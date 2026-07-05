@@ -1,0 +1,4 @@
+EXEC: Tucker, status.
+TUCKER: The logs say Chatterbox, Qwen3, and CosyVoice are operational. F5 remains a software landmine.
+ANALYST: I can provide fourteen implementation paths.
+EXEC: Pick one.

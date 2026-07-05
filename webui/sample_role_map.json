@@ -1,0 +1,16 @@
+{
+  "EXEC": {
+    "engine": "chatterbox",
+    "profile": "chris-dry-executive"
+  },
+  "TUCKER": {
+    "engine": "qwen3",
+    "profile": "tucker-ops-manager",
+    "x_vector_only": true
+  },
+  "ANALYST": {
+    "engine": "qwen3",
+    "profile": "chatgpt-consultant",
+    "x_vector_only": true
+  }
+}

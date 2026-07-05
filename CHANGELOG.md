@@ -4,7 +4,14 @@
 
 Initial public alpha repository for HandAI TTS Lab.
 
-Includes Web UI v0.85, TTS Lab Stack Installer v0.1.2, MIT license, local-only security guidance, AI-assisted software development disclosure, and integration documentation for the separate HandAI Video Downloader helper.
+Includes:
+
+- Web UI v0.85
+- TTS Lab Stack Installer v0.1.2
+- MIT license
+- local-only security guidance
+- AI-assisted software development disclosure
+- integration documentation for the separate HandAI Video Downloader helper
 
 Validation before publication:
 
