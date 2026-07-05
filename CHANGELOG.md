@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.1.1-alpha - 2026-07-05
+
+Public alpha confidence pass.
+
+Includes:
+
+- Web UI v0.86
+- Maintenance stack-status card for the public launcher contract
+- `/api/stack-status` diagnostics endpoint
+- copyable stack diagnostics from the browser
+- top-level Known Issues / alpha caveats section
+- validated configuration notes in `docs/VALIDATED_CONFIGS.md`
+
+Validation:
+
+- Web UI Python syntax check passed.
+- Web UI browser JavaScript parsed with Node.
+- Temporary local server started with an isolated `TTS_LAB`.
+- `/api/meta` returned Web UI version `0.86`.
+- `/api/stack-status` returned useful missing-stack diagnostics instead of crashing.
+
 ## v0.1.0-alpha - 2026-07-05
 
 Initial public alpha repository for HandAI TTS Lab.
