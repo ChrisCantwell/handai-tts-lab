@@ -18,9 +18,9 @@ Normal use is intended to happen in the browser. Terminal commands are acceptabl
 
 ## Current alpha contents
 
-This initial public alpha includes:
+This public alpha includes:
 
-- **Web UI v0.85** in [`webui/`](webui/)
+- **Web UI v0.86** in [`webui/`](webui/)
 - **TTS Lab Stack Installer v0.1.2** in [`stack-installer/`](stack-installer/)
 - Documentation for the AI-assisted development process in [`docs/`](docs/)
 
@@ -72,6 +72,8 @@ Then verify:
 ```bash
 $HOME/tts-lab/tts-lab.sh status
 ```
+
+After installing Web UI v0.86, open **Maintenance / Repairs → TTS Lab stack contract** and click **Refresh stack status**. That browser-side diagnostic reports the detected launcher, engine envs, helper tools, video downloader, external-launch tools, and log paths without merging stack installation into the Web UI installer.
 
 ## What the Web UI expects
 
@@ -126,9 +128,19 @@ F5: present/experimental, not part of the green path
 Video downloader: detected and working as separate helper
 ```
 
-## Important caveats
+See [`docs/VALIDATED_CONFIGS.md`](docs/VALIDATED_CONFIGS.md) for the current validation notes.
+
+## Known issues / alpha caveats
 
 This is an alpha/developer project, not a polished consumer installer. GPU ML dependencies are fragile, model downloads are large, and upstream packages may change.
+
+Known current caveats:
+
+- F5 is present/experimental and should not be treated as part of the green path yet.
+- Linux + NVIDIA GPU + Conda is the primary validated stack.
+- Qwen3 may warn that `flash-attn` is not installed; that is expected to affect speed, not basic generation.
+- CosyVoice may report CUDA-provider or `libcublasLt.so.11` warnings and still generate audio via fallback behavior.
+- Large/long enhancement jobs can exceed available VRAM on 6GB GPUs.
 
 Do **not** expose this local Web UI directly to the public internet. It can launch local processes, access files under the TTS Lab workspace, save tokens, run jobs, and open desktop applications.
 

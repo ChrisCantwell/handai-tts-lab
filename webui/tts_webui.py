@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.85 replaces repeated handoff button rows with compact Actions dropdowns and adds Resemble/external-open routing.
+Version 0.86 adds public-alpha stack status diagnostics in Maintenance while keeping the stack installer separate from the Web UI installer.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -65,11 +65,15 @@ RESEMBLE_COMPAT_WRAPPER = Path(os.environ.get("TTS_RESEMBLE_COMPAT_WRAPPER", str
 WHISPER_HELPER = Path(os.environ.get("TTS_WHISPER_HELPER", str(LAB / "webui" / "stt_faster_whisper.py")))
 WHISPER_PYTHON = Path(os.environ.get("TTS_WHISPER_PYTHON", str(Path.home() / "miniconda3" / "envs" / "tts-whisper" / "bin" / "python")))
 WHISPER_CUDA_INSTALLER = Path(os.environ.get("TTS_WHISPER_CUDA_INSTALLER", str(LAB / "install-whisper-cuda-libs.sh")))
+CONDA_ROOT = Path(os.environ.get("CONDA_ROOT", str(Path.home() / "miniconda3")))
+STACK_INSTALLER = Path(os.environ.get("TTS_STACK_INSTALLER", str(LAB / "stack-installer" / "install-tts-lab-stack.sh")))
+STACK_INSTALLER_ENV = os.environ.get("TTS_STACK_INSTALLER", "").strip()
+ENGINE_ENV_NAMES = {"chatterbox": "tts-chatterbox", "qwen3": "tts-qwen3", "cosyvoice": "tts-cosyvoice", "f5": "tts-f5"}
 DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.85"
+VERSION = "0.86"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
@@ -341,6 +345,164 @@ def append_external_action_log(message: str, data: dict[str, Any] | None = None)
             fh.write(line + "\n")
     except Exception:
         pass
+
+
+
+def command_probe(name: str) -> dict[str, Any]:
+    path = shutil.which(name) or ""
+    return {"name": name, "path": path, "available": bool(path)}
+
+
+def path_probe(path: Path, executable: bool = False) -> dict[str, Any]:
+    exists = path.exists()
+    return {
+        "path": str(path),
+        "exists": exists,
+        "is_file": path.is_file(),
+        "is_dir": path.is_dir(),
+        "executable": bool(exists and os.access(path, os.X_OK)) if executable else None,
+    }
+
+
+def stack_installer_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    if STACK_INSTALLER_ENV:
+        candidates.append(Path(STACK_INSTALLER_ENV).expanduser())
+    candidates.extend([
+        STACK_INSTALLER,
+        LAB / "install-tts-lab-stack.sh",
+        LAB / "stack-installer" / "install-tts-lab-stack.sh",
+        Path(__file__).resolve().parent.parent / "stack-installer" / "install-tts-lab-stack.sh",
+        Path.cwd() / "stack-installer" / "install-tts-lab-stack.sh",
+        Path.home() / "handai-tts-lab" / "stack-installer" / "install-tts-lab-stack.sh",
+    ])
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for c in candidates:
+        try:
+            key = str(c.expanduser().resolve())
+        except Exception:
+            key = str(c)
+        if key not in seen:
+            seen.add(key)
+            unique.append(c.expanduser())
+    return unique
+
+
+def detect_stack_installer_version(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[:20000]
+    except Exception:
+        return ""
+    m = re.search(r'^VERSION=["\']([^"\']+)["\']', text, re.MULTILINE)
+    if m:
+        return m.group(1)
+    m = re.search(r'TTS Lab Stack Installer v([0-9][A-Za-z0-9_.-]*)', text)
+    return m.group(1) if m else ""
+
+
+def launcher_status_payload() -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "path": str(LAUNCHER),
+        "exists": LAUNCHER.exists(),
+        "executable": bool(LAUNCHER.exists() and os.access(LAUNCHER, os.X_OK)),
+        "status_ran": False,
+        "status_ok": False,
+        "returncode": None,
+        "output_tail": "",
+        "error": "",
+    }
+    if not data["exists"]:
+        data["error"] = "Launcher is missing. Run the stack installer or set TTS_LAUNCHER."
+        return data
+    if not data["executable"]:
+        data["error"] = "Launcher exists but is not executable."
+        return data
+    try:
+        proc = subprocess.run([str(LAUNCHER), "status"], cwd=str(LAB), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
+        data["status_ran"] = True
+        data["returncode"] = proc.returncode
+        data["status_ok"] = proc.returncode == 0
+        data["output_tail"] = (proc.stdout or "")[-4000:]
+        if proc.returncode != 0:
+            data["error"] = f"launcher status exited {proc.returncode}"
+    except Exception as exc:
+        data["error"] = str(exc)
+    return data
+
+
+def engine_env_status_payload() -> dict[str, Any]:
+    envs: dict[str, Any] = {}
+    for engine, env_name in ENGINE_ENV_NAMES.items():
+        env_path = CONDA_ROOT / "envs" / env_name
+        py = env_path / "bin" / "python"
+        envs[engine] = {
+            "env_name": env_name,
+            "path": str(env_path),
+            "exists": env_path.exists(),
+            "python": str(py),
+            "python_exists": py.exists(),
+            "green_path": engine in {"chatterbox", "qwen3", "cosyvoice"},
+            "experimental": engine == "f5",
+        }
+    return envs
+
+
+def stack_status_payload() -> dict[str, Any]:
+    installer_candidates = []
+    best_installer: dict[str, Any] | None = None
+    for candidate in stack_installer_candidates():
+        item = path_probe(candidate, executable=True)
+        item["version"] = detect_stack_installer_version(candidate) if item.get("exists") else ""
+        installer_candidates.append(item)
+        if best_installer is None and item.get("exists"):
+            best_installer = item
+
+    video_status = video_intake_status_payload()
+    external_status = external_command_status()
+    helpers = {
+        "conda": {"path": str(CONDA_ROOT / "bin" / "conda"), "available": (CONDA_ROOT / "bin" / "conda").exists()},
+        "ffmpeg": command_probe("ffmpeg"),
+        "ffprobe": command_probe("ffprobe"),
+        "yt_dlp": command_probe("yt-dlp"),
+        "git": command_probe("git"),
+        "git_lfs": command_probe("git-lfs"),
+        "nvidia_smi": command_probe("nvidia-smi"),
+        "audacity": external_status.get("audacity", {}),
+        "xdg_open": command_probe("xdg-open"),
+    }
+    launcher = launcher_status_payload()
+    engines = engine_env_status_payload()
+    green_engines = [k for k, v in engines.items() if v.get("green_path")]
+    green_ready = all(engines[k].get("exists") and engines[k].get("python_exists") for k in green_engines)
+    ready = bool(launcher.get("exists") and launcher.get("executable") and green_ready)
+    return {
+        "version": VERSION,
+        "lab": str(LAB),
+        "launcher": launcher,
+        "stack_installer": {
+            "best": best_installer or {},
+            "candidates": installer_candidates,
+            "env_var": "TTS_STACK_INSTALLER",
+        },
+        "conda_root": str(CONDA_ROOT),
+        "engines": engines,
+        "helpers": helpers,
+        "video_downloader": video_status,
+        "external_actions": external_status,
+        "logs": {
+            "ui_diagnostics": str(UI_DIAGNOSTICS_DIR),
+            "external_actions": str(EXTERNAL_ACTION_LOG),
+            "stack_installer": str(LAB / "logs" / "stack-installer"),
+            "jobs": str(JOB_DIR),
+        },
+        "ready": ready,
+        "notes": [
+            "This is a diagnostics-only Web UI check. It does not install engines or run repair actions.",
+            "Green path engines are Chatterbox, Qwen3, and CosyVoice. F5 is present/experimental when detected.",
+            "If launcher status fails but the launcher exists, copy the diagnostics and inspect the stack-installer logs.",
+        ],
+    }
 
 
 def external_command_status() -> dict[str, Any]:
@@ -3640,6 +3802,17 @@ EXEC: Pick one.</textarea>
       <h3>Dismissed notices</h3>
       <div id="dismissedNoticesList" class="small">Loading dismissed notices...</div>
 
+      <h3>Stack status</h3>
+      <div class="maintenance-item">
+        <h3>TTS Lab stack contract</h3>
+        <div class="small">Checks the public-alpha contract without installing anything: Web UI version, lab path, launcher, Conda engine envs, helper tools, video downloader, external launch tools, and log locations.</div>
+        <div id="maintStackStatus" class="maintenance-status small">Not checked yet.</div>
+        <div class="notice-actions">
+          <button class="mini secondary" onclick="maintenanceCheckStack()">Refresh stack status</button>
+          <button class="mini secondary" onclick="copyStackDiagnostics(this)">Copy stack diagnostics</button>
+        </div>
+      </div>
+
       <h3>Known setup / repair items</h3>
       <div class="maintenance-item">
         <h3>Hugging Face token auth</h3>
@@ -3881,6 +4054,7 @@ let lastSttSelectedPath = null;
 const TAB_NAMES = ['single','batch','profiles','refs','options','stt','video','audio','resemble','maintenance','jobs'];
 let uiDiagEvents = [];
 let currentTabName = '';
+let lastStackStatus = null;
 let pendingProfileSource = null;
 let pendingProfileTranscript = '';
 let pendingProfileExperimental = false;
@@ -4459,6 +4633,60 @@ function renderMaintenance(){
       }).join('');
     }
   }
+}
+
+function yesNo(ok, good='ok', bad='missing'){
+  return ok ? '<span class="ok">'+esc(good)+'</span>' : '<span class="bad">'+esc(bad)+'</span>';
+}
+function statusRow(label, ok, detail=''){
+  return '<div><b>'+esc(label)+':</b> '+yesNo(!!ok)+(detail ? ' <span class="small">'+detail+'</span>' : '')+'</div>';
+}
+function renderStackStatus(d){
+  lastStackStatus = d;
+  const el = $('maintStackStatus');
+  if(!el) return;
+  const launcher = d.launcher || {};
+  const installer = (d.stack_installer && d.stack_installer.best) || {};
+  const engines = d.engines || {};
+  const helpers = d.helpers || {};
+  const video = d.video_downloader || {};
+  const logs = d.logs || {};
+  const engineRows = ['chatterbox','qwen3','cosyvoice','f5'].map(k=>{
+    const e = engines[k] || {};
+    const label = k === 'qwen3' ? 'Qwen3' : (k === 'cosyvoice' ? 'CosyVoice' : (k === 'f5' ? 'F5 experimental' : 'Chatterbox'));
+    const ok = !!(e.exists && e.python_exists);
+    const note = e.experimental ? ' <span class="warn">experimental</span>' : '';
+    return statusRow(label, ok, '<code>'+esc(e.env_name || '')+'</code>'+note);
+  }).join('');
+  const helperRows = [
+    ['Conda', helpers.conda && helpers.conda.available, '<code>'+esc((helpers.conda && helpers.conda.path) || '')+'</code>'],
+    ['ffmpeg', helpers.ffmpeg && helpers.ffmpeg.available, '<code>'+esc((helpers.ffmpeg && helpers.ffmpeg.path) || '')+'</code>'],
+    ['yt-dlp', helpers.yt_dlp && helpers.yt_dlp.available, '<code>'+esc((helpers.yt_dlp && helpers.yt_dlp.path) || 'optional fallback')+'</code>'],
+    ['HandAI video-dl', video.ready, '<code>'+esc((video.commands || []).join(', ') || video.video_dl_dir || '')+'</code>'],
+    ['Audacity', helpers.audacity && helpers.audacity.available, '<code>'+esc((helpers.audacity && helpers.audacity.command) || 'optional')+'</code>'],
+    ['xdg-open', helpers.xdg_open && helpers.xdg_open.available, '<code>'+esc((helpers.xdg_open && helpers.xdg_open.path) || 'optional')+'</code>']
+  ].map(r=>statusRow(r[0], r[1], r[2])).join('');
+  const launcherDetail = launcher.error ? '<span class="bad">'+esc(launcher.error)+'</span>' : '<code>'+esc(launcher.path || '')+'</code>';
+  const installerDetail = installer.exists ? '<code>'+esc(installer.path || '')+'</code>'+(installer.version ? ' v'+esc(installer.version) : '') : '<span class="warn">not found in common locations</span>';
+  el.innerHTML = [
+    '<div><b>Overall:</b> '+(d.ready ? '<span class="ok">green-path stack appears present.</span>' : '<span class="warn">stack needs attention or has optional/missing pieces.</span>')+'</div>',
+    '<div><b>Web UI:</b> v'+esc(d.version || '')+' &nbsp; <b>Lab:</b> <code>'+esc(d.lab || '')+'</code></div>',
+    statusRow('Launcher file', launcher.exists && launcher.executable, launcherDetail),
+    statusRow('Launcher status command', launcher.status_ok, launcher.status_ran ? 'exit '+esc(launcher.returncode) : 'not run'),
+    statusRow('Stack installer', installer.exists, installerDetail),
+    '<details><summary>Engine environments</summary>'+engineRows+'</details>',
+    '<details><summary>Helper tools</summary>'+helperRows+'</details>',
+    '<details><summary>Log locations</summary><div><b>UI diagnostics:</b> <code>'+esc(logs.ui_diagnostics || '')+'</code></div><div><b>External actions:</b> <code>'+esc(logs.external_actions || '')+'</code></div><div><b>Stack installer:</b> <code>'+esc(logs.stack_installer || '')+'</code></div><div><b>Jobs:</b> <code>'+esc(logs.jobs || '')+'</code></div></details>'
+  ].join('');
+}
+function maintenanceCheckStack(){
+  const el=$('maintStackStatus'); if(el) el.textContent='Checking TTS Lab stack contract...';
+  return api('/api/stack-status').then(d=>{ renderStackStatus(d); logUiEvent('maintenance stack status checked', {ready:!!d.ready}); return d; })
+    .catch(err=>{ if(el) el.innerHTML='<span class="bad">Could not check stack status: '+esc(err)+'</span>'; });
+}
+function copyStackDiagnostics(btn){
+  const text = lastStackStatus ? JSON.stringify(lastStackStatus, null, 2) : 'Stack status has not been checked yet.';
+  copyText(text, 'Stack diagnostics copied.', btn);
 }
 function maintenancePrepareShortReference(){
   showTab('audio');
@@ -5525,7 +5753,7 @@ function resembleJobBlock(j){
     (work?`<details class="pref-metadata"><summary>Resemble work directory</summary><code>${esc(work)}</code></details>`:'');
 }
 
-function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
+function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckStack(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
 function startPoll(){
   if(poll) return;
   poll=setInterval(async ()=>{
@@ -5635,6 +5863,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_text(INDEX_HTML)
             elif path == "/api/meta":
                 self.send_json({"version": VERSION, "lab": str(LAB), "launcher": str(LAUNCHER), "default_ref": str(DEFAULT_REF), "engines": ENGINE_META})
+            elif path == "/api/stack-status":
+                self.send_json(stack_status_payload())
             elif path == "/api/profiles":
                 self.send_json({"profiles": profiles_payload()})
             elif path == "/api/refs":

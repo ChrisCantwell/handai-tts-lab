@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.85
+# TTS Lab Unified Web UI v0.86
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.85 replaces repeated handoff button rows with compact Actions dropdowns, adds Resemble routing from audio outputs, and adds logged external launch actions for Audacity/system default/folder open.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.86 adds public-alpha stack status diagnostics under Maintenance while preserving the v0.85 Actions dropdown and external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.85.zip
+unzip -o tts_unified_webui_v0.86.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -52,6 +52,14 @@ Whisper output should be treated as a draft. Review/edit before saving a transcr
 
 The changelog below is ordered newest-to-oldest. Early project versions used labels such as `v0.4`; later versions use labels such as `v0.41`. Treat these as historical release labels, not decimal numbers.
 
+
+## New in v0.86
+
+- Adds **Maintenance → TTS Lab stack contract** diagnostics for the public-alpha launcher stack.
+- Adds `/api/stack-status` to report Web UI version, lab path, launcher status, Conda engine env presence, helper tools, video downloader detection, external-launch status, and log locations.
+- Keeps stack setup logic out of the Web UI installer. The Web UI detects and reports stack state; the stack installer remains responsible for Conda/env/model/helper installation and launcher creation.
+- Adds copyable stack diagnostics from the Maintenance tab for easier troubleshooting.
+- Green-path detection focuses on Chatterbox, Qwen3, and CosyVoice while continuing to label F5 as experimental.
 
 ## New in v0.85
 
