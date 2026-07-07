@@ -1570,13 +1570,97 @@ def _cut_end(cut: dict[str, Any]) -> float:
         return _cut_start(cut)
 
 
-def _consolidate_possible_false_starts(cuts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Merge the sliding-window false-start spam into reviewable regions.
+def _word_start(words: list[dict[str, Any]], idx: int) -> float:
+    try:
+        return float(words[idx].get("start") or 0.0)
+    except Exception:
+        return 0.0
 
-    The first v0.88 heuristic intentionally erred on the side of catching restarts,
-    but a real sample produced dozens of overlapping candidates for one spoken
-    fumble. This keeps every filler/repeated-word candidate, but collapses
-    overlapping possible_false_start regions into a single review item per region.
+
+def _word_end(words: list[dict[str, Any]], idx: int) -> float:
+    try:
+        return float(words[idx].get("end") or words[idx].get("start") or 0.0)
+    except Exception:
+        return _word_start(words, idx)
+
+
+def _is_restart_anchor(words: list[dict[str, Any]], idx: int, min_gap: float = 0.55) -> bool:
+    """Return true when word idx looks like the start of a new take/utterance."""
+    if idx <= 0:
+        return True
+    return (_word_start(words, idx) - _word_end(words, idx - 1)) >= min_gap
+
+
+def _word_confidence(word: dict[str, Any]) -> float | None:
+    for key in ("confidence", "probability"):
+        if key in word:
+            try:
+                return float(word.get(key))
+            except Exception:
+                return None
+    return None
+
+
+def _utterance_start_index(words: list[dict[str, Any]], idx: int, max_back_seconds: float = 3.75) -> int:
+    """Back up to the local bad-take start without swallowing a clean sentence.
+
+    This catches cases like "the disruptive collaborator partner this the disruptive
+    collaborative partner..." where the repeated phrase starts a few words into the
+    bad take. We only extend backward when the small prefix looks unstable, using
+    very low-confidence words as a cheap signal. Otherwise, a repeated sentence at
+    the end of an otherwise good paragraph starts at the repeated phrase itself.
+    """
+    if idx <= 0:
+        return 0
+    anchor_time = _word_start(words, idx)
+    j = idx
+    while j > 0:
+        prev_gap = _word_start(words, j) - _word_end(words, j - 1)
+        candidate_start = _word_start(words, j - 1)
+        if prev_gap >= 0.65:
+            break
+        if (anchor_time - candidate_start) > max_back_seconds:
+            break
+        j -= 1
+    if j == idx:
+        return idx
+    prefix = words[j:idx]
+    low_conf_prefix = any((conf is not None and conf < 0.40) for conf in (_word_confidence(w) for w in prefix))
+    short_prefix = len(prefix) <= 8
+    return j if (short_prefix and low_conf_prefix) else idx
+
+
+def _candidate_text_from_words(words: list[dict[str, Any]], start: float, end: float, max_chars: int = 260) -> str:
+    parts = []
+    for w in words:
+        if _word_start(words, words.index(w)) >= end:
+            break
+        if _word_end(words, words.index(w)) <= start:
+            continue
+        parts.append(_word_text(w))
+    return " ".join(parts).strip()[:max_chars]
+
+
+def _candidate_text_from_word_range(words: list[dict[str, Any]], start_idx: int, end_time: float, max_chars: int = 260) -> str:
+    parts = []
+    for w in words[start_idx:]:
+        try:
+            if float(w.get("start") or 0.0) >= end_time:
+                break
+        except Exception:
+            pass
+        parts.append(_word_text(w))
+    return " ".join(parts).strip()[:max_chars]
+
+
+def _consolidate_possible_false_starts(cuts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Merge duplicate false-start candidates into reviewable take regions.
+
+    v0.88 used a deliberately broad repeated-phrase heuristic. Real spoken-word
+    testing showed that a single fumble could create dozens of sliding overlapping
+    windows. v0.88.1 keeps every filler/repeated-word candidate, but collapses
+    possible_false_start candidates by region and prefers the candidate that ends
+    at the latest restart anchor instead of the union of every overlapping window.
     """
     fixed = [c for c in cuts if c.get("type") != "possible_false_start"]
     false_starts = sorted(
@@ -1605,11 +1689,15 @@ def _consolidate_possible_false_starts(cuts: list[dict[str, Any]]) -> tuple[list
         if len(group) == 1:
             c = dict(group[0])
             c.setdefault("merged_count", 1)
+            c.setdefault("consolidated", False)
             consolidated_false_starts.append(c)
             continue
+        # Prefer the candidate that jumps to the latest restart point. This avoids
+        # unioning into the good take after the restart while still suppressing
+        # near-identical sliding windows.
         start = min(_cut_start(c) for c in group)
         end = max(_cut_end(c) for c in group)
-        best = max(group, key=lambda c: ((_cut_end(c) - _cut_start(c)), len(str(c.get("text") or ""))))
+        best = max(group, key=lambda c: (_cut_end(c), (_cut_end(c) - _cut_start(c)), len(str(c.get("text") or ""))))
         merged_ids = [str(c.get("id") or "") for c in group if c.get("id")]
         c = dict(best)
         c.update({
@@ -1617,7 +1705,7 @@ def _consolidate_possible_false_starts(cuts: list[dict[str, Any]]) -> tuple[list
             "type": "possible_false_start",
             "start": round(start, 3),
             "end": round(max(start, end), 3),
-            "reason": f"Consolidated {len(group)} overlapping false-start candidates. Review before cutting; this may be intentional repetition.",
+            "reason": f"Consolidated {len(group)} related false-start candidates around a repeated take. Review before cutting; this may be intentional repetition.",
             "confidence": "low",
             "safe_auto_cut": False,
             "consolidated": True,
@@ -1671,34 +1759,46 @@ def _proposed_cuts_from_words(words: list[dict[str, Any]], include_stats: bool =
                 "speaker": words[i-1].get("speaker", "SPEAKER_00"),
                 "speaker_label": words[i-1].get("speaker_label", "unknown"),
             })
-    # Conservative false-start heuristic: repeated 3-word phrase nearby. Mark for review only.
+
+    # Conservative false-start heuristic: repeated 5-word phrase nearby where
+    # the repeated phrase starts at a likely restart anchor. This intentionally
+    # avoids short 3-word entity repeats such as "Chat GPT is" and cuts from the
+    # earlier attempt to the later restart, never into the later good take.
+    phrase_len = 5
     seen: dict[tuple[str, ...], int] = {}
-    for i in range(0, max(0, len(norm) - 2)):
-        phrase = tuple(norm[i:i+3])
+    for i in range(0, max(0, len(norm) - phrase_len + 1)):
+        phrase = tuple(norm[i:i+phrase_len])
         if any(not x for x in phrase):
+            continue
+        # Ignore windows that are mostly function words; they are too easy to repeat innocently.
+        meaningful = [x for x in phrase if x not in {"the", "a", "an", "to", "of", "and", "or", "in", "on", "is", "are", "was", "were", "be", "been"}]
+        if len(meaningful) < 2:
             continue
         if phrase in seen:
             prev = seen[phrase]
-            gap = float(words[i].get("start") or 0.0) - float(words[prev+2].get("end") or 0.0)
-            if 0 <= gap <= 20:
-                cuts.append({
-                    "id": f"possible-false-start-{prev+1:04d}-{i+1:04d}",
-                    "type": "possible_false_start",
-                    "start": round(float(words[prev].get("start") or 0.0), 3),
-                    "end": round(float(words[i].get("start") or 0.0), 3),
-                    "text": " ".join(_word_text(w) for w in words[prev:i]).strip()[:240],
-                    "reason": "A nearby phrase appears to restart. Review before cutting; this may be intentional repetition.",
-                    "confidence": "low",
-                    "safe_auto_cut": False,
-                    "speaker": words[prev].get("speaker", "SPEAKER_00"),
-                    "speaker_label": words[prev].get("speaker_label", "unknown"),
-                })
+            gap = _word_start(words, i) - _word_end(words, prev + phrase_len - 1)
+            if 0 <= gap <= 28 and _is_restart_anchor(words, i):
+                start_idx = _utterance_start_index(words, prev)
+                start = _word_start(words, start_idx)
+                end = _word_start(words, i)
+                if end - start >= 1.2:
+                    cuts.append({
+                        "id": f"possible-false-start-{prev+1:04d}-{i+1:04d}",
+                        "type": "possible_false_start",
+                        "start": round(start, 3),
+                        "end": round(end, 3),
+                        "text": _candidate_text_from_word_range(words, start_idx, end),
+                        "reason": "A repeated phrase appears to restart after a pause. Review before cutting; this may be intentional repetition.",
+                        "confidence": "low",
+                        "safe_auto_cut": False,
+                        "speaker": words[start_idx].get("speaker", "SPEAKER_00"),
+                        "speaker_label": words[start_idx].get("speaker_label", "unknown"),
+                    })
         else:
             seen[phrase] = i
     cuts.sort(key=lambda c: (_cut_start(c), _cut_end(c), str(c.get("id") or "")))
     consolidated, stats = _consolidate_possible_false_starts(cuts)
     return (consolidated, stats) if include_stats else consolidated
-
 
 def _markdown_transcript_from_segments(segments: list[dict[str, Any]]) -> str:
     lines = []
@@ -4408,7 +4508,11 @@ EXEC: Pick one.</textarea>
         </div>
         <div class="inline-tools"><button class="secondary" onclick="loadSpeechAnalysisStatus()">Check analysis backends</button><button onclick="analyzeSpeechRepair()">Analyze selected audio for speech repair</button></div>
         <p class="small">v0.88 creates transcript JSON, speaker-turn scaffolding, and proposed cuts for fillers/repeats/possible false starts. It does not cut audio. Review everything before destructive editing.</p>
-        <pre id="speechAnalysisResult">No speech repair analysis yet.</pre>
+        <div class="inline-tools pref-metadata">
+          <button class="mini secondary" type="button" onclick="copySpeechAnalysisResult(this)">copy analysis result</button>
+          <button class="mini secondary" type="button" onclick="selectSpeechAnalysisResult()">select all result text</button>
+        </div>
+        <textarea id="speechAnalysisResult" class="logbox" readonly spellcheck="false">No speech repair analysis yet.</textarea>
       </details>
     </div>
   </section>
@@ -4709,6 +4813,26 @@ function fallbackCopy(text, ok, fail){
   const ta=document.createElement('textarea'); ta.value=text; ta.style.position='fixed'; ta.style.left='-9999px'; document.body.appendChild(ta); ta.focus(); ta.select();
   try{ document.execCommand('copy'); ok(); } catch(e){ fail(e); }
   document.body.removeChild(ta);
+}
+function setSpeechAnalysisResult(text){
+  const el = $('speechAnalysisResult');
+  if(!el) return;
+  if('value' in el) el.value = String(text ?? '');
+  else el.textContent = String(text ?? '');
+}
+function getSpeechAnalysisResult(){
+  const el = $('speechAnalysisResult');
+  if(!el) return '';
+  return ('value' in el) ? (el.value || '') : (el.textContent || '');
+}
+function copySpeechAnalysisResult(btn){
+  copyText(getSpeechAnalysisResult(), 'Speech analysis result copied.', btn);
+}
+function selectSpeechAnalysisResult(){
+  const el = $('speechAnalysisResult');
+  if(!el) return;
+  el.focus();
+  if(el.select) el.select();
 }
 function copyField(id, sourceEl=null, message='Copied.'){ copyText($(id).value || '', message || 'Copied.', sourceEl); }
 function copyButton(text, label, message){ return `<button class="mini secondary copy-btn" data-copy="${esc(text)}" data-copy-message="${esc(message||'Copied.')}" title="${esc(message||'Copy')}">${esc(label)}</button>`; }
@@ -5607,7 +5731,7 @@ function loadSpeechAnalysisStatus(){
 function analyzeSpeechRepair(){
   const path=$('sttSource').value || '';
   if(!path){ alert('Choose an audio source first.'); return; }
-  $('speechAnalysisResult').textContent = 'Queued speech repair analysis. Watch Jobs for status and logs.';
+  setSpeechAnalysisResult('Queued speech repair analysis. Watch Jobs for status and logs.');
   const body={
     path,
     model:$('sttModel').value,
@@ -5622,7 +5746,7 @@ function analyzeSpeechRepair(){
     lastJobsSig='';
     refreshJobs();
     startPoll();
-  }).catch(err=>{ $('speechAnalysisResult').textContent = 'Could not queue speech analysis: ' + err; });
+  }).catch(err=>{ setSpeechAnalysisResult('Could not queue speech analysis: ' + err); });
 }
 function updateCurrentSpeechAnalysisFromJobs(data){
   if(!currentSpeechAnalysisJobId) return;
@@ -5631,15 +5755,15 @@ function updateCurrentSpeechAnalysisFromJobs(data){
   if(j.status === 'done'){
     const result = j.result || {};
     const summary = result.summary || {};
-    $('speechAnalysisResult').textContent = JSON.stringify({summary, candidate_stats: result.candidate_stats || {}, files: result.files || {}, diarization: result.diarization || {}, proposed_cuts_preview: (result.proposed_cuts||[]).slice(0, 20)}, null, 2);
+    setSpeechAnalysisResult(JSON.stringify({summary, candidate_stats: result.candidate_stats || {}, files: result.files || {}, diarization: result.diarization || {}, proposed_cuts_preview: (result.proposed_cuts||[]).slice(0, 20)}, null, 2));
     $('sttMeta').textContent = JSON.stringify(result, null, 2);
     if(result.text) $('sttTranscript').value = result.text;
     currentSpeechAnalysisJobId = null;
   } else if(j.status === 'error' || j.status === 'canceled'){
-    $('speechAnalysisResult').textContent = j.status === 'canceled' ? 'Speech analysis canceled.' : 'Speech analysis failed. Open the job log for details.\n\n' + (j.error || 'Unknown error');
+    setSpeechAnalysisResult(j.status === 'canceled' ? 'Speech analysis canceled.' : 'Speech analysis failed. Open the job log for details.\n\n' + (j.error || 'Unknown error'));
     currentSpeechAnalysisJobId = null;
   } else {
-    $('speechAnalysisResult').textContent = `Speech analysis ${j.status}... open the Jobs panel for logs.`;
+    setSpeechAnalysisResult(`Speech analysis ${j.status}... open the Jobs panel for logs.`);
   }
 }
 function loadSttStatus(){

@@ -10,6 +10,8 @@ Includes:
 - consolidation of heavily overlapping `possible_false_start` candidates
 - raw/suppressed candidate counts in speech analysis summaries
 - regression test based on a real noisy repeated-take sample
+- tighter false-start boundaries so common repeated phrases do not pull clean lead-in material into a proposed cut
+- copy/select-all controls for the speech analysis JSON/result box
 
 Notes:
 
