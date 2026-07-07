@@ -4878,7 +4878,7 @@ function buildSpeechAnalysisAudacityLabels(result=null){
     const start = numericCutStart(c).toFixed(3);
     const end = numericCutEnd(c).toFixed(3);
     return `${start}\t${end}\t${speechAnalysisCutLabel(c, idx)}`;
-  }).join('\n') + '\n';
+  }).join('\n');
 }
 function buildSpeechAnalysisEditChecklist(result=null){
   const src = result || currentSpeechAnalysisResult || null;

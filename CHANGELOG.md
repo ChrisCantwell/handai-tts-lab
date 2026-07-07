@@ -14,6 +14,7 @@ Includes:
 - current speech-analysis result caching so handoff buttons use the full cut list, not just the visible preview
 - local queued/running/done/failure status beside the Analyze button for Jobs-as-tab layouts
 - safer Audacity label export with short tab-delimited labels only
+- Audacity labels omit the trailing blank line so Audacity does not warn about an incomplete extra label
 
 Notes:
 
