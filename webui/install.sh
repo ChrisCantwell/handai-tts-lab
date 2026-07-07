@@ -19,7 +19,18 @@ fi
 mkdir -p "$WEBUI" "$LAB/output" "$LAB/output/job_history" "$LAB/output/audio_lab" "$LAB/output/video_intake/source_media/uploads" "$LAB/output/video_intake/source_media/url_imports" "$LAB/output/video_intake/extracted_audio" "$LAB/output/resemble_enhance" "$LAB/resemble_uploads" "$LAB/engines/resemble-enhance" "$LAB/references" "$LAB/references/profiles" "$LAB/stt_uploads" "$LAB/config"
 cp tts_webui.py "$WEBUI/tts_webui.py"
 cp stt_faster_whisper.py "$WEBUI/stt_faster_whisper.py"
+if [[ -f tts_ai_studio_bridge.py ]]; then
+  cp tts_ai_studio_bridge.py "$WEBUI/tts_ai_studio_bridge.py"
+fi
+if [[ -f run-ai-studio-bridge.sh ]]; then
+  cp run-ai-studio-bridge.sh "$WEBUI/run-ai-studio-bridge.sh"
+fi
+if [[ -f .env.ai-studio-bridge.example ]]; then
+  cp .env.ai-studio-bridge.example "$WEBUI/.env.ai-studio-bridge.example"
+fi
 chmod +x "$WEBUI/tts_webui.py" "$WEBUI/stt_faster_whisper.py"
+if [[ -f "$WEBUI/tts_ai_studio_bridge.py" ]]; then chmod +x "$WEBUI/tts_ai_studio_bridge.py"; fi
+if [[ -f "$WEBUI/run-ai-studio-bridge.sh" ]]; then chmod +x "$WEBUI/run-ai-studio-bridge.sh"; fi
 
 cat > "$LAB/start-tts-webui.sh" <<EOF
 #!/usr/bin/env bash
@@ -39,6 +50,21 @@ exec /usr/bin/env python3 "${WEBUI}/tts_webui.py"
 EOF
 chmod +x "$LAB/start-tts-webui.sh"
 
+cat > "$LAB/start-ai-studio-bridge.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export TTS_LAB="${LAB}"
+export TTS_WEBUI_BASE="\${TTS_WEBUI_BASE:-http://127.0.0.1:7870}"
+export TTS_AI_STUDIO_BRIDGE_HOST="\${TTS_AI_STUDIO_BRIDGE_HOST:-127.0.0.1}"
+export TTS_AI_STUDIO_BRIDGE_PORT="\${TTS_AI_STUDIO_BRIDGE_PORT:-7871}"
+export TTS_AI_STUDIO_BRIDGE_ALLOWED_ORIGINS="\${TTS_AI_STUDIO_BRIDGE_ALLOWED_ORIGINS:-*}"
+export TTS_AI_STUDIO_BRIDGE_ALLOWED_ENGINES="\${TTS_AI_STUDIO_BRIDGE_ALLOWED_ENGINES:-chatterbox,qwen3,cosyvoice}"
+: "\${TTS_AI_STUDIO_BRIDGE_TOKEN:?Set TTS_AI_STUDIO_BRIDGE_TOKEN before starting the bridge}"
+exec /usr/bin/env python3 "${WEBUI}/tts_ai_studio_bridge.py"
+EOF
+chmod +x "$LAB/start-ai-studio-bridge.sh"
+
+
 cat > "$WEBUI/README_INSTALLED.txt" <<EOF
 TTS Lab Unified Web UI v${APP_VERSION} installed.
 
@@ -53,6 +79,13 @@ Override host/port if needed:
 
 Profile library:
   $LAB/references/profiles
+
+Optional AI Studio bridge sidecar:
+  export TTS_AI_STUDIO_BRIDGE_TOKEN=your-long-random-token
+  $LAB/start-ai-studio-bridge.sh
+  http://127.0.0.1:7871
+
+Tunnel only the bridge port if using Cloudflare quick tunnels; do not tunnel the full Web UI.
 EOF
 
 cat > "$LAB/install-whisper.sh" <<'WHISPERINSTALL'

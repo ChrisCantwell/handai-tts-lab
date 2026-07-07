@@ -20,8 +20,9 @@ Normal use is intended to happen in the browser. Terminal commands are acceptabl
 
 This public alpha includes:
 
-- **Web UI v0.86** in [`webui/`](webui/)
+- **Web UI v0.87** in [`webui/`](webui/)
 - **TTS Lab Stack Installer v0.1.2** in [`stack-installer/`](stack-installer/)
+- Optional **HandAISpoke / AI Studio Bridge** sidecar for short local TTS voice patches
 - Documentation for the AI-assisted development process in [`docs/`](docs/)
 
 The Web UI and stack installer are kept in separate folders so the app and the machine setup contract stay understandable without creating an extra repository.
@@ -45,6 +46,7 @@ handai-tts-lab/
   CHANGELOG.md            Top-level release history
   LICENSE                 MIT license for this repository's code/docs
   SECURITY.md             Local-only security guidance
+  .env.example            Example local environment settings; no real tokens
 ```
 
 ## Quick start
@@ -108,6 +110,26 @@ TTS_VIDEO_DL_CMD='/home/user/video-dl/video-dl {url} {out}' ./start.sh
 ```
 
 Video Intake should remain archive-first: download/archive the source media first, then extract audio as a separate action.
+
+## HandAISpoke / AI Studio Bridge
+
+Web UI v0.87 adds an optional local sidecar bridge for Google AI Studio / HandAISpoke speech-repair experiments.
+
+```text
+Google AI Studio / HandAISpoke
+→ optional Cloudflare tunnel to 127.0.0.1:7871
+→ token-protected local AI Studio bridge
+→ TTS Web UI on 127.0.0.1:7870
+→ local Chatterbox/Qwen3/CosyVoice engine
+```
+
+The bridge is disabled unless explicitly launched, binds to `127.0.0.1` by default, and requires `X-HandAISpoke-Bridge-Token` from `TTS_AI_STUDIO_BRIDGE_TOKEN`.
+
+Do **not** tunnel the full Web UI. If Cloudflare is used for quick AI Studio testing, tunnel only the bridge port `7871`.
+
+Correct wording: Gemini / Google AI Studio is not the voice-cloning engine. Local cloned/custom voice generation is handled by the configured local TTS engine.
+
+See [`docs/ai-studio-bridge.md`](docs/ai-studio-bridge.md), [`docs/api-contract.md`](docs/api-contract.md), and [`docs/cloudflare-testing.md`](docs/cloudflare-testing.md).
 
 ## Tested local configuration
 
