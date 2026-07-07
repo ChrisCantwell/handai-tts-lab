@@ -40,9 +40,11 @@ def load_model(model_size: str, device: str, compute_type: str):
     return WhisperModel(model_size, device=device, compute_type=used_compute), device, used_compute
 
 
-def transcribe_once(model_size: str, audio: Path, language: str, device: str, compute_type: str):
+def transcribe_once(model_size: str, audio: Path, language: str, device: str, compute_type: str, word_timestamps: bool = False):
     model, used_device, used_compute = load_model(model_size, device, compute_type)
     kwargs = {"beam_size": 5, "vad_filter": True}
+    if word_timestamps:
+        kwargs["word_timestamps"] = True
     if language.strip() and language.strip().lower() != "auto":
         kwargs["language"] = language.strip()
     segments, info = model.transcribe(str(audio), **kwargs)
@@ -50,6 +52,19 @@ def transcribe_once(model_size: str, audio: Path, language: str, device: str, co
     text_parts = []
     for seg in segments:
         d = {"start": float(seg.start), "end": float(seg.end), "text": seg.text.strip()}
+        words = []
+        for word in getattr(seg, "words", None) or []:
+            txt = str(getattr(word, "word", "") or "").strip()
+            if not txt:
+                continue
+            words.append({
+                "word": txt,
+                "start": float(getattr(word, "start", 0.0) or 0.0),
+                "end": float(getattr(word, "end", 0.0) or 0.0),
+                "probability": float(getattr(word, "probability", 0.0) or 0.0),
+            })
+        if words:
+            d["words"] = words
         items.append(d)
         text_parts.append(d["text"])
     return {
@@ -71,6 +86,7 @@ def main() -> int:
     ap.add_argument("--language", default="")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--compute-type", default="auto")
+    ap.add_argument("--word-timestamps", action="store_true", help="Include per-word timestamps when supported by faster-whisper.")
     args = ap.parse_args()
 
     audio = Path(args.audio)
@@ -80,7 +96,7 @@ def main() -> int:
     fallback_warning = ""
     if args.device == "auto":
         try:
-            result = transcribe_once(args.model, audio, args.language, "cuda", compatible_compute_type("cuda", args.compute_type))
+            result = transcribe_once(args.model, audio, args.language, "cuda", compatible_compute_type("cuda", args.compute_type), args.word_timestamps)
         except Exception as exc:
             if not looks_like_cuda_runtime_error(exc):
                 raise
@@ -90,13 +106,14 @@ def main() -> int:
                 f"CUDA error: {exc}"
             )
             print(fallback_warning, file=sys.stderr)
-            result = transcribe_once(args.model, audio, args.language, "cpu", "int8")
+            result = transcribe_once(args.model, audio, args.language, "cpu", "int8", args.word_timestamps)
         result["requested_device"] = "auto"
     else:
-        result = transcribe_once(args.model, audio, args.language, args.device, args.compute_type)
+        result = transcribe_once(args.model, audio, args.language, args.device, args.compute_type, args.word_timestamps)
         result["requested_device"] = args.device
 
     result["requested_compute_type"] = args.compute_type
+    result["word_timestamps"] = bool(args.word_timestamps)
     if fallback_warning:
         result["fallback_warning"] = fallback_warning
     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.87
+# TTS Lab Unified Web UI v0.88
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.87 adds an optional HandAISpoke / AI Studio Bridge sidecar while preserving v0.86 stack diagnostics and v0.85 Actions dropdown/external launch work.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.88 adds Speech Repair Analysis and a diarization-ready transcript schema while preserving the v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.87.zip
+unzip -o tts_unified_webui_v0.88.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -52,6 +52,22 @@ Whisper output should be treated as a draft. Review/edit before saving a transcr
 
 The changelog below is ordered newest-to-oldest. Early project versions used labels such as `v0.4`; later versions use labels such as `v0.41`. Treat these as historical release labels, not decimal numbers.
 
+
+## New in v0.88
+
+- Adds **Speech Repair Analysis / Diarization foundation** under STT / Transcribe.
+- Adds `/api/stt/analysis-status` to report Faster-Whisper, CrisperWhisper, WhisperX, pyannote, and auto-editor readiness.
+- Adds `/api/stt/analyze` job queueing for review-first speech analysis.
+- Updates the Faster-Whisper helper with optional `--word-timestamps` support for analysis jobs.
+- Writes analysis artifacts under `/home/user/tts-lab/output/speech_analysis/`:
+  - `*.analysis.json`
+  - `*.transcript.md`
+  - `*.proposed_cuts.json`
+- Produces speaker-aware JSON fields from the beginning: `speaker`, `speaker_label`, and `speaker_segments`.
+- Detects filler-word, repeated-word, and possible false-start cut candidates without cutting audio.
+- Treats true WhisperX/pyannote diarization and CrisperWhisper verbatim transcription as experimental backend targets rather than pretending they are already validated.
+
+This pass is intentionally non-destructive. Review proposed cuts before future edit/export passes apply them to audio.
 
 ## New in v0.87
 

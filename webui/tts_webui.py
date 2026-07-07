@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.86 adds public-alpha stack status diagnostics in Maintenance while keeping the stack installer separate from the Web UI installer.
+Version 0.88 adds speech-repair analysis scaffolding and speaker-aware transcript outputs while keeping destructive editing behind review.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -65,6 +65,7 @@ RESEMBLE_COMPAT_WRAPPER = Path(os.environ.get("TTS_RESEMBLE_COMPAT_WRAPPER", str
 WHISPER_HELPER = Path(os.environ.get("TTS_WHISPER_HELPER", str(LAB / "webui" / "stt_faster_whisper.py")))
 WHISPER_PYTHON = Path(os.environ.get("TTS_WHISPER_PYTHON", str(Path.home() / "miniconda3" / "envs" / "tts-whisper" / "bin" / "python")))
 WHISPER_CUDA_INSTALLER = Path(os.environ.get("TTS_WHISPER_CUDA_INSTALLER", str(LAB / "install-whisper-cuda-libs.sh")))
+SPEECH_ANALYSIS_DIR = Path(os.environ.get("TTS_SPEECH_ANALYSIS_DIR", str(OUT_DIR / "speech_analysis")))
 CONDA_ROOT = Path(os.environ.get("CONDA_ROOT", str(Path.home() / "miniconda3")))
 STACK_INSTALLER = Path(os.environ.get("TTS_STACK_INSTALLER", str(LAB / "stack-installer" / "install-tts-lab-stack.sh")))
 STACK_INSTALLER_ENV = os.environ.get("TTS_STACK_INSTALLER", "").strip()
@@ -73,7 +74,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.87"
+VERSION = "0.88"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
@@ -142,6 +143,7 @@ def ensure_dirs() -> None:
     RESEMBLE_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     UI_DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+    SPEECH_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def unique_wav(prefix: str) -> Path:
@@ -1431,6 +1433,244 @@ def test_whisper_gpu_support() -> dict[str, Any]:
     return {"ok": False, "message": "GPU test ran but did not report cuda/float16. Result: " + json.dumps(data)[:1000]}
 
 
+
+def _python_import_status(python_path: Path, module_name: str, label: str) -> dict[str, Any]:
+    data = {"label": label, "python": str(python_path), "module": module_name, "ready": False, "error": ""}
+    if not python_path.exists():
+        data["error"] = "Python environment not found."
+        return data
+    try:
+        proc = subprocess.run([str(python_path), "-c", f"import {module_name}; print('ok')"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20, env=hf_env())
+        if proc.returncode == 0:
+            data["ready"] = True
+        else:
+            data["error"] = (proc.stdout or "").strip()[-700:]
+    except Exception as exc:
+        data["error"] = str(exc)
+    return data
+
+
+def speech_analysis_status_payload() -> dict[str, Any]:
+    """Status for v0.88 speech-repair analysis backends.
+
+    v0.88 intentionally makes diarization a first-class output concept even when
+    the heavy WhisperX/pyannote backend is not installed yet. That keeps future
+    archive work speaker-aware without pretending automatic labels are perfect.
+    """
+    crisper_py = Path(os.environ.get("TTS_CRISPERWHISPER_PYTHON", str(CONDA_ROOT / "envs" / "tts-crisperwhisper" / "bin" / "python")))
+    whisperx_py = Path(os.environ.get("TTS_WHISPERX_PYTHON", str(CONDA_ROOT / "envs" / "tts-whisperx" / "bin" / "python")))
+    whisperx_status = _python_import_status(whisperx_py, "whisperx", "WhisperX alignment/diarization")
+    pyannote_status = _python_import_status(whisperx_py, "pyannote.audio", "pyannote.audio diarization")
+    crisper_status = _python_import_status(crisper_py, "transformers", "CrisperWhisper runtime")
+    crisper_status["model"] = "nyrahealth/CrisperWhisper"
+    return {
+        "version": VERSION,
+        "analysis_dir": str(SPEECH_ANALYSIS_DIR),
+        "faster_whisper": whisper_status_payload(),
+        "crisperwhisper": crisper_status,
+        "whisperx": whisperx_status,
+        "pyannote": pyannote_status,
+        "auto_editor": {"path": shutil.which("auto-editor") or "", "ready": bool(shutil.which("auto-editor"))},
+        "hf_token": hf_token_status_payload(),
+        "note": "v0.88 generates speaker-aware analysis JSON and proposed edit decisions. WhisperX/pyannote diarization remains experimental and requires local installation plus any needed Hugging Face access.",
+        "supported_modes": ["faster-whisper-analysis", "crisperwhisper-planned", "whisperx-diarization-planned"],
+    }
+
+
+FILLER_WORDS = {"um", "umm", "uh", "uhh", "ah", "ahh", "er", "erm", "hm", "hmm", "mmm"}
+
+
+def _word_text(word: dict[str, Any]) -> str:
+    return str(word.get("word") or word.get("text") or "").strip()
+
+
+def _norm_word(value: str) -> str:
+    return re.sub(r"[^a-z0-9']+", "", value.strip().lower())
+
+
+def _words_from_transcript_result(data: dict[str, Any]) -> list[dict[str, Any]]:
+    words: list[dict[str, Any]] = []
+    for seg in data.get("segments") or []:
+        seg_words = seg.get("words") if isinstance(seg, dict) else None
+        if isinstance(seg_words, list) and seg_words:
+            for w in seg_words:
+                if not isinstance(w, dict):
+                    continue
+                txt = _word_text(w)
+                if not txt:
+                    continue
+                words.append({
+                    "text": txt,
+                    "start": float(w.get("start") or seg.get("start") or 0.0),
+                    "end": float(w.get("end") or seg.get("end") or seg.get("start") or 0.0),
+                    "confidence": float(w.get("probability") or w.get("confidence") or 0.0),
+                    "speaker": str(w.get("speaker") or seg.get("speaker") or "SPEAKER_00"),
+                    "speaker_label": str(w.get("speaker_label") or seg.get("speaker_label") or "unknown"),
+                })
+            continue
+        text = str(seg.get("text") or "") if isinstance(seg, dict) else ""
+        tokens = [t for t in re.findall(r"\S+", text) if t.strip()]
+        if not tokens:
+            continue
+        start = float(seg.get("start") or 0.0)
+        end = float(seg.get("end") or start)
+        dur = max(0.01, end - start)
+        step = dur / max(1, len(tokens))
+        for i, tok in enumerate(tokens):
+            words.append({
+                "text": tok,
+                "start": start + i * step,
+                "end": start + (i + 1) * step,
+                "confidence": 0.0,
+                "speaker": str(seg.get("speaker") or "SPEAKER_00"),
+                "speaker_label": str(seg.get("speaker_label") or "unknown"),
+                "approximate_timing": True,
+            })
+    return words
+
+
+def _speaker_segments_from_result(data: dict[str, Any], words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    for seg in data.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        segments.append({
+            "start": float(seg.get("start") or 0.0),
+            "end": float(seg.get("end") or seg.get("start") or 0.0),
+            "speaker": str(seg.get("speaker") or "SPEAKER_00"),
+            "speaker_label": str(seg.get("speaker_label") or "unknown"),
+            "text": str(seg.get("text") or "").strip(),
+            "confidence": float(seg.get("confidence") or 0.0),
+        })
+    if segments:
+        return segments
+    if words:
+        return [{
+            "start": float(words[0].get("start") or 0.0),
+            "end": float(words[-1].get("end") or words[0].get("start") or 0.0),
+            "speaker": "SPEAKER_00",
+            "speaker_label": "unknown",
+            "text": " ".join(_word_text(w) for w in words).strip(),
+            "confidence": 0.0,
+        }]
+    return []
+
+
+def _proposed_cuts_from_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cuts: list[dict[str, Any]] = []
+    for idx, w in enumerate(words):
+        txt = _norm_word(_word_text(w))
+        if txt in FILLER_WORDS:
+            start = max(0.0, float(w.get("start") or 0.0) - 0.06)
+            end = max(start, float(w.get("end") or start) + 0.06)
+            cuts.append({
+                "id": f"filler-{idx+1:04d}",
+                "type": "filler",
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "text": _word_text(w),
+                "reason": f"Detected filler word: {_word_text(w)}",
+                "confidence": "medium" if w.get("approximate_timing") else "high",
+                "safe_auto_cut": not bool(w.get("approximate_timing")),
+                "speaker": w.get("speaker", "SPEAKER_00"),
+                "speaker_label": w.get("speaker_label", "unknown"),
+            })
+    norm = [_norm_word(_word_text(w)) for w in words]
+    for i in range(1, len(words)):
+        if norm[i] and norm[i] == norm[i-1] and norm[i] not in {"the", "a", "an", "to", "of", "and"}:
+            cuts.append({
+                "id": f"repeat-word-{i:04d}",
+                "type": "stutter_or_repeated_word",
+                "start": round(max(0.0, float(words[i-1].get("start") or 0.0) - 0.04), 3),
+                "end": round(float(words[i-1].get("end") or words[i-1].get("start") or 0.0) + 0.04, 3),
+                "text": _word_text(words[i-1]),
+                "reason": "Adjacent repeated word; likely stutter or restart candidate.",
+                "confidence": "medium",
+                "safe_auto_cut": False,
+                "speaker": words[i-1].get("speaker", "SPEAKER_00"),
+                "speaker_label": words[i-1].get("speaker_label", "unknown"),
+            })
+    # Conservative false-start heuristic: repeated 3-word phrase nearby. Mark for review only.
+    seen: dict[tuple[str, ...], int] = {}
+    for i in range(0, max(0, len(norm) - 2)):
+        phrase = tuple(norm[i:i+3])
+        if any(not x for x in phrase):
+            continue
+        if phrase in seen:
+            prev = seen[phrase]
+            gap = float(words[i].get("start") or 0.0) - float(words[prev+2].get("end") or 0.0)
+            if 0 <= gap <= 20:
+                cuts.append({
+                    "id": f"possible-false-start-{prev+1:04d}-{i+1:04d}",
+                    "type": "possible_false_start",
+                    "start": round(float(words[prev].get("start") or 0.0), 3),
+                    "end": round(float(words[i].get("start") or 0.0), 3),
+                    "text": " ".join(_word_text(w) for w in words[prev:i]).strip()[:240],
+                    "reason": "A nearby phrase appears to restart. Review before cutting; this may be intentional repetition.",
+                    "confidence": "low",
+                    "safe_auto_cut": False,
+                    "speaker": words[prev].get("speaker", "SPEAKER_00"),
+                    "speaker_label": words[prev].get("speaker_label", "unknown"),
+                })
+        else:
+            seen[phrase] = i
+    cuts.sort(key=lambda c: (float(c.get("start") or 0.0), float(c.get("end") or 0.0), str(c.get("id") or "")))
+    return cuts
+
+
+def _markdown_transcript_from_segments(segments: list[dict[str, Any]]) -> str:
+    lines = []
+    for seg in segments:
+        label = str(seg.get("speaker_label") or seg.get("speaker") or "unknown")
+        speaker = str(seg.get("speaker") or "")
+        when = f"{fmt_seconds(seg.get('start'))}–{fmt_seconds(seg.get('end'))}"
+        text = str(seg.get("text") or "").strip()
+        lines.append(f"**{label}** {speaker} [{when}]\n\n{text}\n")
+    return "\n".join(lines).strip() + ("\n" if lines else "")
+
+
+def build_speech_analysis_result(src: Path, transcript_data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    words = _words_from_transcript_result(transcript_data)
+    speaker_segments = _speaker_segments_from_result(transcript_data, words)
+    cuts = _proposed_cuts_from_words(words)
+    requested_backend = str(payload.get("analysis_engine") or "faster-whisper-analysis").strip()
+    diarization_mode = str(payload.get("diarization_mode") or "speaker-schema").strip()
+    result = {
+        "kind": "speech-repair-analysis",
+        "schema_version": "0.88.0",
+        "created_at": iso_time(),
+        "source_path": str(src),
+        "source_name": src.name,
+        "duration_seconds": audio_duration_seconds(src),
+        "analysis_engine": requested_backend,
+        "diarization_mode": diarization_mode,
+        "transcript_engine": "faster-whisper",
+        "text": str(transcript_data.get("text") or "").strip(),
+        "language": transcript_data.get("language", ""),
+        "language_probability": transcript_data.get("language_probability", 0.0),
+        "words": words,
+        "speaker_segments": speaker_segments,
+        "proposed_cuts": cuts,
+        "summary": {
+            "word_count": len(words),
+            "speaker_segment_count": len(speaker_segments),
+            "proposed_cut_count": len(cuts),
+            "filler_count": len([c for c in cuts if c.get("type") == "filler"]),
+            "review_required_count": len([c for c in cuts if not c.get("safe_auto_cut")]),
+        },
+        "diarization": {
+            "status": "schema_only" if diarization_mode != "off" else "off",
+            "backend": "none",
+            "note": "v0.88 stores speaker-aware turns now. True WhisperX/pyannote diarization is an experimental backend to install/enable in a later pass.",
+            "speaker_label_options": ["unknown", "host", "caller", "guest", "cohost", "news_clip", "music", "silence"],
+        },
+        "safety": {
+            "destructive_editing": False,
+            "note": "These are proposed edit decisions only. Review before cutting audio.",
+        },
+    }
+    return result
+
 def fmt_seconds(value: Any) -> str:
     try:
         if value is None:
@@ -2122,7 +2362,7 @@ class Job:
                     wp = Path(val)
                     if wp.exists() and inside(wp.resolve(), AUDIO_LAB_DIR):
                         res[key + "_url"] = versioned_url("/audio-lab-waveform/" + wp.name, wp)
-        if self.kind == "stt":
+        if self.kind in {"stt", "speech-analysis"}:
             if self.source_path:
                 data["source_path"] = self.source_path
                 try:
@@ -2365,6 +2605,8 @@ class JobManager:
                     self._run_batch(job, payload)
                 elif job.kind == "stt":
                     self._run_stt(job, payload)
+                elif job.kind == "speech-analysis":
+                    self._run_speech_analysis(job, payload)
                 elif job.kind == "setup":
                     self._run_setup(job, payload)
                 elif job.kind == "audio":
@@ -2720,11 +2962,13 @@ class JobManager:
         else:
             self._set(job, status="error", error="GPU test ran but did not report device=cuda and compute_type=float16. See log.", result=data, finished_at=now())
 
-    def _stt_command(self, src: Path, model: str, language: str, device: str, compute_type: str = "auto") -> list[str]:
+    def _stt_command(self, src: Path, model: str, language: str, device: str, compute_type: str = "auto", word_timestamps: bool = False) -> list[str]:
         cmd = [str(whisper_python_path()), str(WHISPER_HELPER), str(src), "--model", model, "--device", device, "--compute-type", compute_type]
         lang = str(language or "auto").strip()
         if lang and lang.lower() != "auto":
             cmd += ["--language", lang]
+        if word_timestamps:
+            cmd += ["--word-timestamps"]
         return cmd
 
     def _human_stt_error(self, raw: str) -> str:
@@ -2746,6 +2990,68 @@ class JobManager:
                 "The full message is in the job log."
             )
         return text[-600:] or "Transcription failed. See job log."
+
+    def _run_speech_analysis(self, job: Job, payload: dict[str, Any]) -> None:
+        src = safe_existing_path(str(payload.get("path", "")), [REF_DIR, OUT_DIR, PROFILE_DIR, STT_UPLOAD_DIR])
+        if src.suffix.lower() not in AUDIO_EXTS:
+            raise ValueError("Selected analysis source is not an audio file.")
+        status = whisper_status_payload()
+        if not status.get("ready"):
+            raise RuntimeError("Faster-Whisper is not ready. " + str(status.get("error", "")) + " Run: " + str(status.get("install_command", "")))
+        model = str(payload.get("model") or "base").strip().lower()
+        if model not in {"tiny", "base", "small", "medium", "large-v3"}:
+            model = "base"
+        device = str(payload.get("device") or "auto").strip().lower()
+        if device not in {"auto", "cuda", "cpu"}:
+            device = "auto"
+        language = str(payload.get("language") or "auto").strip()
+        compute_type = str(payload.get("compute_type") or "auto").strip().lower() or "auto"
+        analysis_engine = str(payload.get("analysis_engine") or "faster-whisper-analysis").strip()
+        diarization_mode = str(payload.get("diarization_mode") or "speaker-schema").strip()
+        role = "speech-analysis"
+        display = f"{src.name} — {analysis_engine}, diarization={diarization_mode}"
+        self._set(job, status="running", started_at=now(), engine=analysis_engine, role=role, text=display, source_path=str(src))
+        self._append_log(job, "Speech Repair Analysis v0.88\n")
+        self._append_log(job, "This pass creates transcript JSON, speaker-aware segment scaffolding, and proposed edit decisions. It does not cut audio.\n")
+        if analysis_engine in {"crisperwhisper", "crisperwhisper-experimental"}:
+            self._append_log(job, "Requested CrisperWhisper analysis. v0.88 records this as an experimental target but uses the local Faster-Whisper helper unless a future CrisperWhisper runtime is installed and wired.\n")
+        if analysis_engine in {"whisperx", "whisperx-diarization", "whisperx-diarization-experimental"} or diarization_mode.startswith("whisperx"):
+            self._append_log(job, "Requested WhisperX/pyannote diarization. v0.88 keeps speaker-turn fields in the output schema; true diarization requires the future WhisperX backend install/wiring pass.\n")
+        cmd = self._stt_command(src, model, language, device, compute_type, word_timestamps=True)
+        self._append_log(job, "Running transcription with word timestamps when supported by faster-whisper.\n")
+        rc, stdout, stderr, timed_out = self._run_capture_subprocess(job, cmd, timeout=1800, cwd=LAB, env=hf_env())
+        if self._is_cancel_requested(job):
+            self._mark_canceled(job)
+            return
+        if timed_out:
+            self._set(job, status="error", error="Speech analysis timed out after 30 minutes. Try a smaller model or shorter audio segment.", finished_at=now())
+            return
+        if rc != 0:
+            raw = (stderr or stdout or f"Speech analysis failed with exit code {rc}")
+            self._set(job, status="error", error=self._human_stt_error(raw), finished_at=now())
+            return
+        try:
+            transcript_data = json.loads(stdout)
+        except Exception:
+            self._set(job, status="error", error="Speech analysis completed but did not return parseable JSON. See job log.", finished_at=now())
+            return
+        transcript_data["source_path"] = str(src)
+        transcript_data["stderr"] = (stderr or "").strip()[-2000:]
+        result = build_speech_analysis_result(src, transcript_data, payload)
+        ensure_dirs()
+        base = SPEECH_ANALYSIS_DIR / f"{safe_slug(src.stem)}_{job.id}"
+        json_path = base.with_suffix(".analysis.json")
+        md_path = base.with_suffix(".transcript.md")
+        cuts_path = base.with_suffix(".proposed_cuts.json")
+        result["files"] = {"analysis_json": str(json_path), "transcript_md": str(md_path), "proposed_cuts_json": str(cuts_path)}
+        json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        md_path.write_text(_markdown_transcript_from_segments(result.get("speaker_segments") or []), encoding="utf-8")
+        cuts_path.write_text(json.dumps(result.get("proposed_cuts") or [], indent=2, ensure_ascii=False), encoding="utf-8")
+        warning = str(transcript_data.get("fallback_warning") or "").strip()
+        transcript = str(result.get("text") or "").strip()
+        self._append_log(job, f"Analysis complete: {result['summary']['word_count']} words, {result['summary']['speaker_segment_count']} speaker segments, {result['summary']['proposed_cut_count']} proposed cuts.\n")
+        self._append_log(job, f"Analysis JSON: {json_path}\nTranscript Markdown: {md_path}\nProposed cuts JSON: {cuts_path}\n")
+        self._set(job, status="done", transcript=transcript, result=result, warning=warning or None, finished_at=now())
 
     def _run_stt(self, job: Job, payload: dict[str, Any]) -> None:
         src = safe_existing_path(str(payload.get("path", "")), [REF_DIR, OUT_DIR, PROFILE_DIR, STT_UPLOAD_DIR])
@@ -4006,6 +4312,17 @@ EXEC: Pick one.</textarea>
       </div>
       <div id="sttActionStatus" class="small inline-status"></div>
       <details class="pref-metadata"><summary>STT metadata / segments</summary><button class="mini secondary" onclick="copyText($('sttMeta').textContent || '', 'STT metadata copied.', this)">copy metadata</button><pre id="sttMeta">No transcription yet.</pre></details>
+      <details class="pref-experimental" open>
+        <summary>Speech Repair Analysis / Diarization foundation</summary>
+        <div id="speechAnalysisStatus" class="small">Checking speech analysis backends...</div>
+        <div class="row2">
+          <div><label>Analysis engine</label><select id="speechAnalysisEngine"><option value="faster-whisper-analysis" selected>Faster-Whisper analysis - working baseline</option><option value="crisperwhisper-experimental">CrisperWhisper - experimental/planned verbatim backend</option><option value="whisperx-diarization-experimental">WhisperX diarization - experimental/planned backend</option></select></div>
+          <div><label>Diarization mode</label><select id="speechDiarizationMode"><option value="speaker-schema" selected>Speaker-turn schema now / diarization later</option><option value="off">Off</option><option value="whisperx-pyannote-experimental">WhisperX + pyannote experimental</option></select></div>
+        </div>
+        <div class="inline-tools"><button class="secondary" onclick="loadSpeechAnalysisStatus()">Check analysis backends</button><button onclick="analyzeSpeechRepair()">Analyze selected audio for speech repair</button></div>
+        <p class="small">v0.88 creates transcript JSON, speaker-turn scaffolding, and proposed cuts for fillers/repeats/possible false starts. It does not cut audio. Review everything before destructive editing.</p>
+        <pre id="speechAnalysisResult">No speech repair analysis yet.</pre>
+      </details>
     </div>
   </section>
 
@@ -4857,7 +5174,7 @@ function restoreFormState(){
   });
 }
 function attachFormStateHandlers(){
-  for(const id of ['engine','profileSelect','role','ref','refText','text','xVector','splitLong','rememberForm','uiMode','optAdvanced','optProfileTools','optExperimental','optMetadata','optLogs','optDelete','optStickyTabs','optPanelOrientation','optJobsAsTab','optOpsWidth','globalName','globalNameMode','globalFunctionMode','globalDateMode','globalVersionMode','globalFilenameTemplate','resembleInstallMode','resembleDevice','videoFormat','videoMp3Bitrate','videoSampleRate','videoChannels','videoNormalize','audioLabFormat','audioLabMp3Bitrate','audioLabSampleRate','audioLabChannels','audioLabNormalize']){
+  for(const id of ['engine','profileSelect','role','ref','refText','text','xVector','splitLong','rememberForm','uiMode','optAdvanced','optProfileTools','optExperimental','optMetadata','optLogs','optDelete','optStickyTabs','optPanelOrientation','optJobsAsTab','optOpsWidth','globalName','globalNameMode','globalFunctionMode','globalDateMode','globalVersionMode','globalFilenameTemplate','resembleInstallMode','resembleDevice','videoFormat','videoMp3Bitrate','videoSampleRate','videoChannels','videoNormalize','audioLabFormat','audioLabMp3Bitrate','audioLabSampleRate','audioLabChannels','audioLabNormalize','speechAnalysisEngine','speechDiarizationMode']){
     const el=$(id); if(!el || el.dataset.stateHooked) continue;
     el.dataset.stateHooked='1'; el.addEventListener('input', ()=>{ updateNamingSummaries(); scheduleFormStateSave(); }); el.addEventListener('change', ()=>{ updateNamingSummaries(); scheduleFormStateSave(); });
   }
@@ -4885,6 +5202,21 @@ function sttJobBlock(j){
     </div>` : '';
   const details = meta ? `<details class="pref-metadata"><summary>STT result metadata</summary>${copyButton(meta, 'copy metadata', 'STT metadata copied.')}<pre>${esc(meta)}</pre></details>` : '';
   return `${warning}${used}${preview}${buttons}${details}`;
+}
+function speechAnalysisJobBlock(j){
+  const result = j.result || {};
+  const summary = result.summary || {};
+  const files = result.files || {};
+  const cuts = result.proposed_cuts || [];
+  const speakerSegments = result.speaker_segments || [];
+  const meta = Object.keys(result).length ? JSON.stringify(result, null, 2) : '';
+  const cutRows = cuts.slice(0, 12).map(c=>`<tr><td>${esc(c.type||'')}</td><td>${esc(fmtDuration(c.start||0))}</td><td>${esc(fmtDuration(c.end||0))}</td><td>${esc(c.speaker_label||c.speaker||'')}</td><td>${esc(c.reason||'')}</td><td>${c.safe_auto_cut?'<span class="ok">yes</span>':'review'}</td></tr>`).join('');
+  const speakers = Array.from(new Set(speakerSegments.map(s=>s.speaker_label || s.speaker || 'unknown'))).join(', ');
+  const summaryHtml = `<div class="small"><b>Speech analysis:</b> ${esc(summary.word_count||0)} words, ${esc(summary.speaker_segment_count||0)} speaker segments, ${esc(summary.proposed_cut_count||0)} proposed cuts. Speakers: ${esc(speakers || 'unknown')}</div>`;
+  const filesHtml = files.analysis_json ? `<div class="small">Analysis files:<br><code>${esc(files.analysis_json||'')}</code><br><code>${esc(files.transcript_md||'')}</code><br><code>${esc(files.proposed_cuts_json||'')}</code></div>` : '';
+  const cutsHtml = cuts.length ? `<details open><summary>Proposed cuts preview</summary><table><thead><tr><th>type</th><th>start</th><th>end</th><th>speaker</th><th>reason</th><th>auto?</th></tr></thead><tbody>${cutRows}</tbody></table>${cuts.length>12?`<div class="small">Showing first 12 of ${esc(cuts.length)} proposed cuts.</div>`:''}</details>` : '<div class="small">No proposed cuts detected.</div>';
+  const buttons = `<div class="inline-tools pref-metadata">${meta?copyButton(meta, 'copy analysis JSON', 'Speech analysis JSON copied.'):''}</div>`;
+  return `${summaryHtml}${filesHtml}${cutsHtml}${buttons}${meta?`<details class="pref-metadata"><summary>Full speech analysis JSON</summary><pre>${esc(meta)}</pre></details>`:''}`;
 }
 function audioLabJobBlock(j){
   const result = j.result || {};
@@ -4945,8 +5277,9 @@ function refreshJobs(){
   return api('/api/jobs').then(data=>{
     detectHfAuthNoticeFromJobs(data);
     updateCurrentSttFromJobs(data);
+    updateCurrentSpeechAnalysisFromJobs(data);
     const active = data.jobs.some(j => j.status === 'queued' || j.status === 'running' || j.status === 'canceling');
-    const sig = JSON.stringify(data.jobs.map(j => [j.id, j.status, j.returncode, j.error, j.warning, j.output, (j.children||[]).length, j.transcript||""]));
+    const sig = JSON.stringify(data.jobs.map(j => [j.id, j.kind, j.status, j.returncode, j.error, j.warning, j.output, (j.children||[]).length, j.transcript||"", (j.result&&j.result.proposed_cuts?j.result.proposed_cuts.length:0)]));
     // Avoid destroying/recreating <audio> elements while the user is listening.
     // Re-render only when something actually changed, and defer non-critical
     // visual refreshes if audio is playing.
@@ -5166,6 +5499,59 @@ function deleteOutput(path, name){
 let sttSources = [];
 let currentSttSavedTranscript = "";
 let currentSttSavedTranscriptLabel = "";
+let currentSpeechAnalysisJobId = null;
+function loadSpeechAnalysisStatus(){
+  if(!$('speechAnalysisStatus')) return Promise.resolve();
+  return api('/api/stt/analysis-status').then(d=>{
+    const fw = d.faster_whisper && d.faster_whisper.ready;
+    const wx = d.whisperx && d.whisperx.ready;
+    const pa = d.pyannote && d.pyannote.ready;
+    const cr = d.crisperwhisper && d.crisperwhisper.ready;
+    $('speechAnalysisStatus').innerHTML = `<b>Speech analysis:</b> ${fw?'<span class="ok">Faster-Whisper ready</span>':'<span class="warn">Faster-Whisper not ready</span>'}. ` +
+      `CrisperWhisper: ${cr?'<span class="ok">detected</span>':'<span class="warn">not wired/detected</span>'}. ` +
+      `WhisperX: ${wx?'<span class="ok">detected</span>':'<span class="warn">not wired/detected</span>'}. ` +
+      `pyannote: ${pa?'<span class="ok">detected</span>':'<span class="warn">not wired/detected</span>'}.` +
+      `<br><span class="small">v0.88 writes speaker-aware analysis JSON and proposed edit decisions. True diarization remains experimental until the WhisperX/pyannote backend is installed and validated.</span>`;
+  }).catch(err=>{ $('speechAnalysisStatus').innerHTML='<span class="bad">Could not check speech analysis status: '+esc(err)+'</span>'; });
+}
+function analyzeSpeechRepair(){
+  const path=$('sttSource').value || '';
+  if(!path){ alert('Choose an audio source first.'); return; }
+  $('speechAnalysisResult').textContent = 'Queued speech repair analysis. Watch Jobs for status and logs.';
+  const body={
+    path,
+    model:$('sttModel').value,
+    language:$('sttLanguage').value,
+    device:$('sttDevice').value,
+    compute_type:$('sttCompute') ? $('sttCompute').value : 'auto',
+    analysis_engine:$('speechAnalysisEngine') ? $('speechAnalysisEngine').value : 'faster-whisper-analysis',
+    diarization_mode:$('speechDiarizationMode') ? $('speechDiarizationMode').value : 'speaker-schema'
+  };
+  api('/api/stt/analyze', {method:'POST', body:JSON.stringify(body)}).then(r=>{
+    currentSpeechAnalysisJobId = r.job && r.job.id;
+    lastJobsSig='';
+    refreshJobs();
+    startPoll();
+  }).catch(err=>{ $('speechAnalysisResult').textContent = 'Could not queue speech analysis: ' + err; });
+}
+function updateCurrentSpeechAnalysisFromJobs(data){
+  if(!currentSpeechAnalysisJobId) return;
+  const j=(data.jobs||[]).find(x=>x.id===currentSpeechAnalysisJobId);
+  if(!j) return;
+  if(j.status === 'done'){
+    const result = j.result || {};
+    const summary = result.summary || {};
+    $('speechAnalysisResult').textContent = JSON.stringify({summary, files: result.files || {}, diarization: result.diarization || {}, proposed_cuts_preview: (result.proposed_cuts||[]).slice(0, 20)}, null, 2);
+    $('sttMeta').textContent = JSON.stringify(result, null, 2);
+    if(result.text) $('sttTranscript').value = result.text;
+    currentSpeechAnalysisJobId = null;
+  } else if(j.status === 'error' || j.status === 'canceled'){
+    $('speechAnalysisResult').textContent = j.status === 'canceled' ? 'Speech analysis canceled.' : 'Speech analysis failed. Open the job log for details.\n\n' + (j.error || 'Unknown error');
+    currentSpeechAnalysisJobId = null;
+  } else {
+    $('speechAnalysisResult').textContent = `Speech analysis ${j.status}... open the Jobs panel for logs.`;
+  }
+}
 function loadSttStatus(){
   return api('/api/stt/status').then(d=>{
     const ok = d.ready;
@@ -5753,7 +6139,7 @@ function resembleJobBlock(j){
     (work?`<details class="pref-metadata"><summary>Resemble work directory</summary><code>${esc(work)}</code></details>`:'');
 }
 
-function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckStack(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
+function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSpeechAnalysisStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckStack(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
 function startPoll(){
   if(poll) return;
   poll=setInterval(async ()=>{
@@ -5877,6 +6263,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"state": read_webui_state(), "path": str(WEBUI_STATE)})
             elif path == "/api/stt/status":
                 self.send_json(whisper_status_payload())
+            elif path == "/api/stt/analysis-status":
+                self.send_json(speech_analysis_status_payload())
             elif path == "/api/stt/sources":
                 self.send_json({"sources": stt_sources_payload()})
             elif path == "/api/audio-lab/sources":
@@ -6001,6 +6389,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"path": str(target), "name": target.name, "size": target.stat().st_size, "duration_seconds": audio_duration_seconds(target)})
             elif path == "/api/stt/transcribe":
                 job = Job(id=uuid.uuid4().hex, kind="stt")
+                JOBS.add(job, body)
+                self.send_json({"job": job.public()})
+            elif path == "/api/stt/analyze":
+                job = Job(id=uuid.uuid4().hex, kind="speech-analysis")
                 JOBS.add(job, body)
                 self.send_json({"job": job.public()})
             elif path == "/api/stt/save-transcript":

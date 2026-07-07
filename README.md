@@ -20,9 +20,10 @@ Normal use is intended to happen in the browser. Terminal commands are acceptabl
 
 This public alpha includes:
 
-- **Web UI v0.87** in [`webui/`](webui/)
+- **Web UI v0.88** in [`webui/`](webui/)
 - **TTS Lab Stack Installer v0.1.2** in [`stack-installer/`](stack-installer/)
 - Optional **HandAISpoke / AI Studio Bridge** sidecar for short local TTS voice patches
+- Experimental **Speech Repair Analysis / diarization foundation** for speaker-aware transcripts and proposed edit decisions
 - Documentation for the AI-assisted development process in [`docs/`](docs/)
 
 The Web UI and stack installer are kept in separate folders so the app and the machine setup contract stay understandable without creating an extra repository.
@@ -110,6 +111,25 @@ TTS_VIDEO_DL_CMD='/home/user/video-dl/video-dl {url} {out}' ./start.sh
 ```
 
 Video Intake should remain archive-first: download/archive the source media first, then extract audio as a separate action.
+
+
+## Speech Repair Analysis / diarization foundation
+
+Web UI v0.88 adds a review-first analysis layer for spoken-word editing and podcast/archive transcription. It is designed to prepare the ground for filler removal, stutter cleanup, false-start review, and diarized archive transcripts.
+
+The v0.88 analysis path can produce:
+
+```text
+source audio
+→ Faster-Whisper transcript with word timestamps when available
+→ speaker-aware transcript JSON
+→ proposed filler/repetition/false-start cuts
+→ Markdown transcript and proposed-cuts JSON
+```
+
+This is intentionally **not** a one-click destructive editor. Proposed cuts are review candidates. True WhisperX/pyannote diarization and CrisperWhisper verbatim transcription are documented as experimental backend targets, with status reporting in the STT tab.
+
+See [`docs/speech-analysis-diarization.md`](docs/speech-analysis-diarization.md).
 
 ## HandAISpoke / AI Studio Bridge
 
