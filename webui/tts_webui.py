@@ -73,7 +73,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.86"
+VERSION = "0.87"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS

@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.86
+# TTS Lab Unified Web UI v0.87
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.86 adds public-alpha stack status diagnostics under Maintenance while preserving the v0.85 Actions dropdown and external launch work.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.87 adds an optional HandAISpoke / AI Studio Bridge sidecar while preserving v0.86 stack diagnostics and v0.85 Actions dropdown/external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.86.zip
+unzip -o tts_unified_webui_v0.87.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -52,6 +52,26 @@ Whisper output should be treated as a draft. Review/edit before saving a transcr
 
 The changelog below is ordered newest-to-oldest. Early project versions used labels such as `v0.4`; later versions use labels such as `v0.41`. Treat these as historical release labels, not decimal numbers.
 
+
+## New in v0.87
+
+- Adds an optional **HandAISpoke / AI Studio Bridge** sidecar for short local TTS voice patches.
+- Installs `tts_ai_studio_bridge.py`, `run-ai-studio-bridge.sh`, and `.env.ai-studio-bridge.example` under the Web UI folder.
+- Adds `/home/user/tts-lab/start-ai-studio-bridge.sh` during install.
+- Bridge defaults to `127.0.0.1:7871` and calls the normal Web UI on `127.0.0.1:7870`.
+- Bridge requires `X-HandAISpoke-Bridge-Token` from `TTS_AI_STUDIO_BRIDGE_TOKEN`.
+- Bridge exposes only status, clone-TTS patch generation, and job-status endpoints; it does not expose the full browser UI.
+- Bridge logs request metadata to `/home/user/tts-lab/logs/ui-diagnostics/ai-studio-bridge.log` without logging full base64 audio or long text.
+- Corrects architecture wording: local Chatterbox/Qwen3/CosyVoice engines handle cloned/custom voice generation, not Gemini.
+
+Start the bridge only after the main Web UI is running:
+
+```bash
+export TTS_AI_STUDIO_BRIDGE_TOKEN='replace-with-a-long-random-token'
+/home/user/tts-lab/start-ai-studio-bridge.sh
+```
+
+Tunnel only port `7871` if using Cloudflare quick tunnels for AI Studio testing. Do not tunnel the full Web UI port `7870`.
 
 ## New in v0.86
 
