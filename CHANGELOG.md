@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.1.3-alpha - 2026-07-07
+
+Speech analysis and diarization foundation pass.
+
+Includes:
+
+- Web UI v0.88
+- Speech Repair Analysis controls in the STT tab
+- word-timestamp support in the Faster-Whisper helper for analysis jobs
+- speaker-aware transcript JSON schema with `speaker`, `speaker_label`, and speaker-turn fields
+- proposed edit-decision output for filler words, repeated words, and possible false starts
+- analysis artifacts under `/home/user/tts-lab/output/speech_analysis/`
+- backend status reporting for CrisperWhisper, WhisperX, pyannote, and auto-editor readiness
+- documentation for diarization limitations and future speaker-label workflow
+
+Notes:
+
+- v0.88 does not cut audio destructively. It produces reviewable analysis JSON and proposed cuts.
+- True WhisperX/pyannote diarization is treated as experimental/planned unless the backend is installed and wired in a later pass.
+- Automatic speaker labels are placeholders. Human review is required before publishing or archive indexing.
+
+Validation:
+
+- Web UI Python syntax check passed.
+- Faster-Whisper helper Python syntax check passed.
+- Browser JavaScript parsed with Node.
+- Speech analysis candidate-detection tests passed.
+
 ## v0.1.2-alpha - 2026-07-07
 
 AI Studio bridge pass.
