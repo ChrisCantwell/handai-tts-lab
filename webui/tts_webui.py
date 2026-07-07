@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.88.1 tightens speech-repair analysis by consolidating duplicate false-start candidates while keeping destructive editing behind review.
+Version 0.88.2 adds speech-analysis edit handoff helpers for Audacity labels and end-to-beginning manual review checklists while keeping destructive editing behind review.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -74,7 +74,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.88.1"
+VERSION = "0.88.2"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
@@ -4511,7 +4511,10 @@ EXEC: Pick one.</textarea>
         <div class="inline-tools pref-metadata">
           <button class="mini secondary" type="button" onclick="copySpeechAnalysisResult(this)">copy analysis result</button>
           <button class="mini secondary" type="button" onclick="selectSpeechAnalysisResult()">select all result text</button>
+          <button class="mini secondary" type="button" onclick="copySpeechAnalysisAudacityLabels(this)">copy Audacity labels</button>
+          <button class="mini secondary" type="button" onclick="copySpeechAnalysisEditChecklist(this)">copy edit checklist</button>
         </div>
+        <p class="small">Audacity labels and edit checklists are manual-review handoffs only. Listen around each region before deleting audio, and cut from the end of the file backward so earlier timestamps do not shift.</p>
         <textarea id="speechAnalysisResult" class="logbox" readonly spellcheck="false">No speech repair analysis yet.</textarea>
       </details>
     </div>
@@ -4558,6 +4561,7 @@ let activeLogTitle = "";
 let formStateLoaded = false;
 let stateSaveTimer = null;
 let currentSttJobId = null;
+let currentSpeechAnalysisResult = null;
 let lastSttSelectedPath = null;
 const TAB_NAMES = ['single','batch','profiles','refs','options','stt','video','audio','resemble','maintenance','jobs'];
 let uiDiagEvents = [];
@@ -4833,6 +4837,80 @@ function selectSpeechAnalysisResult(){
   if(!el) return;
   el.focus();
   if(el.select) el.select();
+}
+function speechAnalysisCutsForHandoff(result=null){
+  const src = result || currentSpeechAnalysisResult || null;
+  if(src && Array.isArray(src.proposed_cuts)) return src.proposed_cuts;
+  try{
+    const parsed = JSON.parse(getSpeechAnalysisResult() || '{}');
+    if(Array.isArray(parsed.proposed_cuts)) return parsed.proposed_cuts;
+    if(Array.isArray(parsed.proposed_cuts_preview)) return parsed.proposed_cuts_preview;
+  }catch(e){}
+  return [];
+}
+function cleanSpeechAnalysisLabelText(value){
+  return String(value ?? '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function speechAnalysisCutLabel(c, idx){
+  const type = cleanSpeechAnalysisLabelText(c.type || 'speech_review');
+  const speaker = cleanSpeechAnalysisLabelText(c.speaker_label || c.speaker || 'unknown');
+  const reason = cleanSpeechAnalysisLabelText(c.reason || 'review before cutting');
+  const text = cleanSpeechAnalysisLabelText(c.text || '').slice(0, 90);
+  const review = c.safe_auto_cut ? 'candidate' : 'review';
+  return `REVIEW CUT ${String(idx+1).padStart(2,'0')} ${type} ${speaker} ${review} — ${reason}${text ? ' — ' + text : ''}`;
+}
+function numericCutStart(c){
+  const n = Number(c && c.start);
+  return Number.isFinite(n) ? n : 0;
+}
+function numericCutEnd(c){
+  const start = numericCutStart(c);
+  const n = Number(c && c.end);
+  return Number.isFinite(n) ? Math.max(start, n) : start;
+}
+function buildSpeechAnalysisAudacityLabels(result=null){
+  const cuts = speechAnalysisCutsForHandoff(result).slice().sort((a,b)=>numericCutStart(a)-numericCutStart(b));
+  if(!cuts.length) return '# No speech-analysis proposed cuts are available. Run analysis first.\n';
+  return cuts.map((c, idx)=>{
+    const start = numericCutStart(c).toFixed(3);
+    const end = numericCutEnd(c).toFixed(3);
+    return `${start}\t${end}\t${speechAnalysisCutLabel(c, idx)}`;
+  }).join('\n') + '\n';
+}
+function buildSpeechAnalysisEditChecklist(result=null){
+  const src = result || currentSpeechAnalysisResult || null;
+  const cuts = speechAnalysisCutsForHandoff(src).slice().sort((a,b)=>numericCutEnd(b)-numericCutEnd(a));
+  const source = src && src.source_name ? src.source_name : (($('sttSource') && $('sttSource').value) || 'selected audio');
+  const lines = [
+    'Speech Repair Analysis edit checklist',
+    'Source: ' + source,
+    'Generated: ' + new Date().toISOString(),
+    '',
+    'Manual editing rule: review and cut from the end of the file backward so earlier timestamps do not shift.',
+    'Listen a few seconds before and after each region before deleting anything.',
+    ''
+  ];
+  if(!cuts.length){
+    lines.push('No proposed cuts are available. Run speech analysis first.');
+    return lines.join('\n') + '\n';
+  }
+  cuts.forEach((c, idx)=>{
+    const start = numericCutStart(c);
+    const end = numericCutEnd(c);
+    lines.push(`${idx+1}. Review ${start.toFixed(3)}s–${end.toFixed(3)}s (${fmtDuration(start)}–${fmtDuration(end)})`);
+    lines.push(`   Type: ${cleanSpeechAnalysisLabelText(c.type || '')}`);
+    lines.push(`   Reason: ${cleanSpeechAnalysisLabelText(c.reason || '')}`);
+    if(c.text) lines.push(`   Transcript clue: ${cleanSpeechAnalysisLabelText(c.text).slice(0, 180)}`);
+    lines.push('   Action: [ ] keep  [ ] cut  [ ] adjust boundary');
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+function copySpeechAnalysisAudacityLabels(btn){
+  copyText(buildSpeechAnalysisAudacityLabels(), 'Audacity labels copied.', btn);
+}
+function copySpeechAnalysisEditChecklist(btn){
+  copyText(buildSpeechAnalysisEditChecklist(), 'Speech edit checklist copied.', btn);
 }
 function copyField(id, sourceEl=null, message='Copied.'){ copyText($(id).value || '', message || 'Copied.', sourceEl); }
 function copyButton(text, label, message){ return `<button class="mini secondary copy-btn" data-copy="${esc(text)}" data-copy-message="${esc(message||'Copied.')}" title="${esc(message||'Copy')}">${esc(label)}</button>`; }
@@ -5429,7 +5507,10 @@ function speechAnalysisJobBlock(j){
   const summaryHtml = `<div class="small"><b>Speech analysis:</b> ${esc(summary.word_count||0)} words, ${esc(summary.speaker_segment_count||0)} speaker segments, ${esc(summary.proposed_cut_count||0)} proposed cuts${suppressedNote}. Speakers: ${esc(speakers || 'unknown')}</div>`;
   const filesHtml = files.analysis_json ? `<div class="small">Analysis files:<br><code>${esc(files.analysis_json||'')}</code><br><code>${esc(files.transcript_md||'')}</code><br><code>${esc(files.proposed_cuts_json||'')}</code></div>` : '';
   const cutsHtml = cuts.length ? `<details open><summary>Proposed cuts preview</summary><table><thead><tr><th>type</th><th>start</th><th>end</th><th>speaker</th><th>reason</th><th>auto?</th></tr></thead><tbody>${cutRows}</tbody></table>${cuts.length>12?`<div class="small">Showing first 12 of ${esc(cuts.length)} proposed cuts.</div>`:''}</details>` : '<div class="small">No proposed cuts detected.</div>';
-  const buttons = `<div class="inline-tools pref-metadata">${meta?copyButton(meta, 'copy analysis JSON', 'Speech analysis JSON copied.'):''}</div>`;
+  const buttons = `<div class="inline-tools pref-metadata">${meta?copyButton(meta, 'copy analysis JSON', 'Speech analysis JSON copied.'):''}
+    ${cuts.length?copyButton(buildSpeechAnalysisAudacityLabels(result), 'copy Audacity labels', 'Audacity labels copied.'):''}
+    ${cuts.length?copyButton(buildSpeechAnalysisEditChecklist(result), 'copy edit checklist', 'Speech edit checklist copied.'):''}
+  </div>`;
   return `${summaryHtml}${filesHtml}${cutsHtml}${buttons}${meta?`<details class="pref-metadata"><summary>Full speech analysis JSON</summary><pre>${esc(meta)}</pre></details>`:''}`;
 }
 function audioLabJobBlock(j){
@@ -5731,6 +5812,7 @@ function loadSpeechAnalysisStatus(){
 function analyzeSpeechRepair(){
   const path=$('sttSource').value || '';
   if(!path){ alert('Choose an audio source first.'); return; }
+  currentSpeechAnalysisResult = null;
   setSpeechAnalysisResult('Queued speech repair analysis. Watch Jobs for status and logs.');
   const body={
     path,
@@ -5755,11 +5837,13 @@ function updateCurrentSpeechAnalysisFromJobs(data){
   if(j.status === 'done'){
     const result = j.result || {};
     const summary = result.summary || {};
+    currentSpeechAnalysisResult = result;
     setSpeechAnalysisResult(JSON.stringify({summary, candidate_stats: result.candidate_stats || {}, files: result.files || {}, diarization: result.diarization || {}, proposed_cuts_preview: (result.proposed_cuts||[]).slice(0, 20)}, null, 2));
     $('sttMeta').textContent = JSON.stringify(result, null, 2);
     if(result.text) $('sttTranscript').value = result.text;
     currentSpeechAnalysisJobId = null;
   } else if(j.status === 'error' || j.status === 'canceled'){
+    currentSpeechAnalysisResult = null;
     setSpeechAnalysisResult(j.status === 'canceled' ? 'Speech analysis canceled.' : 'Speech analysis failed. Open the job log for details.\n\n' + (j.error || 'Unknown error'));
     currentSpeechAnalysisJobId = null;
   } else {
