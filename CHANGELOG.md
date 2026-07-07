@@ -1,5 +1,33 @@
 # Changelog
 
+
+## v0.1.3-alpha patch 2 - 2026-07-07
+
+Speech analysis editing handoff helper pass.
+
+Includes:
+
+- Web UI v0.88.2
+- Audacity label export/copy helper for review-only speech-analysis cuts
+- end-to-beginning edit checklist copy helper for manual editing
+- preserved non-destructive speech analysis behavior
+- current speech-analysis result caching so handoff buttons use the full cut list, not just the visible preview
+- local queued/running/done/failure status beside the Analyze button for Jobs-as-tab layouts
+- safer Audacity label export with short tab-delimited labels only
+- Audacity labels omit the trailing blank line so Audacity does not warn about an incomplete extra label
+
+Notes:
+
+- This pass still does not cut audio automatically.
+- Audacity labels and edit checklists are handoff aids for manual review.
+- Audacity label output intentionally uses short plain labels to reduce importer fragility.
+- Operators should still listen around each proposed region before deleting audio.
+
+Validation:
+
+- Web UI Python syntax check should pass.
+- Browser JavaScript should parse with Node.
+
 ## v0.1.3-alpha patch - 2026-07-07
 
 Speech analysis cut-consolidation hotfix.

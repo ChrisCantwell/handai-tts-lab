@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.88.1
+# TTS Lab Unified Web UI v0.88.2
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.88.1 tightens Speech Repair Analysis by consolidating duplicate false-start candidates and keeps the diarization-ready transcript schema while preserving the v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.88.2 turns Speech Repair Analysis into a more useful manual-editing handoff by adding Audacity labels and end-to-beginning edit checklists, while preserving the v0.88.1 cut-consolidation work, v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.88.1.zip
+unzip -o tts_unified_webui_v0.88.2.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -51,6 +51,15 @@ Whisper output should be treated as a draft. Review/edit before saving a transcr
 ## Changelog order note
 
 The changelog below is ordered newest-to-oldest. Early project versions used labels such as `v0.4`; later versions use labels such as `v0.41`. Treat these as historical release labels, not decimal numbers.
+
+
+## New in v0.88.2
+
+- Adds **copy Audacity labels** for proposed speech-analysis cuts.
+- Adds **copy edit checklist** with cuts ordered from end to beginning so manual deletions do not shift earlier timestamps.
+- Keeps the workflow non-destructive: labels/checklists are review aids only.
+- Shows queued/running/done status beside the analysis button, useful when Jobs is hidden as its own tab.
+- Uses conservative short Audacity labels with no trailing blank line to avoid importer trouble from long label text or incomplete extra labels.
 
 
 ## New in v0.88.1
