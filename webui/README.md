@@ -58,6 +58,8 @@ The changelog below is ordered newest-to-oldest. Early project versions used lab
 - Adds **copy Audacity labels** for proposed speech-analysis cuts.
 - Adds **copy edit checklist** with cuts ordered from end to beginning so manual deletions do not shift earlier timestamps.
 - Keeps the workflow non-destructive: labels/checklists are review aids only.
+- Shows queued/running/done status beside the analysis button, useful when Jobs is hidden as its own tab.
+- Uses conservative short Audacity labels to avoid importer trouble from long label text.
 
 
 ## New in v0.88.1

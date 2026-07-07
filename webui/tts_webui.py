@@ -4506,7 +4506,8 @@ EXEC: Pick one.</textarea>
           <div><label>Analysis engine</label><select id="speechAnalysisEngine"><option value="faster-whisper-analysis" selected>Faster-Whisper analysis - working baseline</option><option value="crisperwhisper-experimental">CrisperWhisper - experimental/planned verbatim backend</option><option value="whisperx-diarization-experimental">WhisperX diarization - experimental/planned backend</option></select></div>
           <div><label>Diarization mode</label><select id="speechDiarizationMode"><option value="speaker-schema" selected>Speaker-turn schema now / diarization later</option><option value="off">Off</option><option value="whisperx-pyannote-experimental">WhisperX + pyannote experimental</option></select></div>
         </div>
-        <div class="inline-tools"><button class="secondary" onclick="loadSpeechAnalysisStatus()">Check analysis backends</button><button onclick="analyzeSpeechRepair()">Analyze selected audio for speech repair</button></div>
+        <div class="inline-tools"><button class="secondary" onclick="loadSpeechAnalysisStatus()">Check analysis backends</button><button id="speechAnalysisAnalyzeButton" onclick="analyzeSpeechRepair()">Analyze selected audio for speech repair</button></div>
+        <div id="speechAnalysisRunStatus" class="small inline-status">No speech repair analysis running.</div>
         <p class="small">v0.88 creates transcript JSON, speaker-turn scaffolding, and proposed cuts for fillers/repeats/possible false starts. It does not cut audio. Review everything before destructive editing.</p>
         <div class="inline-tools pref-metadata">
           <button class="mini secondary" type="button" onclick="copySpeechAnalysisResult(this)">copy analysis result</button>
@@ -4838,6 +4839,12 @@ function selectSpeechAnalysisResult(){
   el.focus();
   if(el.select) el.select();
 }
+function setSpeechAnalysisRunStatus(message, kind=''){
+  const el = $('speechAnalysisRunStatus');
+  if(!el) return;
+  const cls = kind === 'ok' ? 'ok' : (kind === 'bad' ? 'bad' : (kind === 'warn' ? 'warn' : ''));
+  el.innerHTML = cls ? `<span class="${cls}">${esc(message || '')}</span>` : esc(message || '');
+}
 function speechAnalysisCutsForHandoff(result=null){
   const src = result || currentSpeechAnalysisResult || null;
   if(src && Array.isArray(src.proposed_cuts)) return src.proposed_cuts;
@@ -4849,15 +4856,11 @@ function speechAnalysisCutsForHandoff(result=null){
   return [];
 }
 function cleanSpeechAnalysisLabelText(value){
-  return String(value ?? '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return String(value ?? '').replace(/[\t\r\n]+/g, ' ').replace(/[^A-Za-z0-9 _.-]+/g, '').replace(/\s+/g, ' ').trim();
 }
 function speechAnalysisCutLabel(c, idx){
-  const type = cleanSpeechAnalysisLabelText(c.type || 'speech_review');
-  const speaker = cleanSpeechAnalysisLabelText(c.speaker_label || c.speaker || 'unknown');
-  const reason = cleanSpeechAnalysisLabelText(c.reason || 'review before cutting');
-  const text = cleanSpeechAnalysisLabelText(c.text || '').slice(0, 90);
-  const review = c.safe_auto_cut ? 'candidate' : 'review';
-  return `REVIEW CUT ${String(idx+1).padStart(2,'0')} ${type} ${speaker} ${review} — ${reason}${text ? ' — ' + text : ''}`;
+  const type = cleanSpeechAnalysisLabelText(c.type || 'review').replace(/_/g, '-').slice(0, 28) || 'review';
+  return `CUT ${String(idx+1).padStart(2,'0')} ${type}`.slice(0, 48);
 }
 function numericCutStart(c){
   const n = Number(c && c.start);
@@ -4870,7 +4873,7 @@ function numericCutEnd(c){
 }
 function buildSpeechAnalysisAudacityLabels(result=null){
   const cuts = speechAnalysisCutsForHandoff(result).slice().sort((a,b)=>numericCutStart(a)-numericCutStart(b));
-  if(!cuts.length) return '# No speech-analysis proposed cuts are available. Run analysis first.\n';
+  if(!cuts.length) return '';
   return cuts.map((c, idx)=>{
     const start = numericCutStart(c).toFixed(3);
     const end = numericCutEnd(c).toFixed(3);
@@ -4907,7 +4910,9 @@ function buildSpeechAnalysisEditChecklist(result=null){
   return lines.join('\n');
 }
 function copySpeechAnalysisAudacityLabels(btn){
-  copyText(buildSpeechAnalysisAudacityLabels(), 'Audacity labels copied.', btn);
+  const labels = buildSpeechAnalysisAudacityLabels();
+  if(!labels.trim()){ setSpeechAnalysisRunStatus('No proposed cuts available for Audacity labels. Run analysis first.', 'warn'); return; }
+  copyText(labels, 'Safe Audacity labels copied.', btn);
 }
 function copySpeechAnalysisEditChecklist(btn){
   copyText(buildSpeechAnalysisEditChecklist(), 'Speech edit checklist copied.', btn);
@@ -5813,6 +5818,9 @@ function analyzeSpeechRepair(){
   const path=$('sttSource').value || '';
   if(!path){ alert('Choose an audio source first.'); return; }
   currentSpeechAnalysisResult = null;
+  setSpeechAnalysisRunStatus('Queued speech repair analysis...', 'warn');
+  const btn = $('speechAnalysisAnalyzeButton');
+  if(btn) btn.disabled = true;
   setSpeechAnalysisResult('Queued speech repair analysis. Watch Jobs for status and logs.');
   const body={
     path,
@@ -5825,10 +5833,16 @@ function analyzeSpeechRepair(){
   };
   api('/api/stt/analyze', {method:'POST', body:JSON.stringify(body)}).then(r=>{
     currentSpeechAnalysisJobId = r.job && r.job.id;
+    setSpeechAnalysisRunStatus('Speech analysis running. Jobs tab has logs if needed.', 'warn');
     lastJobsSig='';
     refreshJobs();
     startPoll();
-  }).catch(err=>{ setSpeechAnalysisResult('Could not queue speech analysis: ' + err); });
+  }).catch(err=>{
+    const btn = $('speechAnalysisAnalyzeButton');
+    if(btn) btn.disabled = false;
+    setSpeechAnalysisRunStatus('Could not queue speech analysis.', 'bad');
+    setSpeechAnalysisResult('Could not queue speech analysis: ' + err);
+  });
 }
 function updateCurrentSpeechAnalysisFromJobs(data){
   if(!currentSpeechAnalysisJobId) return;
@@ -5841,12 +5855,19 @@ function updateCurrentSpeechAnalysisFromJobs(data){
     setSpeechAnalysisResult(JSON.stringify({summary, candidate_stats: result.candidate_stats || {}, files: result.files || {}, diarization: result.diarization || {}, proposed_cuts_preview: (result.proposed_cuts||[]).slice(0, 20)}, null, 2));
     $('sttMeta').textContent = JSON.stringify(result, null, 2);
     if(result.text) $('sttTranscript').value = result.text;
+    setSpeechAnalysisRunStatus(`Speech analysis done: ${summary.proposed_cut_count || 0} proposed cuts.`, 'ok');
+    const btn = $('speechAnalysisAnalyzeButton');
+    if(btn) btn.disabled = false;
     currentSpeechAnalysisJobId = null;
   } else if(j.status === 'error' || j.status === 'canceled'){
     currentSpeechAnalysisResult = null;
+    setSpeechAnalysisRunStatus(j.status === 'canceled' ? 'Speech analysis canceled.' : 'Speech analysis failed.', 'bad');
+    const btn = $('speechAnalysisAnalyzeButton');
+    if(btn) btn.disabled = false;
     setSpeechAnalysisResult(j.status === 'canceled' ? 'Speech analysis canceled.' : 'Speech analysis failed. Open the job log for details.\n\n' + (j.error || 'Unknown error'));
     currentSpeechAnalysisJobId = null;
   } else {
+    setSpeechAnalysisRunStatus(`Speech analysis ${j.status}...`, 'warn');
     setSpeechAnalysisResult(`Speech analysis ${j.status}... open the Jobs panel for logs.`);
   }
 }

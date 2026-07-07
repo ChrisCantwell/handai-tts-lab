@@ -12,11 +12,14 @@ Includes:
 - end-to-beginning edit checklist copy helper for manual editing
 - preserved non-destructive speech analysis behavior
 - current speech-analysis result caching so handoff buttons use the full cut list, not just the visible preview
+- local queued/running/done/failure status beside the Analyze button for Jobs-as-tab layouts
+- safer Audacity label export with short tab-delimited labels only
 
 Notes:
 
 - This pass still does not cut audio automatically.
 - Audacity labels and edit checklists are handoff aids for manual review.
+- Audacity label output intentionally uses short plain labels to reduce importer fragility.
 - Operators should still listen around each proposed region before deleting audio.
 
 Validation:
