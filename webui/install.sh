@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 LAB="${TTS_LAB:-/home/user/tts-lab}"
 WEBUI="$LAB/webui"
 LAUNCHER="$LAB/tts-lab.sh"
-APP_VERSION="$(awk -F'\"' '/^VERSION =/ {print $2; exit}' tts_webui.py 2>/dev/null || true)"
+APP_VERSION="$(awk -F'\"' '/^VERSION =/ {print $2; exit}' "$SCRIPT_DIR/tts_webui.py" 2>/dev/null || true)"
 if [[ -z "$APP_VERSION" ]]; then
   APP_VERSION="unknown"
 fi
@@ -17,16 +19,16 @@ if [[ ! -f "$LAUNCHER" ]]; then
 fi
 
 mkdir -p "$WEBUI" "$LAB/output" "$LAB/output/job_history" "$LAB/output/audio_lab" "$LAB/output/video_intake/source_media/uploads" "$LAB/output/video_intake/source_media/url_imports" "$LAB/output/video_intake/extracted_audio" "$LAB/output/resemble_enhance" "$LAB/resemble_uploads" "$LAB/engines/resemble-enhance" "$LAB/references" "$LAB/references/profiles" "$LAB/stt_uploads" "$LAB/config"
-cp tts_webui.py "$WEBUI/tts_webui.py"
-cp stt_faster_whisper.py "$WEBUI/stt_faster_whisper.py"
-if [[ -f tts_ai_studio_bridge.py ]]; then
-  cp tts_ai_studio_bridge.py "$WEBUI/tts_ai_studio_bridge.py"
+cp "$SCRIPT_DIR/tts_webui.py" "$WEBUI/tts_webui.py"
+cp "$SCRIPT_DIR/stt_faster_whisper.py" "$WEBUI/stt_faster_whisper.py"
+if [[ -f "$SCRIPT_DIR/tts_ai_studio_bridge.py" ]]; then
+  cp "$SCRIPT_DIR/tts_ai_studio_bridge.py" "$WEBUI/tts_ai_studio_bridge.py"
 fi
-if [[ -f run-ai-studio-bridge.sh ]]; then
-  cp run-ai-studio-bridge.sh "$WEBUI/run-ai-studio-bridge.sh"
+if [[ -f "$SCRIPT_DIR/run-ai-studio-bridge.sh" ]]; then
+  cp "$SCRIPT_DIR/run-ai-studio-bridge.sh" "$WEBUI/run-ai-studio-bridge.sh"
 fi
-if [[ -f .env.ai-studio-bridge.example ]]; then
-  cp .env.ai-studio-bridge.example "$WEBUI/.env.ai-studio-bridge.example"
+if [[ -f "$SCRIPT_DIR/.env.ai-studio-bridge.example" ]]; then
+  cp "$SCRIPT_DIR/.env.ai-studio-bridge.example" "$WEBUI/.env.ai-studio-bridge.example"
 fi
 chmod +x "$WEBUI/tts_webui.py" "$WEBUI/stt_faster_whisper.py"
 if [[ -f "$WEBUI/tts_ai_studio_bridge.py" ]]; then chmod +x "$WEBUI/tts_ai_studio_bridge.py"; fi
