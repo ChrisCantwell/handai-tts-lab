@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.88 adds speech-repair analysis scaffolding and speaker-aware transcript outputs while keeping destructive editing behind review.
+Version 0.88.1 tightens speech-repair analysis by consolidating duplicate false-start candidates while keeping destructive editing behind review.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -74,7 +74,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.88"
+VERSION = "0.88.1"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
@@ -1453,7 +1453,7 @@ def _python_import_status(python_path: Path, module_name: str, label: str) -> di
 def speech_analysis_status_payload() -> dict[str, Any]:
     """Status for v0.88 speech-repair analysis backends.
 
-    v0.88 intentionally makes diarization a first-class output concept even when
+    v0.88.1 intentionally makes diarization a first-class output concept even when
     the heavy WhisperX/pyannote backend is not installed yet. That keeps future
     archive work speaker-aware without pretending automatic labels are perfect.
     """
@@ -1472,7 +1472,7 @@ def speech_analysis_status_payload() -> dict[str, Any]:
         "pyannote": pyannote_status,
         "auto_editor": {"path": shutil.which("auto-editor") or "", "ready": bool(shutil.which("auto-editor"))},
         "hf_token": hf_token_status_payload(),
-        "note": "v0.88 generates speaker-aware analysis JSON and proposed edit decisions. WhisperX/pyannote diarization remains experimental and requires local installation plus any needed Hugging Face access.",
+        "note": "v0.88.1 generates speaker-aware analysis JSON, consolidates duplicate false-start candidates, and keeps WhisperX/pyannote diarization experimental until locally installed and validated.",
         "supported_modes": ["faster-whisper-analysis", "crisperwhisper-planned", "whisperx-diarization-planned"],
     }
 
@@ -1556,7 +1556,88 @@ def _speaker_segments_from_result(data: dict[str, Any], words: list[dict[str, An
     return []
 
 
-def _proposed_cuts_from_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _cut_start(cut: dict[str, Any]) -> float:
+    try:
+        return float(cut.get("start") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _cut_end(cut: dict[str, Any]) -> float:
+    try:
+        return float(cut.get("end") or cut.get("start") or 0.0)
+    except Exception:
+        return _cut_start(cut)
+
+
+def _consolidate_possible_false_starts(cuts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Merge the sliding-window false-start spam into reviewable regions.
+
+    The first v0.88 heuristic intentionally erred on the side of catching restarts,
+    but a real sample produced dozens of overlapping candidates for one spoken
+    fumble. This keeps every filler/repeated-word candidate, but collapses
+    overlapping possible_false_start regions into a single review item per region.
+    """
+    fixed = [c for c in cuts if c.get("type") != "possible_false_start"]
+    false_starts = sorted(
+        [c for c in cuts if c.get("type") == "possible_false_start"],
+        key=lambda c: (_cut_start(c), _cut_end(c), str(c.get("id") or "")),
+    )
+    raw_false_start_count = len(false_starts)
+    groups: list[list[dict[str, Any]]] = []
+    for cut in false_starts:
+        if not groups:
+            groups.append([cut])
+            continue
+        group = groups[-1]
+        group_start = min(_cut_start(c) for c in group)
+        group_end = max(_cut_end(c) for c in group)
+        same_speaker = str(cut.get("speaker") or "") == str(group[0].get("speaker") or "")
+        overlaps_or_near = _cut_start(cut) <= group_end + 0.75
+        starts_same_region = abs(_cut_start(cut) - group_start) <= 3.0
+        if same_speaker and (overlaps_or_near or starts_same_region):
+            group.append(cut)
+        else:
+            groups.append([cut])
+
+    consolidated_false_starts: list[dict[str, Any]] = []
+    for idx, group in enumerate(groups, 1):
+        if len(group) == 1:
+            c = dict(group[0])
+            c.setdefault("merged_count", 1)
+            consolidated_false_starts.append(c)
+            continue
+        start = min(_cut_start(c) for c in group)
+        end = max(_cut_end(c) for c in group)
+        best = max(group, key=lambda c: ((_cut_end(c) - _cut_start(c)), len(str(c.get("text") or ""))))
+        merged_ids = [str(c.get("id") or "") for c in group if c.get("id")]
+        c = dict(best)
+        c.update({
+            "id": f"possible-false-start-consolidated-{idx:04d}",
+            "type": "possible_false_start",
+            "start": round(start, 3),
+            "end": round(max(start, end), 3),
+            "reason": f"Consolidated {len(group)} overlapping false-start candidates. Review before cutting; this may be intentional repetition.",
+            "confidence": "low",
+            "safe_auto_cut": False,
+            "consolidated": True,
+            "merged_count": len(group),
+            "raw_ids": merged_ids[:20],
+        })
+        consolidated_false_starts.append(c)
+
+    out = fixed + consolidated_false_starts
+    out.sort(key=lambda c: (_cut_start(c), _cut_end(c), str(c.get("id") or "")))
+    stats = {
+        "raw_proposed_cut_count": len(cuts),
+        "raw_false_start_count": raw_false_start_count,
+        "consolidated_false_start_count": len(consolidated_false_starts),
+        "suppressed_duplicate_cut_count": max(0, len(cuts) - len(out)),
+    }
+    return out, stats
+
+
+def _proposed_cuts_from_words(words: list[dict[str, Any]], include_stats: bool = False):
     cuts: list[dict[str, Any]] = []
     for idx, w in enumerate(words):
         txt = _norm_word(_word_text(w))
@@ -1614,8 +1695,9 @@ def _proposed_cuts_from_words(words: list[dict[str, Any]]) -> list[dict[str, Any
                 })
         else:
             seen[phrase] = i
-    cuts.sort(key=lambda c: (float(c.get("start") or 0.0), float(c.get("end") or 0.0), str(c.get("id") or "")))
-    return cuts
+    cuts.sort(key=lambda c: (_cut_start(c), _cut_end(c), str(c.get("id") or "")))
+    consolidated, stats = _consolidate_possible_false_starts(cuts)
+    return (consolidated, stats) if include_stats else consolidated
 
 
 def _markdown_transcript_from_segments(segments: list[dict[str, Any]]) -> str:
@@ -1632,12 +1714,12 @@ def _markdown_transcript_from_segments(segments: list[dict[str, Any]]) -> str:
 def build_speech_analysis_result(src: Path, transcript_data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     words = _words_from_transcript_result(transcript_data)
     speaker_segments = _speaker_segments_from_result(transcript_data, words)
-    cuts = _proposed_cuts_from_words(words)
+    cuts, cut_stats = _proposed_cuts_from_words(words, include_stats=True)
     requested_backend = str(payload.get("analysis_engine") or "faster-whisper-analysis").strip()
     diarization_mode = str(payload.get("diarization_mode") or "speaker-schema").strip()
     result = {
         "kind": "speech-repair-analysis",
-        "schema_version": "0.88.0",
+        "schema_version": "0.88.1",
         "created_at": iso_time(),
         "source_path": str(src),
         "source_name": src.name,
@@ -1655,15 +1737,20 @@ def build_speech_analysis_result(src: Path, transcript_data: dict[str, Any], pay
             "word_count": len(words),
             "speaker_segment_count": len(speaker_segments),
             "proposed_cut_count": len(cuts),
+            "raw_proposed_cut_count": cut_stats.get("raw_proposed_cut_count", len(cuts)),
+            "suppressed_duplicate_cut_count": cut_stats.get("suppressed_duplicate_cut_count", 0),
+            "raw_false_start_count": cut_stats.get("raw_false_start_count", 0),
+            "consolidated_false_start_count": cut_stats.get("consolidated_false_start_count", 0),
             "filler_count": len([c for c in cuts if c.get("type") == "filler"]),
             "review_required_count": len([c for c in cuts if not c.get("safe_auto_cut")]),
         },
         "diarization": {
             "status": "schema_only" if diarization_mode != "off" else "off",
             "backend": "none",
-            "note": "v0.88 stores speaker-aware turns now. True WhisperX/pyannote diarization is an experimental backend to install/enable in a later pass.",
+            "note": "v0.88.1 stores speaker-aware turns now and consolidates overlapping false-start candidates. True WhisperX/pyannote diarization is an experimental backend to install/enable in a later pass.",
             "speaker_label_options": ["unknown", "host", "caller", "guest", "cohost", "news_clip", "music", "silence"],
         },
+        "candidate_stats": cut_stats,
         "safety": {
             "destructive_editing": False,
             "note": "These are proposed edit decisions only. Review before cutting audio.",
@@ -5212,7 +5299,10 @@ function speechAnalysisJobBlock(j){
   const meta = Object.keys(result).length ? JSON.stringify(result, null, 2) : '';
   const cutRows = cuts.slice(0, 12).map(c=>`<tr><td>${esc(c.type||'')}</td><td>${esc(fmtDuration(c.start||0))}</td><td>${esc(fmtDuration(c.end||0))}</td><td>${esc(c.speaker_label||c.speaker||'')}</td><td>${esc(c.reason||'')}</td><td>${c.safe_auto_cut?'<span class="ok">yes</span>':'review'}</td></tr>`).join('');
   const speakers = Array.from(new Set(speakerSegments.map(s=>s.speaker_label || s.speaker || 'unknown'))).join(', ');
-  const summaryHtml = `<div class="small"><b>Speech analysis:</b> ${esc(summary.word_count||0)} words, ${esc(summary.speaker_segment_count||0)} speaker segments, ${esc(summary.proposed_cut_count||0)} proposed cuts. Speakers: ${esc(speakers || 'unknown')}</div>`;
+  const rawCuts = summary.raw_proposed_cut_count || summary.proposed_cut_count || 0;
+  const suppressedCuts = summary.suppressed_duplicate_cut_count || 0;
+  const suppressedNote = suppressedCuts ? ` <span class="warn">(${esc(suppressedCuts)} duplicate/overlap candidates suppressed from ${esc(rawCuts)} raw)</span>` : '';
+  const summaryHtml = `<div class="small"><b>Speech analysis:</b> ${esc(summary.word_count||0)} words, ${esc(summary.speaker_segment_count||0)} speaker segments, ${esc(summary.proposed_cut_count||0)} proposed cuts${suppressedNote}. Speakers: ${esc(speakers || 'unknown')}</div>`;
   const filesHtml = files.analysis_json ? `<div class="small">Analysis files:<br><code>${esc(files.analysis_json||'')}</code><br><code>${esc(files.transcript_md||'')}</code><br><code>${esc(files.proposed_cuts_json||'')}</code></div>` : '';
   const cutsHtml = cuts.length ? `<details open><summary>Proposed cuts preview</summary><table><thead><tr><th>type</th><th>start</th><th>end</th><th>speaker</th><th>reason</th><th>auto?</th></tr></thead><tbody>${cutRows}</tbody></table>${cuts.length>12?`<div class="small">Showing first 12 of ${esc(cuts.length)} proposed cuts.</div>`:''}</details>` : '<div class="small">No proposed cuts detected.</div>';
   const buttons = `<div class="inline-tools pref-metadata">${meta?copyButton(meta, 'copy analysis JSON', 'Speech analysis JSON copied.'):''}</div>`;
@@ -5541,7 +5631,7 @@ function updateCurrentSpeechAnalysisFromJobs(data){
   if(j.status === 'done'){
     const result = j.result || {};
     const summary = result.summary || {};
-    $('speechAnalysisResult').textContent = JSON.stringify({summary, files: result.files || {}, diarization: result.diarization || {}, proposed_cuts_preview: (result.proposed_cuts||[]).slice(0, 20)}, null, 2);
+    $('speechAnalysisResult').textContent = JSON.stringify({summary, candidate_stats: result.candidate_stats || {}, files: result.files || {}, diarization: result.diarization || {}, proposed_cuts_preview: (result.proposed_cuts||[]).slice(0, 20)}, null, 2);
     $('sttMeta').textContent = JSON.stringify(result, null, 2);
     if(result.text) $('sttTranscript').value = result.text;
     currentSpeechAnalysisJobId = null;

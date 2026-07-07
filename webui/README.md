@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.88
+# TTS Lab Unified Web UI v0.88.1
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.88 adds Speech Repair Analysis and a diarization-ready transcript schema while preserving the v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.88.1 tightens Speech Repair Analysis by consolidating duplicate false-start candidates and keeps the diarization-ready transcript schema while preserving the v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.88.zip
+unzip -o tts_unified_webui_v0.88.1.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -52,6 +52,11 @@ Whisper output should be treated as a draft. Review/edit before saving a transcr
 
 The changelog below is ordered newest-to-oldest. Early project versions used labels such as `v0.4`; later versions use labels such as `v0.41`. Treat these as historical release labels, not decimal numbers.
 
+
+## New in v0.88.1
+
+- Consolidates heavily overlapping `possible_false_start` proposals so one spoken fumble does not create dozens of duplicate review items.
+- Adds raw/suppressed candidate counts to speech analysis summaries.
 
 ## New in v0.88
 

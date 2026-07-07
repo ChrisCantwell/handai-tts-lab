@@ -1,6 +1,6 @@
 # Speech Repair Analysis and Diarization Foundation
 
-Web UI v0.88 adds the first local foundation for spoken-word repair analysis. The goal is to turn long, messy speech audio into structured data that can later drive reviewable audio edits.
+Web UI v0.88/v0.88.1 adds the first local foundation for spoken-word repair analysis. The goal is to turn long, messy speech audio into structured data that can later drive reviewable audio edits.
 
 This is not a destructive editor yet. It creates analysis artifacts and proposed edit decisions.
 
@@ -17,7 +17,7 @@ which sections are filler, stutter, restart, or possible false start
 what cuts were proposed, accepted, rejected, or exported
 ```
 
-## v0.88 behavior
+## v0.88/v0.88.1 behavior
 
 The first implementation uses the existing Faster-Whisper helper as the working baseline. Analysis jobs request word timestamps when supported, then generate:
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.1.3-alpha patch - 2026-07-07
+
+Speech analysis cut-consolidation hotfix.
+
+Includes:
+
+- Web UI v0.88.1
+- consolidation of heavily overlapping `possible_false_start` candidates
+- raw/suppressed candidate counts in speech analysis summaries
+- regression test based on a real noisy repeated-take sample
+
+Notes:
+
+- False-start candidates remain review-only and are never auto-cut.
+- This pass does not add true WhisperX/pyannote diarization yet.
+
+Validation:
+
+- Web UI Python syntax check passed.
+- Speech analysis candidate regression test passed.
+
 ## v0.1.3-alpha - 2026-07-07
 
 Speech analysis and diarization foundation pass.
