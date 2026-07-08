@@ -61,6 +61,8 @@ The changelog below is ordered newest-to-oldest. Early project versions used lab
 - Supports optional title, artist, album, year/date, genre, and comment fields.
 - Uses FFmpeg for cover-art/ID3 embedding and saves output under `/home/user/tts-lab/output/metadata/`.
 - Preserves source files; this pass does not overwrite the original MP3.
+- Metadata local saves follow **Options → File naming defaults** unless the Metadata tab output filename override is filled.
+- Adds an optional **Download tagged MP3 when done** checkbox for browser download/Save As workflows.
 
 
 ## New in v0.88.2
