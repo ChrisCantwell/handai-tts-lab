@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.88.2 adds speech-analysis edit handoff helpers for Audacity labels and end-to-beginning manual review checklists while keeping destructive editing behind review.
+Version 0.89 adds a practical Metadata tab for attaching cover art and basic ID3 fields to MP3 files while keeping source files untouched.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -66,6 +66,8 @@ WHISPER_HELPER = Path(os.environ.get("TTS_WHISPER_HELPER", str(LAB / "webui" / "
 WHISPER_PYTHON = Path(os.environ.get("TTS_WHISPER_PYTHON", str(Path.home() / "miniconda3" / "envs" / "tts-whisper" / "bin" / "python")))
 WHISPER_CUDA_INSTALLER = Path(os.environ.get("TTS_WHISPER_CUDA_INSTALLER", str(LAB / "install-whisper-cuda-libs.sh")))
 SPEECH_ANALYSIS_DIR = Path(os.environ.get("TTS_SPEECH_ANALYSIS_DIR", str(OUT_DIR / "speech_analysis")))
+METADATA_DIR = Path(os.environ.get("TTS_METADATA_DIR", str(OUT_DIR / "metadata")))
+METADATA_UPLOAD_DIR = METADATA_DIR / "uploads"
 CONDA_ROOT = Path(os.environ.get("CONDA_ROOT", str(Path.home() / "miniconda3")))
 STACK_INSTALLER = Path(os.environ.get("TTS_STACK_INSTALLER", str(LAB / "stack-installer" / "install-tts-lab-stack.sh")))
 STACK_INSTALLER_ENV = os.environ.get("TTS_STACK_INSTALLER", "").strip()
@@ -74,8 +76,9 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.88.2"
+VERSION = "0.89"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
 TEXT_EXTS = {".txt", ".md", ".text", ".json"}
@@ -144,6 +147,8 @@ def ensure_dirs() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     UI_DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
     SPEECH_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+    METADATA_DIR.mkdir(parents=True, exist_ok=True)
+    METADATA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def unique_wav(prefix: str) -> Path:
@@ -1858,6 +1863,12 @@ def build_speech_analysis_result(src: Path, transcript_data: dict[str, Any], pay
     }
     return result
 
+
+def metadata_status_payload() -> dict[str, Any]:
+    ffmpeg = command_probe("ffmpeg")
+    ffprobe = command_probe("ffprobe")
+    return {"ready": bool(ffmpeg.get("available")), "ffmpeg": ffmpeg, "ffprobe": ffprobe, "output_dir": str(METADATA_DIR), "upload_dir": str(METADATA_UPLOAD_DIR)}
+
 def fmt_seconds(value: Any) -> str:
     try:
         if value is None:
@@ -2794,6 +2805,8 @@ class JobManager:
                     self._run_stt(job, payload)
                 elif job.kind == "speech-analysis":
                     self._run_speech_analysis(job, payload)
+                elif job.kind == "metadata":
+                    self._run_metadata_job(job, payload)
                 elif job.kind == "setup":
                     self._run_setup(job, payload)
                 elif job.kind == "audio":
@@ -3793,6 +3806,78 @@ class JobManager:
         final_output.with_suffix(final_output.suffix + ".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         self._set(job, status="done", output=str(final_output), result=meta, finished_at=now())
 
+
+    def _run_metadata_job(self, job: Job, payload: dict[str, Any]) -> None:
+        ensure_dirs()
+        status = metadata_status_payload()
+        if not status.get("ready"):
+            raise RuntimeError("FFmpeg is required for Metadata tab MP3 tagging, but ffmpeg was not found in PATH.")
+        mp3_filename = safe_filename(str(payload.get("mp3_filename") or "source.mp3"), "source.mp3")
+        cover_filename = safe_filename(str(payload.get("cover_filename") or "cover.jpg"), "cover.jpg")
+        if Path(mp3_filename).suffix.lower() != ".mp3":
+            raise ValueError("Metadata tab currently accepts MP3 source files only.")
+        if Path(cover_filename).suffix.lower() not in IMAGE_EXTS:
+            raise ValueError("Cover image must be JPG or PNG for broad MP3 player compatibility.")
+        mp3_bytes = decode_b64(str(payload.get("mp3_base64") or ""))
+        cover_bytes = decode_b64(str(payload.get("cover_base64") or ""))
+        work = METADATA_UPLOAD_DIR / job.id
+        work.mkdir(parents=True, exist_ok=True)
+        src = work / mp3_filename
+        cover = work / cover_filename
+        src.write_bytes(mp3_bytes)
+        cover.write_bytes(cover_bytes)
+
+        requested_name = safe_filename(str(payload.get("output_filename") or ""), "")
+        if requested_name:
+            if Path(requested_name).suffix.lower() != ".mp3":
+                requested_name += ".mp3"
+            output = next_versioned_path(METADATA_DIR / requested_name, always_version=False)
+        else:
+            source_stem = safe_filename(Path(mp3_filename).stem, "mp3").strip(" ._-") or "mp3"
+            output = next_versioned_path(METADATA_DIR / f"{source_stem}_tagged.mp3", always_version=False)
+
+        fields = {
+            "title": str(payload.get("title") or "").strip(),
+            "artist": str(payload.get("artist") or "").strip(),
+            "album": str(payload.get("album") or "").strip(),
+            "date": str(payload.get("date") or payload.get("year") or "").strip(),
+            "genre": str(payload.get("genre") or "").strip(),
+            "comment": str(payload.get("comment") or "").strip(),
+        }
+        self._set(job, status="running", started_at=now(), engine="ffmpeg", role="metadata", text=f"Attach cover art: {mp3_filename}", source_path=str(src))
+        self._append_log(job, "Metadata tab MP3 tagging job. Source files are copied into the metadata work area; original uploads are preserved.\n")
+        self._append_log(job, f"Source MP3: {src}\nCover image: {cover}\nOutput MP3: {output}\n")
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(src),
+            "-i", str(cover),
+            "-map", "0:a",
+            "-map", "1:v:0",
+            "-c", "copy",
+            "-id3v2_version", "3",
+            "-metadata:s:v", "title=Album cover",
+            "-metadata:s:v", "comment=Cover (front)",
+            "-disposition:v:0", "attached_pic",
+        ]
+        for key, value in fields.items():
+            if value:
+                cmd += ["-metadata", f"{key}={value}"]
+        cmd.append(str(output))
+        rc = self._run_subprocess(job, cmd, cwd=LAB)
+        if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+            try:
+                output.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._mark_canceled(job)
+            return
+        if rc != 0 or not output.exists() or output.stat().st_size <= 0:
+            self._set(job, status="error", error="FFmpeg failed to write tagged MP3. Open the job log for details.", finished_at=now())
+            return
+        result = {"kind": "metadata-output", "created_at": iso_time(), "job_id": job.id, "source_mp3": str(src), "cover_image": str(cover), "output_audio": str(output), "output_format": "mp3", "metadata": fields, "note": "Created by Metadata tab. Source MP3 was not overwritten."}
+        output.with_suffix(output.suffix + ".json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        self._set(job, status="done", output=str(output), result=result, finished_at=now())
+
     def _run_video_intake(self, job: Job, payload: dict[str, Any]) -> None:
         action = str(payload.get("action") or "").strip().lower()
         source_type = str(payload.get("source_type") or "upload").strip().lower()
@@ -3991,8 +4076,8 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 </head>
 <body>
 <header>
-  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.78</span></h1>
-  <div class="small">Voice profiles, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
+  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.89</span></h1>
+  <div class="small">Voice profiles, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Metadata cover-art tagging, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
 </header>
 <main>
   <section class="left-panel">
@@ -4005,6 +4090,7 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
       <button id="tab-stt" onclick="showTab('stt')">STT / Transcribe</button>
       <button id="tab-video" onclick="showTab('video')">Video Intake</button>
       <button id="tab-audio" onclick="showTab('audio')">Audio Lab</button>
+      <button id="tab-metadata" onclick="showTab('metadata')">Metadata</button>
       <button id="tab-resemble" onclick="showTab('resemble')">Resemble Enhance</button>
       <button id="tab-maintenance" onclick="showTab('maintenance')">Maintenance</button>
       <button id="tab-jobs" class="jobs-tab-button hidden" onclick="showTab('jobs')">Jobs</button>
@@ -4202,6 +4288,39 @@ EXEC: Pick one.</textarea>
       <div class="sticky-actions"><button onclick="processAudioLab()">Process audio</button></div>
       <div id="audioLabStatus" class="small inline-status"></div>
       <p class="small">Processed files are saved under <code>/home/user/tts-lab/output/audio_lab/</code>. Completed Audio Lab jobs appear in Jobs with playback, actual-format download, and before/after waveform previews when available.</p>
+    </div>
+
+
+    <div id="pane-metadata" class="hidden">
+      <h2>Metadata</h2>
+      <p class="small">Practical MP3 publishing helper. Pick an MP3, pick a JPG/PNG cover image, optionally fill ID3 fields, and write a new tagged MP3 copy. The original MP3 is not overwritten.</p>
+      <div id="metadataStatus" class="warning-box">Checking metadata backend...</div>
+      <div class="row">
+        <div>
+          <label>Source MP3</label>
+          <input id="metadataMp3File" type="file" accept="audio/mpeg,.mp3" />
+        </div>
+        <div>
+          <label>Cover image</label>
+          <input id="metadataCoverFile" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" />
+        </div>
+      </div>
+      <div class="row">
+        <div><label>Title</label><input id="metadataTitle" placeholder="Episode title" /></div>
+        <div><label>Artist</label><input id="metadataArtist" placeholder="The Handy A.I. Man" /></div>
+      </div>
+      <div class="row3">
+        <div><label>Album / show</label><input id="metadataAlbum" placeholder="The Handy A.I. Man" /></div>
+        <div><label>Year / date</label><input id="metadataDate" placeholder="2026" /></div>
+        <div><label>Genre</label><input id="metadataGenre" placeholder="Podcast" /></div>
+      </div>
+      <label>Comment</label>
+      <input id="metadataComment" placeholder="Optional comment / description" />
+      <label>Output filename</label>
+      <input id="metadataOutputName" placeholder="leave blank for source_tagged.mp3" />
+      <div class="sticky-actions"><button id="metadataWriteButton" type="button" onclick="writeMetadataMp3()">Write tagged MP3 copy</button></div>
+      <div id="metadataActionStatus" class="small inline-status"></div>
+      <p class="small">Outputs are saved under <code>/home/user/tts-lab/output/metadata/</code> and appear in Jobs/Recent audio with playback, download links, and normal handoff actions.</p>
     </div>
 
     <div id="pane-resemble" class="hidden">
@@ -4563,8 +4682,9 @@ let formStateLoaded = false;
 let stateSaveTimer = null;
 let currentSttJobId = null;
 let currentSpeechAnalysisResult = null;
+let currentMetadataJobId = null;
 let lastSttSelectedPath = null;
-const TAB_NAMES = ['single','batch','profiles','refs','options','stt','video','audio','resemble','maintenance','jobs'];
+const TAB_NAMES = ['single','batch','profiles','refs','options','stt','video','audio','metadata','resemble','maintenance','jobs'];
 let uiDiagEvents = [];
 let currentTabName = '';
 let lastStackStatus = null;
@@ -5553,8 +5673,9 @@ function renderJobs(data){
     ${isStt ? sttJobBlock(j) : ''}
     ${j.kind==='audio' ? audioLabJobBlock(j) : ''}
     ${j.kind==='video' ? videoJobBlock(j) : ''}
+      ${j.kind==='metadata' ? metadataJobBlock(j) : ''}
     ${j.kind==='resemble' ? resembleJobBlock(j) : ''}
-    ${(!isStt && j.kind!=='video' && j.kind!=='resemble' && j.audio_url)?`<audio controls preload="none" src="${j.preview_url || j.audio_url}"></audio>${durationBadge(j.duration_seconds, false)}<br>${outputActions(j.output_path || j.output, j.text, j.id || '')} <a download href="${j.wav_url || j.audio_url}">download ${esc(((j.output_path||j.output||'').split('.').pop()||'audio').toLowerCase())}</a><br>${metadataBlock(j)}`:''}
+    ${(!isStt && j.kind!=='video' && j.kind!=='metadata' && j.kind!=='resemble' && j.audio_url)?`<audio controls preload="none" src="${j.preview_url || j.audio_url}"></audio>${durationBadge(j.duration_seconds, false)}<br>${outputActions(j.output_path || j.output, j.text, j.id || '')} <a download href="${j.wav_url || j.audio_url}">download ${esc(((j.output_path||j.output||'').split('.').pop()||'audio').toLowerCase())}</a><br>${metadataBlock(j)}`:''}
     ${j.manifest_url?`<a download href="${j.manifest_url}">manifest</a><br>`:''}
     ${j.children&&j.children.length?`<details><summary>${j.children.length} batch lines</summary>${j.children.map(c=>`${c.ok?'✅':'❌'} ${esc(c.index)} ${esc(c.role)} ${c.audio_url?`<audio controls preload="none" src="${c.preview_url || c.audio_url}"></audio>${durationBadge(c.duration_seconds, false)} ${outputActions(c.output, c.text)} <a download href="${c.wav_url || c.audio_url}">download wav</a>`:''}<br>`).join('')}</details>`:''}
     ${j.error?`<div class="bad">${esc(j.error)}</div>`:''}
@@ -5578,6 +5699,7 @@ function refreshJobs(){
     detectHfAuthNoticeFromJobs(data);
     updateCurrentSttFromJobs(data);
     updateCurrentSpeechAnalysisFromJobs(data);
+    updateCurrentMetadataFromJobs(data);
     const active = data.jobs.some(j => j.status === 'queued' || j.status === 'running' || j.status === 'canceling');
     const sig = JSON.stringify(data.jobs.map(j => [j.id, j.kind, j.status, j.returncode, j.error, j.warning, j.output, (j.children||[]).length, j.transcript||"", (j.result&&j.result.proposed_cuts?j.result.proposed_cuts.length:0)]));
     // Avoid destroying/recreating <audio> elements while the user is listening.
@@ -6458,6 +6580,84 @@ function resembleJobBlock(j){
     (work?`<details class="pref-metadata"><summary>Resemble work directory</summary><code>${esc(work)}</code></details>`:'');
 }
 
+
+function metadataJobBlock(j){
+  const result = j.result || {};
+  const path = j.output_path || j.output || result.output_audio || '';
+  const fields = result.metadata || {};
+  const details = Object.keys(fields).filter(k=>fields[k]).map(k=>`${esc(k)}: <code>${esc(fields[k])}</code>`).join(' · ');
+  const src = result.source_mp3 || j.source_path || '';
+  const cover = result.cover_image || '';
+  const player = (path && j.audio_url) ? `<audio controls preload="none" src="${j.preview_url || j.audio_url}"></audio>${durationBadge(j.duration_seconds, false)}<br>${outputActions(path, fields.title || '', 'metadata-'+(j.id || ''))} <a download href="${j.wav_url || j.audio_url}">download tagged mp3</a>` : '';
+  return `<div class="small">Tagged MP3 output${details?' · '+details:''}</div>` +
+    (src?`<div class="small">Source copy: <code>${esc(String(src).slice(0,240))}</code></div>`:'') +
+    (cover?`<div class="small">Cover image: <code>${esc(String(cover).slice(0,240))}</code></div>`:'') +
+    player;
+}
+
+function loadMetadataStatus(){
+  return api('/api/metadata/status').then(d=>{
+    const el=$('metadataStatus'); if(!el) return d;
+    el.innerHTML = d.ready
+      ? '<span class="ok">Metadata backend ready:</span> FFmpeg detected. Tagged MP3 copies will be saved under <code>'+esc(d.output_dir || '')+'</code>.'
+      : '<span class="bad">Metadata backend not ready.</span> FFmpeg was not detected. Install ffmpeg, then restart or refresh the Web UI.';
+    return d;
+  }).catch(err=>{ const el=$('metadataStatus'); if(el) el.innerHTML='<span class="bad">Could not check metadata backend: '+esc(err)+'</span>'; });
+}
+
+function setMetadataRunning(running, message=''){
+  const btn=$('metadataWriteButton'); if(btn) btn.disabled=!!running;
+  const st=$('metadataActionStatus'); if(st && message) st.innerHTML=message;
+}
+
+async function writeMetadataMp3(){
+  const mp3=$('metadataMp3File') && $('metadataMp3File').files ? $('metadataMp3File').files[0] : null;
+  const cover=$('metadataCoverFile') && $('metadataCoverFile').files ? $('metadataCoverFile').files[0] : null;
+  if(!mp3){ setMetadataRunning(false, '<span class="bad">Choose an MP3 first.</span>'); return; }
+  if(!cover){ setMetadataRunning(false, '<span class="bad">Choose a cover image first.</span>'); return; }
+  if(!/\.mp3$/i.test(mp3.name || '')){ setMetadataRunning(false, '<span class="bad">Source file must be an MP3.</span>'); return; }
+  if(!/\.(jpg|jpeg|png)$/i.test(cover.name || '')){ setMetadataRunning(false, '<span class="bad">Cover must be JPG or PNG.</span>'); return; }
+  setMetadataRunning(true, '<span class="warn">Reading files and queueing metadata job...</span>');
+  let body;
+  try{
+    body={
+      mp3_filename: mp3.name,
+      mp3_base64: await fileToB64(mp3),
+      cover_filename: cover.name,
+      cover_base64: await fileToB64(cover),
+      title: readFieldValue('metadataTitle',''),
+      artist: readFieldValue('metadataArtist',''),
+      album: readFieldValue('metadataAlbum',''),
+      date: readFieldValue('metadataDate',''),
+      genre: readFieldValue('metadataGenre',''),
+      comment: readFieldValue('metadataComment',''),
+      output_filename: readFieldValue('metadataOutputName','')
+    };
+  }catch(err){
+    setMetadataRunning(false, '<span class="bad">Could not read selected files: '+esc(err)+'</span>');
+    return;
+  }
+  api('/api/metadata/write', {method:'POST', body:JSON.stringify(body)})
+    .then(r=>{ currentMetadataJobId = r.job && r.job.id; setMetadataRunning(true, queuedJobStatus('metadata tagging', r.job || r)); lastJobsSig=''; refreshJobs(); startPoll(); })
+    .catch(err=>{ currentMetadataJobId=null; setMetadataRunning(false, '<span class="bad">Could not queue metadata job: '+esc(err)+'</span>'); });
+}
+
+function updateCurrentMetadataFromJobs(data){
+  if(!currentMetadataJobId) return;
+  const j=(data.jobs||[]).find(x=>x.id===currentMetadataJobId);
+  if(!j) return;
+  if(j.status === 'done'){
+    const path = j.output_path || j.output || (j.result && j.result.output_audio) || '';
+    setMetadataRunning(false, '<span class="ok">Tagged MP3 ready.</span> '+(path?'<code>'+esc(path)+'</code>':'')+' '+openJobsButtonHtml());
+    currentMetadataJobId = null;
+  } else if(j.status === 'error' || j.status === 'canceled'){
+    setMetadataRunning(false, j.status === 'canceled' ? '<span class="warn">Metadata job canceled.</span>' : '<span class="bad">Metadata job failed. Open the job log for details.</span>');
+    currentMetadataJobId = null;
+  } else {
+    setMetadataRunning(true, '<span class="warn">Metadata job '+esc(j.status)+'...</span>'+openJobsButtonHtml());
+  }
+}
+
 function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSpeechAnalysisStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckStack(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
 function startPoll(){
   if(poll) return;
@@ -6596,6 +6796,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(external_command_status())
             elif path == "/api/resemble/status":
                 self.send_json(resemble_status_payload())
+            elif path == "/api/metadata/status":
+                self.send_json(metadata_status_payload())
             elif path == "/api/resemble/sources":
                 self.send_json({"sources": resemble_sources_payload()})
             elif path == "/api/hf-token/status":
@@ -6793,6 +6995,10 @@ class Handler(BaseHTTPRequestHandler):
                 job = Job(id=uuid.uuid4().hex, kind="resemble")
                 payload = dict(body)
                 JOBS.add(job, payload)
+                self.send_json({"job": job.public()})
+            elif path == "/api/metadata/write":
+                job = Job(id=uuid.uuid4().hex, kind="metadata")
+                JOBS.add(job, dict(body))
                 self.send_json({"job": job.public()})
             elif path == "/api/external-launch":
                 self.send_json(launch_external_target(str(body.get("target", "system-default")), str(body.get("path", ""))))

@@ -1,6 +1,33 @@
 # Changelog
 
 
+## v0.1.3-alpha patch 3 - 2026-07-07
+
+Metadata tab pass.
+
+Includes:
+
+- Web UI v0.89
+- new Metadata tab for practical MP3 publishing cleanup
+- upload MP3 + upload cover image workflow
+- optional title, artist, album, year/date, genre, and comment fields
+- FFmpeg-based ID3/cover-art embedding into a new MP3 copy
+- original MP3 and image are preserved under the metadata work area
+- output MP3 is saved under `/home/user/tts-lab/output/metadata/`
+- completed metadata jobs appear in Jobs with playback/download/actions
+
+Notes:
+
+- This pass does not overwrite the source MP3.
+- FFmpeg is required for the first metadata backend.
+- This is intentionally simpler than Kid3/eyeD3: pick MP3, pick image, write a tagged copy.
+
+Validation:
+
+- Web UI Python syntax check should pass.
+- Shell syntax checks should pass.
+
+
 ## v0.1.3-alpha patch 2 - 2026-07-07
 
 Speech analysis editing handoff helper pass.
