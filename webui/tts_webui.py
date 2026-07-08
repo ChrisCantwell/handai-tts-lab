@@ -695,6 +695,7 @@ def default_webui_state() -> dict[str, Any]:
         "audio_lab_sample_rate": "unchanged",
         "audio_lab_channels": "unchanged",
         "audio_lab_normalize": True,
+        "metadata_download_when_done": False,
     }
 
 
@@ -3833,8 +3834,19 @@ class JobManager:
                 requested_name += ".mp3"
             output = next_versioned_path(METADATA_DIR / requested_name, always_version=False)
         else:
-            source_stem = safe_filename(Path(mp3_filename).stem, "mp3").strip(" ._-") or "mp3"
-            output = next_versioned_path(METADATA_DIR / f"{source_stem}_tagged.mp3", always_version=False)
+            output = named_output_path(
+                METADATA_DIR,
+                src,
+                "mp3",
+                custom_text=str(payload.get("name") or "").strip(),
+                custom_mode=str(payload.get("name_mode") or "none"),
+                date_mode=str(payload.get("date_mode") or "none"),
+                version_mode=str(payload.get("version_mode") or "collision"),
+                function_mode=str(payload.get("function_mode") or "none"),
+                filename_template=str(payload.get("filename_template") or ""),
+                function_label="tagged",
+                fallback_base="metadata-mp3",
+            )
 
         fields = {
             "title": str(payload.get("title") or "").strip(),
@@ -3853,6 +3865,7 @@ class JobManager:
             "-i", str(cover),
             "-map", "0:a",
             "-map", "1:v:0",
+            "-map_metadata", "0",
             "-c", "copy",
             "-id3v2_version", "3",
             "-metadata:s:v", "title=Album cover",
@@ -3874,7 +3887,27 @@ class JobManager:
         if rc != 0 or not output.exists() or output.stat().st_size <= 0:
             self._set(job, status="error", error="FFmpeg failed to write tagged MP3. Open the job log for details.", finished_at=now())
             return
-        result = {"kind": "metadata-output", "created_at": iso_time(), "job_id": job.id, "source_mp3": str(src), "cover_image": str(cover), "output_audio": str(output), "output_format": "mp3", "metadata": fields, "note": "Created by Metadata tab. Source MP3 was not overwritten."}
+        result = {
+            "kind": "metadata-output",
+            "created_at": iso_time(),
+            "job_id": job.id,
+            "source_mp3": str(src),
+            "cover_image": str(cover),
+            "output_audio": str(output),
+            "output_format": "mp3",
+            "metadata": fields,
+            "naming": {
+                "explicit_output_filename": str(payload.get("output_filename") or "").strip(),
+                "custom_text": str(payload.get("name") or "").strip(),
+                "custom_mode": str(payload.get("name_mode") or "none"),
+                "function_mode": str(payload.get("function_mode") or "none"),
+                "date_mode": str(payload.get("date_mode") or "none"),
+                "version_mode": str(payload.get("version_mode") or "collision"),
+                "filename_template": str(payload.get("filename_template") or ""),
+                "function_label": "tagged",
+            },
+            "note": "Created by Metadata tab. Source MP3 was not overwritten.",
+        }
         output.with_suffix(output.suffix + ".json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         self._set(job, status="done", output=str(output), result=result, finished_at=now())
 
@@ -4316,8 +4349,10 @@ EXEC: Pick one.</textarea>
       </div>
       <label>Comment</label>
       <input id="metadataComment" placeholder="Optional comment / description" />
-      <label>Output filename</label>
-      <input id="metadataOutputName" placeholder="leave blank for source_tagged.mp3" />
+      <label>Output filename override</label>
+      <input id="metadataOutputName" placeholder="leave blank to use Options → File naming defaults" />
+      <div class="small naming-summary">Local save uses <b>Options → File naming defaults</b> unless this output filename override is filled. Metadata jobs supply <code>[function]</code> as <code>tagged</code>.</div>
+      <label><input id="metadataDownloadWhenDone" type="checkbox" onchange="scheduleFormStateSave()" /> Download tagged MP3 when done</label>
       <div class="sticky-actions"><button id="metadataWriteButton" type="button" onclick="writeMetadataMp3()">Write tagged MP3 copy</button></div>
       <div id="metadataActionStatus" class="small inline-status"></div>
       <p class="small">Outputs are saved under <code>/home/user/tts-lab/output/metadata/</code> and appear in Jobs/Recent audio with playback, download links, and normal handoff actions.</p>
@@ -5526,7 +5561,8 @@ function collectFormState(){
     audio_lab_mp3_bitrate:readFieldValue('audioLabMp3Bitrate', '192k'),
     audio_lab_sample_rate:readFieldValue('audioLabSampleRate', 'unchanged'),
     audio_lab_channels:readFieldValue('audioLabChannels', 'unchanged'),
-    audio_lab_normalize:readFieldChecked('audioLabNormalize', true)
+    audio_lab_normalize:readFieldChecked('audioLabNormalize', true),
+    metadata_download_when_done:readFieldChecked('metadataDownloadWhenDone', false)
   };
 }
 function saveFormStateNow(){ if(!formStateLoaded) return Promise.resolve(); return api('/api/state', {method:'POST', body:JSON.stringify(collectFormState())}).catch(err=>console.warn('state save failed', err)); }
@@ -5572,6 +5608,7 @@ function restoreFormState(){
     setFieldValue('audioLabSampleRate', s.audio_lab_sample_rate);
     setFieldValue('audioLabChannels', s.audio_lab_channels);
     setFieldChecked('audioLabNormalize', s.audio_lab_normalize);
+    setFieldChecked('metadataDownloadWhenDone', s.metadata_download_when_done);
     dismissedNotices = new Set(Array.isArray(s.dismissed_notices) ? s.dismissed_notices : []);
     if(localStorage.getItem('ttsLabHfTokenSetupDismissed') === '1') dismissedNotices.add('hf_token_setup');
     if(localStorage.getItem('ttsLabGpuSetupHidden') === '1') dismissedNotices.add('whisper_gpu_setup');
@@ -5588,7 +5625,7 @@ function restoreFormState(){
   });
 }
 function attachFormStateHandlers(){
-  for(const id of ['engine','profileSelect','role','ref','refText','text','xVector','splitLong','rememberForm','uiMode','optAdvanced','optProfileTools','optExperimental','optMetadata','optLogs','optDelete','optStickyTabs','optPanelOrientation','optJobsAsTab','optOpsWidth','globalName','globalNameMode','globalFunctionMode','globalDateMode','globalVersionMode','globalFilenameTemplate','resembleInstallMode','resembleDevice','videoFormat','videoMp3Bitrate','videoSampleRate','videoChannels','videoNormalize','audioLabFormat','audioLabMp3Bitrate','audioLabSampleRate','audioLabChannels','audioLabNormalize','speechAnalysisEngine','speechDiarizationMode']){
+  for(const id of ['engine','profileSelect','role','ref','refText','text','xVector','splitLong','rememberForm','uiMode','optAdvanced','optProfileTools','optExperimental','optMetadata','optLogs','optDelete','optStickyTabs','optPanelOrientation','optJobsAsTab','optOpsWidth','globalName','globalNameMode','globalFunctionMode','globalDateMode','globalVersionMode','globalFilenameTemplate','resembleInstallMode','resembleDevice','videoFormat','videoMp3Bitrate','videoSampleRate','videoChannels','videoNormalize','audioLabFormat','audioLabMp3Bitrate','audioLabSampleRate','audioLabChannels','audioLabNormalize','metadataDownloadWhenDone','speechAnalysisEngine','speechDiarizationMode']){
     const el=$(id); if(!el || el.dataset.stateHooked) continue;
     el.dataset.stateHooked='1'; el.addEventListener('input', ()=>{ updateNamingSummaries(); scheduleFormStateSave(); }); el.addEventListener('change', ()=>{ updateNamingSummaries(); scheduleFormStateSave(); });
   }
@@ -6620,7 +6657,7 @@ async function writeMetadataMp3(){
   setMetadataRunning(true, '<span class="warn">Reading files and queueing metadata job...</span>');
   let body;
   try{
-    body={
+    body=Object.assign(globalNamingBody(), {
       mp3_filename: mp3.name,
       mp3_base64: await fileToB64(mp3),
       cover_filename: cover.name,
@@ -6632,7 +6669,7 @@ async function writeMetadataMp3(){
       genre: readFieldValue('metadataGenre',''),
       comment: readFieldValue('metadataComment',''),
       output_filename: readFieldValue('metadataOutputName','')
-    };
+    });
   }catch(err){
     setMetadataRunning(false, '<span class="bad">Could not read selected files: '+esc(err)+'</span>');
     return;
@@ -6642,13 +6679,31 @@ async function writeMetadataMp3(){
     .catch(err=>{ currentMetadataJobId=null; setMetadataRunning(false, '<span class="bad">Could not queue metadata job: '+esc(err)+'</span>'); });
 }
 
+function downloadJobAudio(j){
+  const url = j && (j.wav_url || j.audio_url || '');
+  if(!url) return false;
+  const path = j.output_path || j.output || (j.result && j.result.output_audio) || 'tagged.mp3';
+  const name = String(path).split('/').pop() || 'tagged.mp3';
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(()=>a.remove(), 500);
+  return true;
+}
+
 function updateCurrentMetadataFromJobs(data){
   if(!currentMetadataJobId) return;
   const j=(data.jobs||[]).find(x=>x.id===currentMetadataJobId);
   if(!j) return;
   if(j.status === 'done'){
     const path = j.output_path || j.output || (j.result && j.result.output_audio) || '';
-    setMetadataRunning(false, '<span class="ok">Tagged MP3 ready.</span> '+(path?'<code>'+esc(path)+'</code>':'')+' '+openJobsButtonHtml());
+    const wantDownload = readFieldChecked('metadataDownloadWhenDone', false);
+    const downloaded = wantDownload ? downloadJobAudio(j) : false;
+    const downloadNote = wantDownload ? (downloaded ? ' Browser download requested.' : ' <span class="warn">Download requested, but no download URL was available. Open Jobs and use the download link.</span>') : '';
+    setMetadataRunning(false, '<span class="ok">Tagged MP3 ready.</span> '+(path?'<code>'+esc(path)+'</code>':'')+downloadNote+' '+openJobsButtonHtml());
     currentMetadataJobId = null;
   } else if(j.status === 'error' || j.status === 'canceled'){
     setMetadataRunning(false, j.status === 'canceled' ? '<span class="warn">Metadata job canceled.</span>' : '<span class="bad">Metadata job failed. Open the job log for details.</span>');
@@ -6658,7 +6713,7 @@ function updateCurrentMetadataFromJobs(data){
   }
 }
 
-function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSpeechAnalysisStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckStack(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
+function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSpeechAnalysisStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadMetadataStatus(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckStack(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
 function startPoll(){
   if(poll) return;
   poll=setInterval(async ()=>{

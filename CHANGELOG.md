@@ -15,6 +15,8 @@ Includes:
 - original MP3 and image are preserved under the metadata work area
 - output MP3 is saved under `/home/user/tts-lab/output/metadata/`
 - completed metadata jobs appear in Jobs with playback/download/actions
+- Metadata local saves follow the app-wide file naming defaults unless an output filename override is filled
+- optional Download tagged MP3 checkbox for browser download/Save As workflows
 
 Notes:
 
