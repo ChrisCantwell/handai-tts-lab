@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.88.2
+# TTS Lab Unified Web UI v0.89
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.88.2 turns Speech Repair Analysis into a more useful manual-editing handoff by adding Audacity labels and end-to-beginning edit checklists, while preserving the v0.88.1 cut-consolidation work, v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.89 adds a practical Metadata tab for attaching cover art and basic ID3 fields to MP3 files, while preserving the v0.88.2 Speech Repair Analysis handoff helpers, v0.88.1 cut-consolidation work, v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.88.2.zip
+unzip -o tts_unified_webui_v0.89.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -51,6 +51,16 @@ Whisper output should be treated as a draft. Review/edit before saving a transcr
 ## Changelog order note
 
 The changelog below is ordered newest-to-oldest. Early project versions used labels such as `v0.4`; later versions use labels such as `v0.41`. Treat these as historical release labels, not decimal numbers.
+
+
+
+## New in v0.89
+
+- Adds a **Metadata** tab for MP3 publishing cleanup.
+- Lets the user upload an MP3 and cover image, then write a new tagged MP3 copy.
+- Supports optional title, artist, album, year/date, genre, and comment fields.
+- Uses FFmpeg for cover-art/ID3 embedding and saves output under `/home/user/tts-lab/output/metadata/`.
+- Preserves source files; this pass does not overwrite the original MP3.
 
 
 ## New in v0.88.2
