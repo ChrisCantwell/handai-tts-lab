@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.3-alpha patch 5 - 2026-07-08
+
+WhisperX maintenance setup pass.
+
+Includes:
+
+- Web UI v0.90
+- Maintenance status card for the isolated WhisperX speech-repair backend
+- queued Install / repair WhisperX job
+- queued WhisperX short-sample smoke-test job
+- app-owned WhisperX JSON helper writer
+- explicit separation from the existing faster-whisper STT environment
+- no Speech Analysis integration yet; this pass only installs, repairs, detects, and smoke-tests the backend
+
+Validation:
+
+- Web UI Python syntax check should pass.
+- Shell syntax checks should pass.
+- Existing WhisperX installs should be detected without reinstalling.
+
+
+
 
 ## v0.1.3-alpha patch 3 - 2026-07-07
 

@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.89
+# TTS Lab Unified Web UI v0.90
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.89 adds a practical Metadata tab for attaching cover art and basic ID3 fields to MP3 files, while preserving the v0.88.2 Speech Repair Analysis handoff helpers, v0.88.1 cut-consolidation work, v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.90 adds Maintenance install/repair and smoke-test controls for the isolated WhisperX speech-repair backend, while preserving the v0.89 Metadata tab, v0.88.2 Speech Repair Analysis handoff helpers, v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.89.zip
+unzip -o tts_unified_webui_v0.90.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -53,6 +53,15 @@ Whisper output should be treated as a draft. Review/edit before saving a transcr
 The changelog below is ordered newest-to-oldest. Early project versions used labels such as `v0.4`; later versions use labels such as `v0.41`. Treat these as historical release labels, not decimal numbers.
 
 
+
+
+## New in v0.90
+
+- Adds Maintenance status checks for an isolated WhisperX speech-repair backend.
+- Adds **Install / repair WhisperX** as a queued setup job.
+- Adds **Test WhisperX on short sample** as a queued smoke-test job.
+- Writes/repairs the helper script at `/home/user/tts-lab/engines/whisperx/test_whisperx_json.py`.
+- Keeps WhisperX separate from the existing faster-whisper STT environment and does not wire it into Speech Analysis yet.
 
 ## New in v0.89
 
