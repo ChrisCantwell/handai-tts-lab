@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.89 adds a practical Metadata tab for attaching cover art and basic ID3 fields to MP3 files while keeping source files untouched.
+Version 0.90 adds Maintenance install/repair and smoke-test controls for the isolated WhisperX speech-repair backend.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -65,6 +65,12 @@ RESEMBLE_COMPAT_WRAPPER = Path(os.environ.get("TTS_RESEMBLE_COMPAT_WRAPPER", str
 WHISPER_HELPER = Path(os.environ.get("TTS_WHISPER_HELPER", str(LAB / "webui" / "stt_faster_whisper.py")))
 WHISPER_PYTHON = Path(os.environ.get("TTS_WHISPER_PYTHON", str(Path.home() / "miniconda3" / "envs" / "tts-whisper" / "bin" / "python")))
 WHISPER_CUDA_INSTALLER = Path(os.environ.get("TTS_WHISPER_CUDA_INSTALLER", str(LAB / "install-whisper-cuda-libs.sh")))
+WHISPERX_ENV_NAME = os.environ.get("TTS_WHISPERX_CONDA_ENV", "tts-whisperx")
+WHISPERX_ROOT = Path(os.environ.get("TTS_WHISPERX_ROOT", str(LAB / "engines" / "whisperx")))
+WHISPERX_HELPER = Path(os.environ.get("TTS_WHISPERX_HELPER", str(WHISPERX_ROOT / "test_whisperx_json.py")))
+WHISPERX_PYTHON = Path(os.environ.get("TTS_WHISPERX_PYTHON", str(Path.home() / "miniconda3" / "envs" / WHISPERX_ENV_NAME / "bin" / "python")))
+MODEL_INSTALL_LOG_DIR = Path(os.environ.get("TTS_MODEL_INSTALL_LOG_DIR", str(LAB / "logs" / "model-installs")))
+MODEL_TEST_DIR = Path(os.environ.get("TTS_MODEL_TEST_DIR", str(OUT_DIR / "model-tests")))
 SPEECH_ANALYSIS_DIR = Path(os.environ.get("TTS_SPEECH_ANALYSIS_DIR", str(OUT_DIR / "speech_analysis")))
 METADATA_DIR = Path(os.environ.get("TTS_METADATA_DIR", str(OUT_DIR / "metadata")))
 METADATA_UPLOAD_DIR = METADATA_DIR / "uploads"
@@ -76,7 +82,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.89"
+VERSION = "0.90"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -146,6 +152,9 @@ def ensure_dirs() -> None:
     RESEMBLE_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     UI_DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_INSTALL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_TEST_DIR.mkdir(parents=True, exist_ok=True)
+    WHISPERX_ROOT.mkdir(parents=True, exist_ok=True)
     SPEECH_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
     METADATA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1870,6 +1879,263 @@ def metadata_status_payload() -> dict[str, Any]:
     ffprobe = command_probe("ffprobe")
     return {"ready": bool(ffmpeg.get("available")), "ffmpeg": ffmpeg, "ffprobe": ffprobe, "output_dir": str(METADATA_DIR), "upload_dir": str(METADATA_UPLOAD_DIR)}
 
+WHISPERX_HELPER_CODE = r"""#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+import traceback
+from pathlib import Path
+
+def jsonable(value):
+    try:
+        import numpy as np
+    except Exception:
+        np = None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if np is not None and isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    try:
+        return float(value)
+    except Exception:
+        return str(value)
+
+def read_token(path: str = "") -> str:
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if token:
+        return token
+    if path:
+        try:
+            return Path(path).expanduser().read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+    return ""
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="HandAI Web UI WhisperX JSON smoke/integration helper")
+    parser.add_argument("--input", required=True, help="Input audio path")
+    parser.add_argument("--output", required=True, help="Output JSON path")
+    parser.add_argument("--model", default="small", help="Whisper model size")
+    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--compute-type", default="auto", help="auto, int8, float16, float32")
+    parser.add_argument("--language", default="auto")
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--diarize", action="store_true")
+    parser.add_argument("--hf-token-file", default="")
+    args = parser.parse_args()
+
+    out_path = Path(args.output).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    result = {
+        "ok": False,
+        "engine": "whisperx",
+        "input": str(Path(args.input).expanduser()),
+        "output": str(out_path),
+        "model": args.model,
+        "requested_device": args.device,
+        "requested_compute_type": args.compute_type,
+        "batch_size": args.batch_size,
+        "diarization": {"requested": bool(args.diarize), "status": "not-run"},
+        "warnings": [],
+        "errors": [],
+    }
+
+    try:
+        import torch
+        import whisperx
+
+        device = args.device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = args.compute_type
+        if compute_type == "auto":
+            compute_type = "float16" if device == "cuda" else "int8"
+
+        result["device"] = device
+        result["compute_type"] = compute_type
+        result["torch_cuda_available"] = bool(torch.cuda.is_available())
+        result["torch_version"] = getattr(torch, "__version__", "")
+        result["whisperx_version"] = getattr(whisperx, "__version__", "")
+
+        input_path = Path(args.input).expanduser()
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input audio not found: {input_path}")
+
+        language = None if str(args.language or "auto").lower() == "auto" else args.language
+        audio = whisperx.load_audio(str(input_path))
+        model_kwargs = {"compute_type": compute_type}
+        if language:
+            model_kwargs["language"] = language
+        model = whisperx.load_model(args.model, device, **model_kwargs)
+        transcribed = model.transcribe(audio, batch_size=max(1, int(args.batch_size or 1)))
+
+        aligned = transcribed
+        align_status = "not-run"
+        try:
+            lang = transcribed.get("language") or language or "en"
+            align_model, metadata = whisperx.load_align_model(language_code=lang, device=device)
+            aligned = whisperx.align(transcribed.get("segments") or [], align_model, metadata, audio, device, return_char_alignments=False)
+            aligned["language"] = lang
+            align_status = "ok"
+        except Exception as exc:
+            aligned = transcribed
+            align_status = "failed"
+            result["warnings"].append("Alignment failed; returning unaligned WhisperX transcription: " + str(exc))
+
+        if args.diarize:
+            token = read_token(args.hf_token_file)
+            if not token:
+                result["diarization"] = {"requested": True, "status": "missing-token", "message": "Set HF_TOKEN or save a Hugging Face token in the Web UI before diarization."}
+            else:
+                try:
+                    diarize_cls = getattr(whisperx, "DiarizationPipeline", None)
+                    if diarize_cls is None and hasattr(whisperx, "diarize"):
+                        diarize_cls = getattr(whisperx.diarize, "DiarizationPipeline", None)
+                    if diarize_cls is None:
+                        raise RuntimeError("WhisperX DiarizationPipeline was not found in this installation.")
+                    diarize_model = diarize_cls(use_auth_token=token, device=device)
+                    diarize_segments = diarize_model(audio)
+                    aligned = whisperx.assign_word_speakers(diarize_segments, aligned)
+                    result["diarization"] = {"requested": True, "status": "ok"}
+                except Exception as exc:
+                    result["diarization"] = {"requested": True, "status": "failed", "message": str(exc)}
+                    result["warnings"].append("Diarization failed; transcription/alignment may still be usable.")
+
+        segments = aligned.get("segments") or []
+        text = " ".join(str(seg.get("text") or "").strip() for seg in segments if isinstance(seg, dict)).strip()
+        words = []
+        for seg in segments:
+            if isinstance(seg, dict):
+                for w in seg.get("words") or []:
+                    if isinstance(w, dict):
+                        words.append(w)
+
+        result.update({
+            "ok": True,
+            "language": aligned.get("language") or transcribed.get("language") or language or "",
+            "alignment_status": align_status,
+            "text": text,
+            "segments": jsonable(segments),
+            "words": jsonable(words),
+            "summary": {
+                "segment_count": len(segments),
+                "word_count": len(words),
+                "text_chars": len(text),
+            },
+        })
+    except Exception as exc:
+        result["ok"] = False
+        result["errors"].append(str(exc))
+        result["traceback"] = traceback.format_exc()
+
+    out_path.write_text(json.dumps(jsonable(result), indent=2, ensure_ascii=False), encoding="utf-8")
+    if not result.get("ok"):
+        print(json.dumps({"ok": False, "error": (result.get("errors") or ["unknown error"])[0], "output": str(out_path)}, ensure_ascii=False))
+        return 1
+    print(json.dumps({"ok": True, "output": str(out_path), "word_count": result.get("summary", {}).get("word_count", 0), "diarization": result.get("diarization", {})}, ensure_ascii=False))
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+
+def whisperx_python_path() -> Path:
+    override = os.environ.get("TTS_WHISPERX_PYTHON", "").strip()
+    return Path(override).expanduser() if override else WHISPERX_PYTHON
+
+
+def whisperx_env_bin_path() -> Path | None:
+    py = whisperx_python_path()
+    return py.parent if py.exists() else None
+
+
+def whisperx_runtime_env() -> dict[str, str]:
+    env = hf_env()
+    env_bin = whisperx_env_bin_path()
+    if env_bin:
+        env["PATH"] = str(env_bin) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def ensure_whisperx_helper() -> dict[str, Any]:
+    try:
+        ensure_dirs()
+        WHISPERX_ROOT.mkdir(parents=True, exist_ok=True)
+        WHISPERX_HELPER.write_text(WHISPERX_HELPER_CODE, encoding="utf-8")
+        os.chmod(WHISPERX_HELPER, 0o755)
+        return {"ok": True, "helper": str(WHISPERX_HELPER)}
+    except Exception as exc:
+        return {"ok": False, "helper": str(WHISPERX_HELPER), "error": str(exc)}
+
+
+def whisperx_status_payload() -> dict[str, Any]:
+    ensure_dirs()
+    helper = ensure_whisperx_helper()
+    py = whisperx_python_path()
+    conda = conda_exe_path()
+    ffmpeg = command_probe("ffmpeg")
+    ffprobe = command_probe("ffprobe")
+    package_check = {"ok": False, "output": "WhisperX env python not found."}
+    if py.exists() and os.access(py, os.X_OK):
+        package_check = _run_short_command([
+            str(py), "-c",
+            "import json, torch, whisperx; "
+            "import pyannote.audio as pa; "
+            "print(json.dumps({'torch': getattr(torch, '__version__', ''), 'cuda': bool(torch.cuda.is_available()), 'whisperx': getattr(whisperx, '__version__', ''), 'pyannote_audio': getattr(pa, '__version__', '')}))"
+        ], env=whisperx_runtime_env(), timeout=45)
+    ready = bool(py.exists() and os.access(py, os.X_OK) and helper.get("ok") and package_check.get("ok") and ffmpeg.get("available"))
+    return {
+        "ready": ready,
+        "env_name": WHISPERX_ENV_NAME,
+        "root": str(WHISPERX_ROOT),
+        "helper": str(WHISPERX_HELPER),
+        "helper_status": helper,
+        "python": str(py),
+        "python_exists": py.exists(),
+        "python_executable": py.exists() and os.access(py, os.X_OK),
+        "env_bin": str(whisperx_env_bin_path() or ""),
+        "conda": str(conda) if conda else "",
+        "ffmpeg": ffmpeg,
+        "ffprobe": ffprobe,
+        "package_check": package_check,
+        "hf_token": hf_token_status_payload(),
+        "model_test_dir": str(MODEL_TEST_DIR),
+        "install_log_dir": str(MODEL_INSTALL_LOG_DIR),
+        "notes": "WhisperX is isolated in its own conda environment. Diarization may require a Hugging Face token and accepting pyannote model terms.",
+    }
+
+
+def whisperx_smoke_source() -> Path | None:
+    ensure_dirs()
+    roots = [STT_UPLOAD_DIR, AUDIO_LAB_DIR, VIDEO_EXTRACT_DIR, OUT_DIR, REF_DIR]
+    seen: set[str] = set()
+    files: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            try:
+                rp = str(p.resolve())
+                if rp in seen:
+                    continue
+                if p.is_file() and p.suffix.lower() in AUDIO_EXTS and not p.name.endswith(".preview.mp3") and p.stat().st_size > 0:
+                    seen.add(rp)
+                    files.append(p)
+            except OSError:
+                continue
+    files.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+    return files[0] if files else None
+
+
+
 def fmt_seconds(value: Any) -> str:
     try:
         if value is None:
@@ -3002,6 +3268,12 @@ class JobManager:
         if action == "resemble-enhance":
             self._run_resemble_enhance_setup(job, payload)
             return
+        if action == "whisperx":
+            self._run_whisperx_setup(job, payload)
+            return
+        if action == "whisperx-smoke":
+            self._run_whisperx_smoke_test(job, payload)
+            return
         if action == "resemble-git-lfs":
             self._run_resemble_git_lfs_repair(job, payload)
             return
@@ -3021,6 +3293,111 @@ class JobManager:
             self._set(job, status="done", warning="Restart Web UI or run GPU test if needed.", result={"message": msg, "nvidia_lib_dirs": libs}, finished_at=now())
         else:
             self._set(job, status="error", error=oom_message(rc), finished_at=now())
+
+
+    def _run_whisperx_setup(self, job: Job, payload: dict[str, Any]) -> None:
+        ensure_dirs()
+        self._set(job, status="running", started_at=now(), engine="setup", role="whisperx", text="Install / repair WhisperX isolated speech-repair backend")
+        self._append_log(job, "WhisperX setup is isolated from the existing faster-whisper/STT environment and from the Web UI Python runtime.\n")
+        self._append_log(job, f"Env name: {WHISPERX_ENV_NAME}\nPython: {whisperx_python_path()}\nHelper: {WHISPERX_HELPER}\n\n")
+        conda = conda_exe_path()
+        if not conda:
+            self._set(job, status="error", error="Conda was not detected. WhisperX installer currently expects Miniconda/Anaconda so it can create an isolated tts-whisperx environment.", result=whisperx_status_payload(), finished_at=now())
+            return
+        py = whisperx_python_path()
+        if not py.exists():
+            cmd = [str(conda), "create", "-n", WHISPERX_ENV_NAME, "python=3.10", "-y"]
+            rc = self._run_subprocess(job, cmd, cwd=LAB)
+            if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+                self._mark_canceled(job)
+                return
+            if rc != 0:
+                self._set(job, status="error", error=f"Could not create conda env {WHISPERX_ENV_NAME}. Exit code: {rc}", result=whisperx_status_payload(), finished_at=now())
+                return
+        helper = ensure_whisperx_helper()
+        self._append_log(job, "Helper write status:\n" + json.dumps(helper, indent=2) + "\n\n")
+        py = whisperx_python_path()
+        steps = [
+            [str(py), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
+            [str(py), "-m", "pip", "install", "--upgrade", "torch", "torchaudio"],
+            [str(py), "-m", "pip", "install", "--upgrade", "whisperx", "pyannote.audio"],
+        ]
+        for cmd in steps:
+            rc = self._run_subprocess(job, cmd, cwd=LAB)
+            if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+                self._mark_canceled(job)
+                return
+            if rc != 0:
+                self._set(job, status="error", error=f"WhisperX install step failed with exit code {rc}. Open the job log for details.", result=whisperx_status_payload(), finished_at=now())
+                return
+        helper = ensure_whisperx_helper()
+        status = whisperx_status_payload()
+        self._append_log(job, "\nFinal WhisperX status:\n" + json.dumps(status, indent=2) + "\n")
+        if status.get("ready"):
+            self._set(job, status="done", result=status, warning="WhisperX installed. Use the smoke-test button with a short audio clip before wiring it into Speech Analysis.", finished_at=now())
+        else:
+            self._set(job, status="error", error="Installer finished, but WhisperX status is not ready. Open the job log and package_check output.", result=status, finished_at=now())
+
+    def _run_whisperx_smoke_test(self, job: Job, payload: dict[str, Any]) -> None:
+        ensure_dirs()
+        status = whisperx_status_payload()
+        if not status.get("ready"):
+            self._set(job, status="error", error="WhisperX is not ready. Run Install / repair WhisperX first, then retry the smoke test.", result=status, finished_at=now())
+            return
+        raw_path = str(payload.get("path") or "").strip()
+        if raw_path:
+            src = safe_existing_path(raw_path, [REF_DIR, OUT_DIR, PROFILE_DIR, STT_UPLOAD_DIR, AUDIO_LAB_DIR, VIDEO_EXTRACT_DIR])
+        else:
+            src = whisperx_smoke_source()
+            if not src:
+                self._set(job, status="error", error="No audio source found for WhisperX smoke test. Upload or create a short audio clip first.", result=status, finished_at=now())
+                return
+        duration = audio_duration_seconds(src)
+        if duration and duration > 180:
+            self._set(job, status="error", error=f"WhisperX smoke test refused long source ({fmt_seconds(duration)}). Use a short 30–60 second clip first.", result={"source": str(src), "duration_seconds": duration, "whisperx_status": status}, finished_at=now())
+            return
+        model = str(payload.get("model") or "tiny").strip().lower()
+        if model not in {"tiny", "base", "small", "medium", "large-v3"}:
+            model = "tiny"
+        device = str(payload.get("device") or "auto").strip().lower()
+        if device not in {"auto", "cuda", "cpu"}:
+            device = "auto"
+        compute_type = str(payload.get("compute_type") or "auto").strip().lower()
+        if compute_type not in {"auto", "int8", "float16", "float32"}:
+            compute_type = "auto"
+        diarize = bool(payload.get("diarize", False))
+        output = MODEL_TEST_DIR / f"whisperx-webui-smoke-{job.id}.json"
+        cmd = [
+            str(whisperx_python_path()), str(WHISPERX_HELPER),
+            "--input", str(src),
+            "--output", str(output),
+            "--model", model,
+            "--device", device,
+            "--compute-type", compute_type,
+            "--batch-size", str(int(payload.get("batch_size") or 2)),
+            "--hf-token-file", str(HF_TOKEN_FILE),
+        ]
+        if diarize:
+            cmd.append("--diarize")
+        self._set(job, status="running", started_at=now(), engine="setup", role="whisperx-smoke", text=f"WhisperX smoke test: {src.name}", source_path=str(src), output=str(output), command=cmd)
+        self._append_log(job, "WhisperX smoke test. This should be run on short audio first; long files belong in a later Speech Analysis integration pass.\n")
+        self._append_log(job, f"Source: {src}\nDuration: {fmt_seconds(duration) if duration else 'unknown'}\nOutput JSON: {output}\n\n")
+        rc = self._run_subprocess(job, cmd, cwd=LAB)
+        if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+            self._mark_canceled(job)
+            return
+        result: dict[str, Any] = {"output": str(output)}
+        if output.exists():
+            try:
+                result = json.loads(output.read_text(encoding="utf-8"))
+            except Exception as exc:
+                result = {"output": str(output), "json_error": str(exc)}
+        if rc == 0 and result.get("ok"):
+            self._set(job, status="done", result=result, warning="WhisperX smoke test completed. This does not yet wire WhisperX into Speech Analysis.", finished_at=now())
+        else:
+            err = (result.get("errors") or [f"WhisperX smoke test failed with exit code {rc}"])[0] if isinstance(result, dict) else f"WhisperX smoke test failed with exit code {rc}"
+            self._set(job, status="error", error=str(err), result=result, finished_at=now())
+
 
     def _run_resemble_git_lfs_repair(self, job: Job, payload: dict[str, Any]) -> None:
         """Install/repair Git LFS for Resemble model downloads inside the isolated env when possible."""
@@ -4109,8 +4486,8 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 </head>
 <body>
 <header>
-  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.89</span></h1>
-  <div class="small">Voice profiles, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Metadata cover-art tagging, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
+  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.90</span></h1>
+  <div class="small">Voice profiles, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Metadata cover-art tagging, WhisperX setup/testing, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
 </header>
 <main>
   <section class="left-panel">
@@ -4483,6 +4860,40 @@ EXEC: Pick one.</textarea>
           <button class="mini secondary" onclick="testWhisperGpuSupport()">Test GPU support</button>
         </div>
       </div>
+
+      <div class="maintenance-item">
+        <h3>WhisperX speech repair backend</h3>
+        <div class="small">Installs and checks an isolated WhisperX / pyannote environment for future Speech Repair Analysis integration. This does not modify the existing faster-whisper STT environment.</div>
+        <div id="maintWhisperXStatus" class="maintenance-status small">Not checked yet.</div>
+        <div class="row3">
+          <div>
+            <label>Smoke-test model</label>
+            <select id="whisperxSmokeModel">
+              <option value="tiny" selected>tiny - fastest smoke test</option>
+              <option value="base">base</option>
+              <option value="small">small</option>
+            </select>
+          </div>
+          <div>
+            <label>Smoke-test device</label>
+            <select id="whisperxSmokeDevice">
+              <option value="auto" selected>auto</option>
+              <option value="cuda">cuda</option>
+              <option value="cpu">cpu</option>
+            </select>
+          </div>
+          <div>
+            <label><input id="whisperxSmokeDiarize" type="checkbox" /> include diarization</label>
+            <div class="small">Diarization may require a Hugging Face token and accepted pyannote terms.</div>
+          </div>
+        </div>
+        <div class="notice-actions">
+          <button class="mini secondary" onclick="maintenanceCheckWhisperX()">Check WhisperX</button>
+          <button class="mini secondary" onclick="installWhisperX()">Install / repair WhisperX</button>
+          <button class="mini secondary" onclick="testWhisperXSmoke()">Test WhisperX on short sample</button>
+        </div>
+      </div>
+
 
       <div class="maintenance-item">
         <h3>Video URL importer</h3>
@@ -5500,6 +5911,52 @@ function maintenanceCheckWhisper(){
     loadSttStatus();
   }).catch(err=>{ if(el) el.innerHTML='<span class="bad">Could not check STT: '+esc(err)+'</span>'; });
 }
+
+function renderWhisperXStatus(d){
+  const el=$('maintWhisperXStatus');
+  if(!el) return;
+  const pkg = d.package_check || {};
+  const helper = d.helper_status || {};
+  const hf = d.hf_token || {};
+  const pkgOut = pkg.output ? '<details><summary>package check output</summary><pre>'+esc(pkg.output)+'</pre></details>' : '';
+  el.innerHTML = (d.ready ? '<span class="ok">WhisperX ready.</span>' : '<span class="warn">WhisperX not ready.</span>') +
+    '<div><b>Env:</b> <code>'+esc(d.env_name || '')+'</code></div>' +
+    '<div><b>Python:</b> '+(d.python_exists ? '<code>'+esc(d.python || '')+'</code>' : '<span class="bad">missing</span>')+'</div>' +
+    '<div><b>Helper:</b> '+(helper.ok ? '<code>'+esc(d.helper || '')+'</code>' : '<span class="bad">could not write helper</span>')+'</div>' +
+    '<div><b>Packages:</b> '+(pkg.ok ? '<span class="ok">import ok</span>' : '<span class="bad">missing/broken</span>')+'</div>' +
+    '<div><b>FFmpeg:</b> '+((d.ffmpeg && d.ffmpeg.available) ? '<span class="ok">available</span>' : '<span class="bad">missing</span>')+'</div>' +
+    '<div><b>HF token:</b> '+(hf.configured ? '<span class="ok">configured</span> <code>'+esc(hf.masked || '')+'</code>' : '<span class="warn">not configured; diarization may fail</span>')+'</div>' +
+    '<div class="small">Model tests: <code>'+esc(d.model_test_dir || '')+'</code></div>' +
+    pkgOut;
+}
+function maintenanceCheckWhisperX(){
+  const el=$('maintWhisperXStatus'); if(el) el.textContent='Checking WhisperX...';
+  return api('/api/whisperx/status').then(d=>{ renderWhisperXStatus(d); logUiEvent('maintenance WhisperX status checked', {ready:!!d.ready}); return d; })
+    .catch(err=>{ if(el) el.innerHTML='<span class="bad">Could not check WhisperX: '+esc(err)+'</span>'; });
+}
+function installWhisperX(){
+  const el=$('maintWhisperXStatus'); if(el) el.innerHTML='<span class="warn">Queueing WhisperX install/repair job...</span>';
+  logUiEvent('WhisperX install clicked', {});
+  api('/api/setup/whisperx', {method:'POST', body:JSON.stringify({})})
+    .then(r=>{ if(el) el.innerHTML=queuedJobStatus('WhisperX install/repair', r.job || r); lastJobsSig=''; refreshJobs(); startPoll(); setTimeout(maintenanceCheckWhisperX, 1000); })
+    .catch(err=>{ if(el) el.innerHTML='<span class="bad">Could not queue WhisperX installer: '+esc(err)+'</span>'; logUiEvent('WhisperX install queue failed', {error:String(err)}, 'error'); });
+}
+function testWhisperXSmoke(){
+  const el=$('maintWhisperXStatus'); if(el) el.innerHTML='<span class="warn">Queueing WhisperX smoke test...</span>';
+  const body={
+    model:readFieldValue('whisperxSmokeModel', 'tiny'),
+    device:readFieldValue('whisperxSmokeDevice', 'auto'),
+    compute_type:'auto',
+    diarize:readFieldChecked('whisperxSmokeDiarize', false),
+    batch_size:2
+  };
+  logUiEvent('WhisperX smoke test clicked', body);
+  api('/api/setup/whisperx-smoke', {method:'POST', body:JSON.stringify(body)})
+    .then(r=>{ if(el) el.innerHTML=queuedJobStatus('WhisperX smoke test', r.job || r); lastJobsSig=''; refreshJobs(); startPoll(); })
+    .catch(err=>{ if(el) el.innerHTML='<span class="bad">Could not queue WhisperX smoke test: '+esc(err)+'</span>'; logUiEvent('WhisperX smoke queue failed', {error:String(err)}, 'error'); });
+}
+
+
 function maintenanceOpenVideoIntake(){ showTab('video'); loadVideoIntakeStatus(); logUiEvent('maintenance action: opened Video Intake'); }
 function maintenanceCheckVideoImporter(){
   const el=$('maintVideoStatus'); if(el) el.textContent='Checking Video URL importer...';
@@ -6713,7 +7170,7 @@ function updateCurrentMetadataFromJobs(data){
   }
 }
 
-function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSpeechAnalysisStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadMetadataStatus(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckStack(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
+function loadAll(){ toggleVideoBitrate(); applyLayoutPrefs(); renderMaintenance(); return Promise.all([loadProfiles(), loadRefs(), loadOutputs(true), refreshJobs(), loadSttStatus(), loadSpeechAnalysisStatus(), loadSttSources(), loadAudioLabSources(), loadVideoIntakeStatus(), loadVideoSources(), loadMetadataStatus(), loadResembleStatus(), loadResembleSources()]).then(r=>{ renderMaintenance(); maintenanceCheckStack(); maintenanceCheckHfToken(); maintenanceCheckWhisper(); maintenanceCheckWhisperX(); maintenanceCheckVideoImporter(); maintenanceCheckResemble(); return r; }); }
 function startPoll(){
   if(poll) return;
   poll=setInterval(async ()=>{
@@ -6851,6 +7308,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(external_command_status())
             elif path == "/api/resemble/status":
                 self.send_json(resemble_status_payload())
+            elif path == "/api/whisperx/status":
+                self.send_json(whisperx_status_payload())
             elif path == "/api/metadata/status":
                 self.send_json(metadata_status_payload())
             elif path == "/api/resemble/sources":
@@ -7033,6 +7492,18 @@ class Handler(BaseHTTPRequestHandler):
                 job = Job(id=uuid.uuid4().hex, kind="setup")
                 payload = dict(body)
                 payload["action"] = "resemble-git-lfs"
+                JOBS.add(job, payload)
+                self.send_json({"job": job.public()})
+            elif path == "/api/setup/whisperx":
+                job = Job(id=uuid.uuid4().hex, kind="setup")
+                payload = dict(body)
+                payload["action"] = "whisperx"
+                JOBS.add(job, payload)
+                self.send_json({"job": job.public()})
+            elif path == "/api/setup/whisperx-smoke":
+                job = Job(id=uuid.uuid4().hex, kind="setup")
+                payload = dict(body)
+                payload["action"] = "whisperx-smoke"
                 JOBS.add(job, payload)
                 self.send_json({"job": job.public()})
             elif path == "/api/resemble/upload":
