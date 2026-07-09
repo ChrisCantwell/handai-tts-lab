@@ -1,3 +1,20 @@
+## v0.91 - Local Speech API / AI Studio Bridge STT
+
+- Added internal Local Speech API routes for Faster-Whisper and WhisperX:
+  - `GET /api/speech/status`
+  - `GET /api/speech/engines`
+  - `POST /api/speech/upload`
+  - `POST /api/speech/transcribe`
+  - `GET /api/speech/jobs/<job_id>`
+- Added AI Studio bridge STT routes so Cloudflare can expose only the bridge, not the full Web UI:
+  - `POST /api/ai-studio-bridge/transcribe`
+  - `POST /v1/audio/transcriptions`
+- Added OpenAI-compatible multipart transcription support for coding assistants and app previews.
+- Added native async transcription flow for long files.
+- Added normalized speech JSON output under `/home/user/tts-lab/output/speech_api/`.
+- Kept `/api/ai-studio-bridge/clone-tts` unchanged.
+- Kept CrisperWhisper hidden/unsupported because local smoke testing showed stability problems.
+
 # Changelog
 
 ## v0.1.3-alpha patch 5 - 2026-07-08

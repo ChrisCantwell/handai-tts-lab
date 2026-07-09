@@ -71,6 +71,7 @@ WHISPERX_HELPER = Path(os.environ.get("TTS_WHISPERX_HELPER", str(WHISPERX_ROOT /
 WHISPERX_PYTHON = Path(os.environ.get("TTS_WHISPERX_PYTHON", str(Path.home() / "miniconda3" / "envs" / WHISPERX_ENV_NAME / "bin" / "python")))
 MODEL_INSTALL_LOG_DIR = Path(os.environ.get("TTS_MODEL_INSTALL_LOG_DIR", str(LAB / "logs" / "model-installs")))
 MODEL_TEST_DIR = Path(os.environ.get("TTS_MODEL_TEST_DIR", str(OUT_DIR / "model-tests")))
+SPEECH_API_DIR = Path(os.environ.get("TTS_SPEECH_API_DIR", str(OUT_DIR / "speech_api")))
 SPEECH_ANALYSIS_DIR = Path(os.environ.get("TTS_SPEECH_ANALYSIS_DIR", str(OUT_DIR / "speech_analysis")))
 METADATA_DIR = Path(os.environ.get("TTS_METADATA_DIR", str(OUT_DIR / "metadata")))
 METADATA_UPLOAD_DIR = METADATA_DIR / "uploads"
@@ -82,7 +83,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.90"
+VERSION = "0.91"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -154,6 +155,7 @@ def ensure_dirs() -> None:
     UI_DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_INSTALL_LOG_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_TEST_DIR.mkdir(parents=True, exist_ok=True)
+    SPEECH_API_DIR.mkdir(parents=True, exist_ok=True)
     WHISPERX_ROOT.mkdir(parents=True, exist_ok=True)
     SPEECH_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1491,6 +1493,190 @@ def speech_analysis_status_payload() -> dict[str, Any]:
         "supported_modes": ["faster-whisper-analysis", "crisperwhisper-planned", "whisperx-diarization-planned"],
     }
 
+
+
+
+SPEECH_API_ENGINE_ALIASES = {
+    "whisper-1": "faster-whisper",
+    "faster-whisper": "faster-whisper",
+    "local-faster-whisper": "faster-whisper",
+    "whisperx": "whisperx",
+    "local-whisperx": "whisperx",
+    "whisperx-aligned": "whisperx",
+    "whisperx-diarization": "whisperx-diarization",
+    "whisperx-diarize": "whisperx-diarization",
+    "local-whisperx-diarize": "whisperx-diarization",
+    "local-whisperx-diarization": "whisperx-diarization",
+}
+
+
+def normalize_speech_api_engine(value: str, diarize: bool = False) -> str:
+    raw = str(value or "faster-whisper").strip().lower()
+    engine = SPEECH_API_ENGINE_ALIASES.get(raw, raw)
+    if engine == "whisperx" and diarize:
+        engine = "whisperx-diarization"
+    if engine not in {"faster-whisper", "whisperx", "whisperx-diarization"}:
+        raise ValueError(f"Unsupported speech engine: {value}. Use faster-whisper, whisperx, or whisperx-diarization.")
+    return engine
+
+
+def speech_api_status_payload() -> dict[str, Any]:
+    faster = whisper_status_payload()
+    whisperx = whisperx_status_payload()
+    engines = {
+        "faster-whisper": {
+            "ready": bool(faster.get("ready")),
+            "label": "Faster-Whisper",
+            "aliases": ["whisper-1", "faster-whisper", "local-faster-whisper"],
+            "python": faster.get("python", ""),
+            "helper": faster.get("helper", ""),
+            "supports": ["text", "segments", "word_timestamps"],
+            "error": faster.get("error", ""),
+        },
+        "whisperx": {
+            "ready": bool(whisperx.get("ready")),
+            "label": "WhisperX aligned timestamps",
+            "aliases": ["whisperx", "local-whisperx", "whisperx-aligned"],
+            "python": whisperx.get("python", ""),
+            "helper": whisperx.get("helper", ""),
+            "supports": ["text", "segments", "word_timestamps", "alignment"],
+            "error": whisperx.get("error", ""),
+        },
+        "whisperx-diarization": {
+            "ready": bool(whisperx.get("ready")),
+            "label": "WhisperX + pyannote diarization",
+            "aliases": ["whisperx-diarization", "whisperx-diarize", "local-whisperx-diarize"],
+            "python": whisperx.get("python", ""),
+            "helper": whisperx.get("helper", ""),
+            "supports": ["text", "segments", "word_timestamps", "alignment", "speaker_labels"],
+            "requires_hf_token_for_diarization": True,
+            "hf_token": hf_token_status_payload(),
+            "error": whisperx.get("error", ""),
+        },
+    }
+    return {
+        "ok": True,
+        "version": VERSION,
+        "api": "handai-local-speech-api",
+        "speech_api_dir": str(SPEECH_API_DIR),
+        "upload_dir": str(STT_UPLOAD_DIR),
+        "engines": engines,
+        "ready": any(e.get("ready") for e in engines.values()),
+        "routes": {
+            "status": "/api/speech/status",
+            "engines": "/api/speech/engines",
+            "upload": "/api/speech/upload",
+            "transcribe": "/api/speech/transcribe",
+            "jobs": "/api/speech/jobs/<job_id>",
+        },
+        "note": "Local speech API for Faster-Whisper and WhisperX. The public AI Studio bridge exposes selected routes without exposing the full Web UI.",
+    }
+
+
+def _speech_api_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _speech_api_words(data: dict[str, Any], segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    raw_words = data.get("words") if isinstance(data.get("words"), list) else []
+    words: list[dict[str, Any]] = []
+    for w in raw_words:
+        if not isinstance(w, dict):
+            continue
+        word = str(w.get("word") or w.get("text") or "").strip()
+        if not word:
+            continue
+        words.append({
+            "word": word,
+            "text": word,
+            "start": _speech_api_float(w.get("start")),
+            "end": _speech_api_float(w.get("end"), _speech_api_float(w.get("start"))),
+            "confidence": _speech_api_float(w.get("probability") or w.get("confidence"), 0.0),
+            "speaker": str(w.get("speaker") or "").strip(),
+        })
+    if words:
+        return words
+    # Fall back to segment-level words from the existing analysis helper.
+    try:
+        return [
+            {
+                "word": _word_text(w),
+                "text": _word_text(w),
+                "start": _speech_api_float(w.get("start")),
+                "end": _speech_api_float(w.get("end"), _speech_api_float(w.get("start"))),
+                "confidence": _speech_api_float(w.get("confidence"), 0.0),
+                "speaker": str(w.get("speaker") or ""),
+                "approximate_timing": bool(w.get("approximate_timing")),
+            }
+            for w in _words_from_transcript_result({"segments": segments})
+            if _word_text(w)
+        ]
+    except Exception:
+        return []
+
+
+def normalize_speech_api_result(engine: str, src: Path, data: dict[str, Any], payload: dict[str, Any], raw_json_path: Path | None = None) -> dict[str, Any]:
+    segments: list[dict[str, Any]] = []
+    for idx, seg in enumerate(data.get("segments") or []):
+        if not isinstance(seg, dict):
+            continue
+        segments.append({
+            "id": int(seg.get("id") if str(seg.get("id", "")).isdigit() else idx),
+            "start": _speech_api_float(seg.get("start")),
+            "end": _speech_api_float(seg.get("end"), _speech_api_float(seg.get("start"))),
+            "text": str(seg.get("text") or "").strip(),
+            "speaker": str(seg.get("speaker") or "").strip(),
+            "confidence": _speech_api_float(seg.get("confidence") or seg.get("avg_logprob"), 0.0),
+        })
+    text = str(data.get("text") or data.get("transcript") or " ".join(s.get("text", "") for s in segments)).strip()
+    words = _speech_api_words(data, segments)
+    speaker_segments = []
+    try:
+        speaker_segments = _speaker_segments_from_result({"segments": segments}, words)
+    except Exception:
+        speaker_segments = []
+    duration = audio_duration_seconds(src)
+    result = {
+        "ok": True,
+        "task": "transcribe",
+        "engine": engine,
+        "model": str(payload.get("model") or data.get("model") or ""),
+        "language": str(data.get("language") or payload.get("language") or "auto"),
+        "duration": duration,
+        "duration_seconds": duration,
+        "text": text,
+        "segments": segments,
+        "words": words,
+        "speakers": speaker_segments,
+        "speaker_segments": speaker_segments,
+        "source_path": str(src),
+        "raw_backend": data,
+        "files": {},
+        "created_at": iso_time(),
+    }
+    if raw_json_path:
+        result["files"]["raw_json"] = str(raw_json_path)
+    return result
+
+
+def write_speech_api_upload(filename: str, data_base64: str) -> dict[str, Any]:
+    filename = safe_filename(filename or "speech-api-upload.wav", "speech-api-upload.wav")
+    if Path(filename).suffix.lower() not in AUDIO_EXTS:
+        filename += ".wav"
+    data = decode_b64(str(data_base64 or ""))
+    if not data:
+        raise ValueError("audio_base64 decoded to zero bytes")
+    ensure_dirs()
+    target = STT_UPLOAD_DIR / filename
+    if target.exists():
+        target = next_versioned_path(target, always_version=False)
+    target.write_bytes(data)
+    return {"ok": True, "path": str(target), "name": target.name, "size": target.stat().st_size, "duration_seconds": audio_duration_seconds(target)}
 
 FILLER_WORDS = {"um", "umm", "uh", "uhh", "ah", "ahh", "er", "erm", "hm", "hmm", "mmm"}
 
@@ -3070,6 +3256,8 @@ class JobManager:
                     self._run_batch(job, payload)
                 elif job.kind == "stt":
                     self._run_stt(job, payload)
+                elif job.kind == "speech-api":
+                    self._run_speech_api(job, payload)
                 elif job.kind == "speech-analysis":
                     self._run_speech_analysis(job, payload)
                 elif job.kind == "metadata":
@@ -3568,6 +3756,107 @@ class JobManager:
                 "The full message is in the job log."
             )
         return text[-600:] or "Transcription failed. See job log."
+
+
+    def _run_speech_api(self, job: Job, payload: dict[str, Any]) -> None:
+        src = safe_existing_path(
+            str(payload.get("source_path") or payload.get("path") or ""),
+            [REF_DIR, OUT_DIR, PROFILE_DIR, STT_UPLOAD_DIR, AUDIO_LAB_DIR, VIDEO_EXTRACT_DIR, MODEL_TEST_DIR, SPEECH_API_DIR],
+        )
+        if src.suffix.lower() not in AUDIO_EXTS:
+            raise ValueError("Speech API source is not a supported audio file.")
+        engine = normalize_speech_api_engine(str(payload.get("engine") or payload.get("model") or "faster-whisper"), bool(payload.get("diarization") or payload.get("diarize")))
+        model = str(payload.get("model_size") or payload.get("whisper_model") or payload.get("model_name") or payload.get("model") or "").strip().lower()
+        if model in SPEECH_API_ENGINE_ALIASES or model in {"faster-whisper", "whisperx", "whisperx-diarization"}:
+            model = ""
+        if model not in {"tiny", "base", "small", "medium", "large-v3"}:
+            model = "small" if engine.startswith("whisperx") else "base"
+        device = str(payload.get("device") or "auto").strip().lower()
+        if device not in {"auto", "cuda", "cpu"}:
+            device = "auto"
+        compute_type = str(payload.get("compute_type") or "auto").strip().lower()
+        if compute_type not in {"auto", "int8", "float16", "float32"}:
+            compute_type = "auto"
+        language = str(payload.get("language") or "auto").strip()
+        timeout = int(float(payload.get("timeout_seconds") or 7200))
+        timeout = max(60, min(timeout, 24 * 60 * 60))
+        ensure_dirs()
+        base = SPEECH_API_DIR / f"{safe_slug(src.stem)}_{engine}_{job.id}"
+        raw_json = base.with_suffix(".raw.json")
+        final_json = base.with_suffix(".json")
+        self._set(job, status="running", started_at=now(), engine=engine, role="speech-api", text=f"Speech API: {src.name} via {engine}", source_path=str(src), output=str(final_json))
+        self._append_log(job, "HandAI Local Speech API v0.91\n")
+        self._append_log(job, f"Source: {src}\nEngine: {engine}\nModel: {model}\nDevice: {device}\nCompute type: {compute_type}\nOutput JSON: {final_json}\n\n")
+
+        if engine == "faster-whisper":
+            status = whisper_status_payload()
+            if not status.get("ready"):
+                raise RuntimeError("Faster-Whisper is not ready. " + str(status.get("error", "")))
+            word_timestamps = bool(payload.get("word_timestamps", True))
+            cmd = self._stt_command(src, model, language, device, compute_type, word_timestamps=word_timestamps)
+            rc, stdout, stderr, timed_out = self._run_capture_subprocess(job, cmd, timeout=timeout, cwd=LAB, env=hf_env())
+            if self._is_cancel_requested(job):
+                self._mark_canceled(job)
+                return
+            if timed_out:
+                self._set(job, status="error", error=f"Speech API transcription timed out after {timeout} seconds.", finished_at=now())
+                return
+            if rc != 0:
+                raw = stderr or stdout or f"Speech API transcription failed with exit code {rc}"
+                self._set(job, status="error", error=self._human_stt_error(raw), finished_at=now())
+                return
+            try:
+                data = json.loads(stdout)
+            except Exception:
+                self._set(job, status="error", error="Speech API completed but Faster-Whisper did not return parseable JSON. See job log.", finished_at=now())
+                return
+            data["stderr"] = (stderr or "").strip()[-2000:]
+            raw_json.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            result = normalize_speech_api_result(engine, src, data, {**payload, "model": model, "language": language}, raw_json)
+        else:
+            status = whisperx_status_payload()
+            if not status.get("ready"):
+                raise RuntimeError("WhisperX is not ready. Use Maintenance → WhisperX install/repair, then retry. " + str(status.get("error", "")))
+            helper_status = ensure_whisperx_helper()
+            self._append_log(job, "WhisperX helper status: " + json.dumps(helper_status, default=str) + "\n")
+            cmd = [
+                str(whisperx_python_path()), str(WHISPERX_HELPER),
+                "--input", str(src),
+                "--output", str(raw_json),
+                "--model", model,
+                "--device", device,
+                "--compute-type", compute_type,
+                "--batch-size", str(int(payload.get("batch_size") or 2)),
+                "--hf-token-file", str(HF_TOKEN_FILE),
+            ]
+            if language and language.lower() != "auto":
+                cmd += ["--language", language]
+            if engine == "whisperx-diarization" or bool(payload.get("diarization") or payload.get("diarize")):
+                cmd.append("--diarize")
+            rc = self._run_subprocess(job, cmd, cwd=LAB)
+            if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+                self._mark_canceled(job)
+                return
+            if not raw_json.exists():
+                self._set(job, status="error", error=f"WhisperX did not write expected JSON output. Exit code: {rc}", finished_at=now())
+                return
+            try:
+                data = json.loads(raw_json.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self._set(job, status="error", error=f"WhisperX wrote unreadable JSON: {exc}", finished_at=now())
+                return
+            if rc != 0 or data.get("ok") is False:
+                errors = data.get("errors") if isinstance(data.get("errors"), list) else []
+                self._set(job, status="error", error=(errors[0] if errors else f"WhisperX failed with exit code {rc}"), result=data, finished_at=now())
+                return
+            result = normalize_speech_api_result(engine, src, data, {**payload, "model": model, "language": language}, raw_json)
+        result["files"]["json"] = str(final_json)
+        result["job_id"] = job.id
+        result["status"] = "done"
+        final_json.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._append_log(job, f"Speech API complete. Text chars: {len(result.get('text') or '')}; segments: {len(result.get('segments') or [])}; words: {len(result.get('words') or [])}.\n")
+        self._append_log(job, f"Result JSON: {final_json}\n")
+        self._set(job, status="done", transcript=str(result.get("text") or ""), result=result, output=str(final_json), finished_at=now())
 
     def _run_speech_analysis(self, job: Job, payload: dict[str, Any]) -> None:
         src = safe_existing_path(str(payload.get("path", "")), [REF_DIR, OUT_DIR, PROFILE_DIR, STT_UPLOAD_DIR])
@@ -7296,6 +7585,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(whisper_status_payload())
             elif path == "/api/stt/analysis-status":
                 self.send_json(speech_analysis_status_payload())
+            elif path == "/api/speech/status":
+                self.send_json(speech_api_status_payload())
+            elif path == "/api/speech/engines":
+                self.send_json({"engines": speech_api_status_payload().get("engines", {})})
             elif path == "/api/stt/sources":
                 self.send_json({"sources": stt_sources_payload()})
             elif path == "/api/audio-lab/sources":
@@ -7316,6 +7609,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"sources": resemble_sources_payload()})
             elif path == "/api/hf-token/status":
                 self.send_json(hf_token_status_payload())
+            elif path.startswith("/api/speech/jobs/"):
+                job_id = path.rsplit("/", 1)[-1]
+                job = JOBS.get(job_id)
+                self.send_json({"job": job.public()} if job else {"error": "not found"}, 200 if job else 404)
             elif path.startswith("/api/jobs/"):
                 job_id = path.rsplit("/", 1)[-1]
                 job = JOBS.get(job_id)
@@ -7422,6 +7719,17 @@ class Handler(BaseHTTPRequestHandler):
                 target = STT_UPLOAD_DIR / filename
                 target.write_bytes(data)
                 self.send_json({"path": str(target), "name": target.name, "size": target.stat().st_size, "duration_seconds": audio_duration_seconds(target)})
+            elif path == "/api/speech/upload":
+                self.send_json(write_speech_api_upload(str(body.get("filename") or body.get("name") or "speech-api-upload.wav"), str(body.get("audio_base64") or body.get("data_base64") or "")))
+            elif path == "/api/speech/transcribe":
+                payload = dict(body)
+                if not str(payload.get("source_path") or payload.get("path") or "").strip() and str(payload.get("audio_base64") or payload.get("data_base64") or "").strip():
+                    up = write_speech_api_upload(str(payload.get("filename") or "speech-api-upload.wav"), str(payload.get("audio_base64") or payload.get("data_base64") or ""))
+                    payload["source_path"] = up["path"]
+                    payload["upload"] = up
+                job = Job(id=uuid.uuid4().hex, kind="speech-api")
+                JOBS.add(job, payload)
+                self.send_json({"job": job.public(), "status_url": f"/api/speech/jobs/{job.id}"})
             elif path == "/api/stt/transcribe":
                 job = Job(id=uuid.uuid4().hex, kind="stt")
                 JOBS.add(job, body)
