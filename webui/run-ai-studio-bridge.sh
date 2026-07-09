@@ -11,5 +11,6 @@ export TTS_AI_STUDIO_BRIDGE_HOST="${TTS_AI_STUDIO_BRIDGE_HOST:-127.0.0.1}"
 export TTS_AI_STUDIO_BRIDGE_PORT="${TTS_AI_STUDIO_BRIDGE_PORT:-7871}"
 export TTS_AI_STUDIO_BRIDGE_ALLOWED_ORIGINS="${TTS_AI_STUDIO_BRIDGE_ALLOWED_ORIGINS:-*}"
 export TTS_AI_STUDIO_BRIDGE_ALLOWED_ENGINES="${TTS_AI_STUDIO_BRIDGE_ALLOWED_ENGINES:-chatterbox,qwen3,cosyvoice}"
+export TTS_AI_STUDIO_BRIDGE_ALLOWED_STT_ENGINES="${TTS_AI_STUDIO_BRIDGE_ALLOWED_STT_ENGINES:-whisper-1,faster-whisper,whisperx,local-whisperx,whisperx-diarization,local-whisperx-diarize}"
 
 exec python3 ./tts_ai_studio_bridge.py

@@ -600,3 +600,44 @@ The Profiles tab can also import a ZIP profile package and add it to the library
 ## Safety / exposure
 
 By default it binds only to `127.0.0.1`, meaning only the local machine can access it. Do **not** expose this directly to the public internet. It can execute local synth jobs and read/write files inside the TTS lab directories.
+
+
+### v0.91 Local Speech API / AI Studio Bridge STT
+
+The AI Studio bridge can now expose local transcription without exposing the full Web UI. Keep the Cloudflare tunnel pointed at the bridge service, not at the browser UI.
+
+Public bridge routes:
+
+```text
+POST /api/ai-studio-bridge/clone-tts        # existing local cloned/custom TTS
+POST /api/ai-studio-bridge/transcribe       # bridge-native JSON STT
+POST /v1/audio/transcriptions               # OpenAI-compatible multipart STT
+GET  /api/ai-studio-bridge/jobs/<job_id>    # async job polling
+GET  /api/ai-studio-bridge/status           # bridge + speech-engine status
+```
+
+Use the same `X-HandAISpoke-Bridge-Token` header as the TTS bridge. The OpenAI-compatible route also accepts `Authorization: Bearer <token>` for clients that expect that shape.
+
+OpenAI-compatible example:
+
+```bash
+curl https://handaispokeapi.thehandaiman.com/v1/audio/transcriptions \
+  -H "X-HandAISpoke-Bridge-Token: $TTS_AI_STUDIO_BRIDGE_TOKEN" \
+  -F file="@clip.mp3" \
+  -F model="whisperx" \
+  -F response_format="verbose_json" \
+  -F "timestamp_granularities[]=word"
+```
+
+Supported speech model aliases:
+
+```text
+whisper-1              -> faster-whisper
+faster-whisper         -> faster-whisper
+whisperx               -> WhisperX aligned timestamps
+local-whisperx         -> WhisperX aligned timestamps
+whisperx-diarization   -> WhisperX + pyannote diarization
+local-whisperx-diarize -> WhisperX + pyannote diarization
+```
+
+For long files, use the bridge-native JSON endpoint with `mode: "async"`, then poll `/api/ai-studio-bridge/jobs/<job_id>`.
