@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.92 adds a Tagged Script role-map builder for assigning script roles to saved voice profiles without hand-editing JSON.
+Version 0.93 adds immediate production feedback, live job timers, tagged-script ETA, and optional full-script mixdown.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -83,7 +83,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.92"
+VERSION = "0.93.3"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -116,6 +116,17 @@ ENGINE_META = {
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_. -]+")
 SAFE_SLUG = re.compile(r"[^A-Za-z0-9_.-]+")
 ROLE_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_ -]{0,31})\s*:\s*(.+?)\s*$")
+TAGGED_SCRIPT_INVISIBLE_CHARS = "\ufeff\u200b\u200c\u200d\u2060"
+TAGGED_SCRIPT_INVISIBLE_TRANSLATION = {ord(ch): None for ch in TAGGED_SCRIPT_INVISIBLE_CHARS}
+
+
+def clean_tagged_script_text(value: str) -> tuple[str, int]:
+    """Remove BOM/zero-width marker characters that can hide before ROLE: labels."""
+    text = str(value or "")
+    count = sum(text.count(ch) for ch in TAGGED_SCRIPT_INVISIBLE_CHARS)
+    if count:
+        text = text.translate(TAGGED_SCRIPT_INVISIBLE_TRANSLATION)
+    return text, count
 
 
 def now() -> float:
@@ -3277,6 +3288,8 @@ class JobManager:
                     self._run_single(job, payload)
                 elif job.kind == "batch":
                     self._run_batch(job, payload)
+                elif job.kind == "batch-mixdown":
+                    self._run_batch_mixdown(job, payload)
                 elif job.kind == "stt":
                     self._run_stt(job, payload)
                 elif job.kind == "speech-api":
@@ -3442,6 +3455,139 @@ class JobManager:
         self._append_log(job, "\n$ " + shlex.join(cmd) + "\n")
         rc = subprocess.call(cmd, cwd=str(LAB))
         return rc == 0 and output.exists() and self._normalize_wav_for_browser(job, output)
+
+    def _write_silence_wav(self, job: Job, output: Path, duration: float) -> bool:
+        duration = max(0.0, float(duration or 0.0))
+        if duration <= 0:
+            return False
+        output.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+            "-t", f"{duration:g}", "-c:a", "pcm_s16le", str(output),
+        ]
+        self._append_log(job, "\n$ " + shlex.join(cmd) + "\n")
+        rc = subprocess.call(cmd, cwd=str(LAB))
+        return rc == 0 and output.exists() and output.stat().st_size > 0
+
+    def _convert_mixdown_audio(self, job: Job, source_wav: Path, output: Path, fmt: str = "mp3", mp3_bitrate: str = "192k") -> bool:
+        fmt = (fmt or "mp3").strip().lower()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if fmt == "wav":
+            if source_wav.resolve() != output.resolve():
+                shutil.copy2(source_wav, output)
+            self._normalize_wav_for_browser(job, output)
+            return output.exists() and output.stat().st_size > 0
+        if fmt != "mp3":
+            fmt = "mp3"
+        if mp3_bitrate not in {"96k", "128k", "192k", "256k", "320k"}:
+            mp3_bitrate = "192k"
+        tmp = output.with_name(output.name + ".tmp.mp3")
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(source_wav), "-vn", "-ar", "44100", "-ac", "1",
+            "-c:a", "libmp3lame", "-b:a", mp3_bitrate, str(tmp),
+        ]
+        self._append_log(job, "\n$ " + shlex.join(cmd) + "\n")
+        rc = subprocess.call(cmd, cwd=str(LAB))
+        if rc == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            tmp.replace(output)
+            ensure_mp3_preview(output, lambda msg: self._append_log(job, msg))
+            return True
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+    def _run_batch_mixdown(self, job: Job, payload: dict[str, Any]) -> None:
+        manifest_raw = str(payload.get("manifest") or payload.get("manifest_path") or "").strip()
+        if not manifest_raw:
+            raise ValueError("A batch manifest path is required for post-run mixdown.")
+        manifest_path = safe_existing_path(manifest_raw, [OUT_DIR])
+        if manifest_path.name != "manifest.json":
+            raise ValueError("Post-run mixdown expects a tagged-script manifest.json file.")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Could not read batch manifest JSON: {exc}") from exc
+        if not isinstance(manifest, list):
+            raise ValueError("Batch manifest must be a list of rendered line entries.")
+        batch_dir = manifest_path.parent
+        rendered: list[tuple[dict[str, Any], Path]] = []
+        skipped: list[dict[str, Any]] = []
+        for item in manifest:
+            if not isinstance(item, dict):
+                continue
+            raw_output = str(item.get("output") or "").strip()
+            if not raw_output or not bool(item.get("ok")):
+                skipped.append({"index": item.get("index"), "role": item.get("role"), "reason": "not marked ok or missing output"})
+                continue
+            try:
+                piece = safe_existing_path(raw_output, [OUT_DIR])
+            except Exception as exc:
+                skipped.append({"index": item.get("index"), "role": item.get("role"), "output": raw_output, "reason": str(exc)})
+                continue
+            if piece.suffix.lower() not in AUDIO_EXTS:
+                skipped.append({"index": item.get("index"), "role": item.get("role"), "output": str(piece), "reason": "not an audio file"})
+                continue
+            rendered.append((item, piece))
+        if not rendered:
+            raise RuntimeError("No successful rendered line outputs were found in the selected batch manifest.")
+        mix_fmt = str(payload.get("mixdown_format") or payload.get("format") or "mp3").strip().lower()
+        if mix_fmt not in {"mp3", "wav"}:
+            mix_fmt = "mp3"
+        mp3_bitrate = str(payload.get("mixdown_mp3_bitrate") or payload.get("mp3_bitrate") or "192k").strip().lower()
+        if mp3_bitrate not in {"96k", "128k", "192k", "256k", "320k"}:
+            mp3_bitrate = "192k"
+        try:
+            line_gap = max(0.0, float(payload.get("line_gap_seconds") or payload.get("gap_seconds") or 0.0))
+        except Exception:
+            line_gap = 0.0
+        output_stem = safe_slug(str(payload.get("output_name") or "tagged_script_mixdown_manual"), "tagged_script_mixdown_manual")
+        final_output = next_versioned_path(batch_dir / f"{output_stem}.{mix_fmt}", always_version=False)
+        assembled_wav = next_versioned_path(batch_dir / f"{output_stem}_work.wav", always_version=False)
+        self._set(job, status="running", started_at=now(), engine="ffmpeg", role="tagged-script-mixdown", text=f"Mix down tagged-script batch: {len(rendered)} rendered lines", source_path=str(manifest_path), manifest=str(manifest_path))
+        self._append_log(job, "Tagged Script post-run mixdown v0.93.2\n")
+        self._append_log(job, f"Manifest: {manifest_path}\nRendered lines found: {len(rendered)}\nOutput format: {mix_fmt}; line gap: {line_gap:g}s; final output: {final_output}\n")
+        if skipped:
+            self._append_log(job, f"Skipped manifest entries: {len(skipped)}\n")
+        mix_pieces: list[Path] = []
+        silence_files: list[str] = []
+        for i, (_item, piece) in enumerate(rendered, start=1):
+            mix_pieces.append(piece)
+            if line_gap > 0 and i < len(rendered):
+                silence = batch_dir / f"manual_mixdown_{job.id}_silence_{i:03d}_{line_gap:g}s.wav"
+                if self._write_silence_wav(job, silence, line_gap):
+                    mix_pieces.append(silence)
+                    silence_files.append(str(silence))
+                else:
+                    self._append_log(job, f"Warning: could not create silence gap after line {i}; continuing without that gap.\n")
+        mix_ok = self._concat_wavs(job, mix_pieces, assembled_wav)
+        if mix_ok:
+            mix_ok = self._convert_mixdown_audio(job, assembled_wav, final_output, mix_fmt, mp3_bitrate)
+        if not mix_ok or not final_output.exists() or final_output.stat().st_size <= 0:
+            self._set(job, status="error", error="FFmpeg could not assemble the selected batch line outputs. See job log.", finished_at=now())
+            return
+        meta = {
+            "kind": "tagged-script-post-run-mixdown",
+            "created_at": iso_time(),
+            "job_id": job.id,
+            "source_manifest": str(manifest_path),
+            "source_line_count": len(rendered),
+            "skipped_entries": skipped,
+            "line_gap_seconds": line_gap,
+            "output_audio": str(final_output),
+            "output_format": mix_fmt,
+            "mp3_bitrate": mp3_bitrate if mix_fmt == "mp3" else "",
+            "intermediate_wav": str(assembled_wav),
+            "silence_files": silence_files,
+            "note": "Created from an already-rendered Tagged Script batch. No TTS lines were regenerated.",
+        }
+        final_output.with_suffix(final_output.suffix + ".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        self._append_log(job, f"Post-run tagged script mixdown ready: {final_output}\n")
+        self._set(job, status="done", output=str(final_output), result=meta, finished_at=now())
+
 
     def _run_chunked(self, job: Job, payload: dict[str, Any], output: Path, chunks: list[str]) -> int:
         pieces: list[Path] = []
@@ -4610,8 +4756,282 @@ class JobManager:
         else:
             self._archive_uploaded_video_source(job, payload)
 
+
+    def _run_batch_mixdown(self, job: Job, payload: dict[str, Any]) -> None:
+        # Post-run Tagged Script mixdown v0.93.3 backend override.
+        source_job_id = str(payload.get("job_id") or payload.get("source_job_id") or "").strip()
+        source_job = self.get(source_job_id) if source_job_id else None
+
+        fmt = str(payload.get("output_format") or payload.get("format") or payload.get("mixdown_format") or "mp3").strip().lower()
+        if fmt not in {"mp3", "wav"}:
+            fmt = "mp3"
+        try:
+            gap = float(payload.get("line_gap_seconds") or payload.get("gap_seconds") or payload.get("pause_seconds") or 0.35)
+        except Exception:
+            gap = 0.35
+        gap = max(0.0, min(gap, 10.0))
+
+        def first_text(*values: Any) -> str:
+            for value in values:
+                if value is None:
+                    continue
+                txt = str(value).strip()
+                if txt:
+                    return txt
+            return ""
+
+        def resolve_manifest_path(value: Any) -> Path | None:
+            raw = first_text(value)
+            if not raw:
+                return None
+            # Public job payloads may contain /manifest/<file.json> rather than a filesystem path.
+            if raw.startswith("/manifest/"):
+                name = safe_filename(unquote(raw.rsplit("/", 1)[-1]), "manifest.json")
+                hits = list(OUT_DIR.rglob(name))
+                return hits[0].resolve() if hits else None
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                # Allow plain manifest filenames from public payloads.
+                hits = list(OUT_DIR.rglob(candidate.name))
+                if hits:
+                    return hits[0].resolve()
+                candidate = OUT_DIR / candidate
+            candidate = candidate.resolve()
+            if inside(candidate, OUT_DIR) and candidate.exists() and candidate.is_file():
+                return candidate
+            return None
+
+        manifest_path = resolve_manifest_path(
+            payload.get("manifest_path")
+            or payload.get("manifest")
+            or payload.get("manifest_url")
+            or ((source_job.manifest or "") if source_job else "")
+        )
+
+        children: list[dict[str, Any]] = []
+        if source_job and isinstance(source_job.children, list):
+            children.extend([c for c in source_job.children if isinstance(c, dict)])
+        if isinstance(payload.get("children"), list):
+            children.extend([c for c in payload.get("children", []) if isinstance(c, dict)])
+
+        def manifest_items(data: Any) -> list[dict[str, Any]]:
+            if isinstance(data, list):
+                return [x for x in data if isinstance(x, dict)]
+            if isinstance(data, dict):
+                for key in ("children", "lines", "items", "outputs", "batch_lines"):
+                    val = data.get(key)
+                    if isinstance(val, list):
+                        return [x for x in val if isinstance(x, dict)]
+            return []
+
+        if manifest_path:
+            try:
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                children.extend(manifest_items(data))
+            except Exception as exc:
+                self._append_log(job, f"Warning: could not read manifest {manifest_path}: {exc}\n")
+
+        def child_index(item: dict[str, Any]) -> int:
+            for key in ("index", "line", "line_index", "number"):
+                try:
+                    value = item.get(key)
+                    if value not in (None, ""):
+                        return int(value)
+                except Exception:
+                    pass
+            return 0
+
+        def output_path_from_child(item: dict[str, Any]) -> str:
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            return first_text(
+                item.get("output"),
+                item.get("output_path"),
+                item.get("path"),
+                item.get("audio"),
+                item.get("audio_path"),
+                result.get("output_audio"),
+                result.get("output_path"),
+                result.get("audio"),
+            )
+
+        def resolve_audio_path(value: Any) -> Path | None:
+            raw = first_text(value)
+            if not raw:
+                return None
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                p = OUT_DIR / p
+            p = p.resolve()
+            if inside(p, OUT_DIR) and p.exists() and p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+                return p
+            return None
+
+        sequence: list[Path] = []
+        skipped: list[str] = []
+        seen: set[str] = set()
+        for item in sorted(children, key=child_index):
+            if item.get("ok") is False:
+                skipped.append(f"line {item.get('index', '?')}: marked not ok")
+                continue
+            out = output_path_from_child(item)
+            p = resolve_audio_path(out)
+            if not p:
+                skipped.append(f"line {item.get('index', '?')}: no usable output audio path")
+                continue
+            sp = str(p)
+            if sp in seen:
+                continue
+            seen.add(sp)
+            sequence.append(p)
+
+        # Last-resort recovery for old history records whose child objects do not expose output paths.
+        # If we have a manifest path, scan its batch directory for final line-level audio files.
+        # Exclude chunk part folders, previews, existing mixdowns, and silence helpers.
+        if not sequence and manifest_path:
+            batch_dir_scan = manifest_path.parent
+            candidates: list[Path] = []
+            for p in sorted(batch_dir_scan.glob("*")):
+                name = p.name.lower()
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in AUDIO_EXTS:
+                    continue
+                if "preview" in name or "mixdown" in name or "silence" in name or "concat" in name:
+                    continue
+                if not re.match(r"^\d{3}_", p.name):
+                    continue
+                candidates.append(p.resolve())
+            sequence = candidates
+
+        if not sequence:
+            raise ValueError(
+                "No usable rendered line audio files were found for post-run mixdown. "
+                "The source batch may predate saved child output paths, or the files may have moved."
+            )
+
+        batch_dir = manifest_path.parent if manifest_path else sequence[0].parent
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        wav_output = next_versioned_path(batch_dir / "tagged_script_post_mixdown.wav", always_version=False)
+        concat_path = batch_dir / f"tagged_script_post_mixdown_{job.id[:8]}.concat.txt"
+        silence_path = None
+
+        self._set(
+            job,
+            status="running",
+            started_at=now(),
+            engine="ffmpeg",
+            role="batch-mixdown",
+            text=f"Post-run Tagged Script mixdown: {len(sequence)} rendered lines",
+            manifest=str(manifest_path) if manifest_path else None,
+            source_path=str(manifest_path) if manifest_path else None,
+        )
+        self._append_log(job, "Post-run Tagged Script mixdown v0.93.3 backend override\n")
+        if source_job_id:
+            self._append_log(job, f"Source job: {source_job_id}\n")
+        if manifest_path:
+            self._append_log(job, f"Manifest: {manifest_path}\n")
+        self._append_log(job, f"Usable rendered lines: {len(sequence)}\nSkipped child records: {len(skipped)}\nFormat: {fmt}\nLine gap: {gap:g}s\n\n")
+
+        if gap > 0 and len(sequence) > 1:
+            gap_slug = str(gap).replace(".", "_")
+            silence_path = batch_dir / f"post_mixdown_silence_{gap_slug}s.wav"
+            if not silence_path.exists() or silence_path.stat().st_size <= 0:
+                silence_cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+                    "-t", f"{gap:g}",
+                    "-c:a", "pcm_s16le",
+                    str(silence_path),
+                ]
+                rc = self._run_subprocess(job, silence_cmd, cwd=LAB)
+                if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+                    self._mark_canceled(job)
+                    return
+                if rc != 0 or not silence_path.exists():
+                    self._set(job, status="error", error="Could not create silence gap file for mixdown.", finished_at=now())
+                    return
+
+        def concat_entry(p: Path) -> str:
+            return "file '" + str(p).replace("'", "'\\''") + "'\n"
+
+        with concat_path.open("w", encoding="utf-8") as fh:
+            for idx, p in enumerate(sequence):
+                fh.write(concat_entry(p))
+                if silence_path and idx < len(sequence) - 1:
+                    fh.write(concat_entry(silence_path))
+
+        concat_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_path),
+            "-ar", "24000", "-ac", "1",
+            "-c:a", "pcm_s16le",
+            str(wav_output),
+        ]
+        rc = self._run_subprocess(job, concat_cmd, cwd=LAB)
+        if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+            try:
+                wav_output.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._mark_canceled(job)
+            return
+        if rc != 0 or not wav_output.exists() or wav_output.stat().st_size <= 0:
+            self._set(job, status="error", error="FFmpeg failed to assemble post-run mixdown WAV. See job log.", finished_at=now())
+            return
+
+        self._normalize_wav_for_browser(job, wav_output)
+        final_output = wav_output
+
+        if fmt == "mp3":
+            final_output = next_versioned_path(batch_dir / "tagged_script_post_mixdown.mp3", always_version=False)
+            tmp = final_output.with_name(final_output.name + ".tmp.mp3")
+            mp3_cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(wav_output),
+                "-vn", "-ar", "44100", "-ac", "1",
+                "-c:a", "libmp3lame", "-b:a", "192k",
+                str(tmp),
+            ]
+            rc = self._run_subprocess(job, mp3_cmd, cwd=LAB)
+            if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self._mark_canceled(job)
+                return
+            if rc != 0 or not tmp.exists() or tmp.stat().st_size <= 0:
+                self._set(job, status="error", error="FFmpeg failed to encode post-run mixdown MP3. WAV was created; see job log.", output=str(wav_output), finished_at=now())
+                return
+            tmp.replace(final_output)
+
+        ensure_mp3_preview(final_output, lambda msg: self._append_log(job, msg))
+        result = {
+            "kind": "tagged-script-post-run-mixdown",
+            "created_at": iso_time(),
+            "job_id": job.id,
+            "source_job_id": source_job_id,
+            "manifest": str(manifest_path) if manifest_path else "",
+            "line_count": len(sequence),
+            "skipped_count": len(skipped),
+            "line_gap_seconds": gap,
+            "output_audio": str(final_output),
+            "output_format": fmt,
+            "wav_mixdown": str(wav_output),
+            "concat_file": str(concat_path),
+            "note": "Created from existing rendered Tagged Script line files without re-running TTS.",
+        }
+        try:
+            final_output.with_suffix(final_output.suffix + ".json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        self._append_log(job, f"Post-run Tagged Script mixdown ready: {final_output}\n")
+        self._set(job, status="done", output=str(final_output), result=result, finished_at=now())
+
     def _run_batch(self, job: Job, payload: dict[str, Any]) -> None:
         script = str(payload.get("script", ""))
+        script, invisible_char_count = clean_tagged_script_text(script)
         role_map = payload.get("role_map") or {}
         if not isinstance(role_map, dict):
             raise ValueError("role_map must be an object.")
@@ -4620,28 +5040,87 @@ class JobManager:
         default_ref_text = str(payload.get("default_ref_text", ""))
         default_x_vector = bool(payload.get("default_x_vector_only", True))
 
-        lines: list[tuple[str, str]] = []
+        lines: list[dict[str, Any]] = []
         for raw in script.splitlines():
             match = ROLE_LINE.match(raw)
             if not match:
                 continue
             role, text = match.group(1).strip(), match.group(2).strip()
             if text:
-                lines.append((role, text))
+                words = len(re.findall(r"\b\w+\b", text))
+                # A fixed per-line overhead keeps short interjections from making ETA wildly optimistic.
+                units = max(1, words) + 8
+                lines.append({"role": role, "text": text, "words": words, "units": units})
         if not lines:
             raise ValueError("No tagged lines found. Use ROLE: dialogue")
 
+        total_lines = len(lines)
+        total_words = sum(int(item["words"]) for item in lines)
+        total_units = sum(int(item["units"]) for item in lines)
         batch_id = uuid.uuid4().hex[:8]
         batch_dir = OUT_DIR / f"batch_{time.strftime('%Y%m%d_%H%M%S')}_{batch_id}"
         batch_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = batch_dir / "manifest.json"
 
-        self._set(job, status="running", started_at=now(), manifest=str(manifest_path))
+        started_ts = now()
         manifest: list[dict[str, Any]] = []
-        for idx, (role, text) in enumerate(lines, start=1):
+
+        def progress_payload(completed: int, status_note: str, current: dict[str, Any] | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+            completed = max(0, min(completed, total_lines))
+            completed_words = sum(int(item["words"]) for item in lines[:completed])
+            completed_units = sum(int(item["units"]) for item in lines[:completed])
+            elapsed = max(0.0, now() - started_ts)
+            remaining_units = max(0, total_units - completed_units)
+            eta = None
+            estimated_total = None
+            if completed >= 3 and completed_units > 0 and elapsed >= 5:
+                rate = completed_units / max(1.0, elapsed)
+                eta = remaining_units / rate if rate > 0 else None
+                estimated_total = elapsed + eta if eta is not None else None
+            data: dict[str, Any] = {
+                "kind": "tagged-script",
+                "status_note": status_note,
+                "total_lines": total_lines,
+                "completed_lines": completed,
+                "total_words": total_words,
+                "completed_words": completed_words,
+                "total_units": total_units,
+                "completed_units": completed_units,
+                "remaining_units": remaining_units,
+                "elapsed_seconds": elapsed,
+                "estimated_remaining_seconds": eta,
+                "estimated_total_seconds": estimated_total,
+                "manifest": str(manifest_path),
+            }
+            if current:
+                data.update({
+                    "current_line": current.get("index"),
+                    "current_role": current.get("role"),
+                    "current_engine": current.get("engine"),
+                    "current_words": current.get("words"),
+                    "current_text_preview": str(current.get("text") or "")[:160],
+                })
+            if extra:
+                data.update(extra)
+            return data
+
+        self._set(
+            job,
+            status="running",
+            started_at=started_ts,
+            manifest=str(manifest_path),
+            result={"kind": "tagged-script-batch", "progress": progress_payload(0, "starting")},
+        )
+        self._append_log(job, f"Tagged script batch: {total_lines} lines, {total_words} words, {total_units} weighted units.\n")
+        if invisible_char_count:
+            self._append_log(job, f"Removed {invisible_char_count} invisible Unicode marker(s) from pasted tagged script before parsing.\n")
+
+        for idx, item_meta in enumerate(lines, start=1):
             if self._is_cancel_requested(job):
                 self._mark_canceled(job)
                 return
+            role = str(item_meta["role"])
+            text = str(item_meta["text"])
             cfg = role_map.get(role) or role_map.get(role.upper()) or role_map.get(role.lower()) or {}
             if not isinstance(cfg, dict):
                 cfg = {}
@@ -4661,7 +5140,15 @@ class JobManager:
                 "x_vector_only": x_vector_only,
                 "profile": profile_slug,
             }
-            self._append_log(job, f"\n=== {idx:03d} {role} via {engine} ===\n")
+            current = {
+                "index": idx,
+                "role": role,
+                "engine": engine,
+                "words": item_meta["words"],
+                "text": text,
+            }
+            self._set(job, result={"kind": "tagged-script-batch", "progress": progress_payload(idx - 1, "rendering", current)})
+            self._append_log(job, f"\n=== {idx:03d}/{total_lines:03d} {role} via {engine} ({item_meta['words']} words) ===\n")
             chunks = split_synthesis_text(text)
             if engine == "chatterbox" and bool(line_payload.get("split_on_sentences", True)) and len(chunks) > 1:
                 rc = self._run_chunked(job, line_payload, output, chunks)
@@ -4676,13 +5163,14 @@ class JobManager:
                 if cooldown > 0 and idx < len(lines):
                     self._append_log(job, f"Cooling down {cooldown:g}s before next line.\n")
                     time.sleep(cooldown)
-            rel = output.relative_to(OUT_DIR)
             item = {
                 "index": idx,
                 "role": role,
                 "engine": engine,
                 "profile": profile_slug,
                 "text": text,
+                "word_count": int(item_meta["words"]),
+                "weighted_units": int(item_meta["units"]),
                 "output": str(output),
                 "audio_url": preview_url_for(output) if output.exists() else "",
                 "preview_url": preview_url_for(output) if output.exists() else "",
@@ -4691,15 +5179,92 @@ class JobManager:
                 "ok": ok,
             }
             manifest.append(item)
-            self._set(job, children=manifest.copy())
+            self._set(
+                job,
+                children=manifest.copy(),
+                result={"kind": "tagged-script-batch", "progress": progress_payload(idx, "rendered", current), "manifest": str(manifest_path)},
+            )
             if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
                 self._mark_canceled(job, f"Canceled by user at line {idx} ({role}).")
                 break
             if rc != 0:
-                self._set(job, status="error", error=f"Batch stopped at line {idx} ({role}); {oom_message(rc)}")
+                self._set(
+                    job,
+                    status="error",
+                    error=f"Batch stopped at line {idx} ({role}); {oom_message(rc)}",
+                    result={"kind": "tagged-script-batch", "progress": progress_payload(idx - 1, "error", current), "manifest": str(manifest_path)},
+                )
                 break
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        if all(item["ok"] for item in manifest):
+        all_ok = bool(manifest) and len(manifest) == total_lines and all(item["ok"] for item in manifest)
+        result: dict[str, Any] = {
+            "kind": "tagged-script-batch",
+            "created_at": iso_time(started_ts),
+            "job_id": job.id,
+            "manifest": str(manifest_path),
+            "line_count": len(manifest),
+            "total_lines": total_lines,
+            "total_words": total_words,
+            "total_units": total_units,
+            "children": manifest,
+            "mixdown_requested": bool(payload.get("assemble_mixdown", False)),
+            "progress": progress_payload(len(manifest), "assembling" if all_ok and bool(payload.get("assemble_mixdown", False)) else "complete"),
+        }
+        if all_ok and bool(payload.get("assemble_mixdown", False)):
+            mix_fmt = str(payload.get("mixdown_format") or "mp3").strip().lower()
+            if mix_fmt not in {"mp3", "wav"}:
+                mix_fmt = "mp3"
+            try:
+                line_gap = max(0.0, float(payload.get("line_gap_seconds") or 0.0))
+            except Exception:
+                line_gap = 0.0
+            self._set(job, result={**result, "progress": progress_payload(len(manifest), "assembling", extra={"mixdown_format": mix_fmt, "line_gap_seconds": line_gap})})
+            self._append_log(job, f"\nAssembling tagged script mixdown: format={mix_fmt}, line gap={line_gap:g}s.\n")
+            rendered = [Path(str(item.get("output") or "")) for item in manifest if item.get("ok")]
+            mix_pieces: list[Path] = []
+            silence_files: list[str] = []
+            for i, piece in enumerate(rendered, start=1):
+                if piece.exists():
+                    mix_pieces.append(piece)
+                if line_gap > 0 and i < len(rendered):
+                    silence = batch_dir / f"silence_{i:03d}_{line_gap:g}s.wav"
+                    if self._write_silence_wav(job, silence, line_gap):
+                        mix_pieces.append(silence)
+                        silence_files.append(str(silence))
+                    else:
+                        self._append_log(job, f"Warning: could not create silence gap after line {i}; continuing without that gap.\n")
+            assembled_wav = batch_dir / "tagged_script_mixdown.wav"
+            final_output = batch_dir / f"tagged_script_mixdown.{mix_fmt}"
+            mix_ok = self._concat_wavs(job, mix_pieces, assembled_wav)
+            if mix_ok:
+                mix_ok = self._convert_mixdown_audio(job, assembled_wav, final_output, mix_fmt, str(payload.get("mixdown_mp3_bitrate") or "192k"))
+            if mix_ok and final_output.exists():
+                mix_meta = {
+                    "kind": "tagged-script-mixdown",
+                    "created_at": iso_time(),
+                    "job_id": job.id,
+                    "manifest": str(manifest_path),
+                    "source_line_count": len(rendered),
+                    "line_gap_seconds": line_gap,
+                    "output_audio": str(final_output),
+                    "output_format": mix_fmt,
+                    "intermediate_wav": str(assembled_wav),
+                    "silence_files": silence_files,
+                    "note": "Created by Tagged Script mixdown. Individual line files are preserved in the same batch directory.",
+                }
+                final_output.with_suffix(final_output.suffix + ".json").write_text(json.dumps(mix_meta, indent=2), encoding="utf-8")
+                result["mixdown"] = mix_meta
+                result["progress"] = progress_payload(len(manifest), "complete", extra={"mixdown_output": str(final_output)})
+                self._set(job, output=str(final_output), result=result)
+                self._append_log(job, f"Tagged script mixdown ready: {final_output}\n")
+            else:
+                result["mixdown_error"] = "Line files rendered, but FFmpeg could not assemble the final mixdown. Individual line outputs are preserved."
+                result["progress"] = progress_payload(len(manifest), "mixdown failed")
+                self._set(job, result=result, warning=result["mixdown_error"])
+                self._append_log(job, "Warning: tagged script mixdown failed. Individual line files are preserved.\n")
+        else:
+            self._set(job, result=result)
+        if all_ok:
             self._set(job, status="done", finished_at=now())
         else:
             self._set(job, finished_at=now())
@@ -4806,8 +5371,8 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 </head>
 <body>
 <header>
-  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.92</span></h1>
-  <div class="small">Voice profiles, Tagged Script role-map builder, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Metadata cover-art tagging, WhisperX setup/testing, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
+  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.93.3</span></h1>
+  <div class="small">Voice profiles, Tagged Script role-map builder, mixdown, ETA, preflight checks, post-run mixdown fixes, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Metadata cover-art tagging, WhisperX setup/testing, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
 </header>
 <main>
   <section class="left-panel">
@@ -4860,7 +5425,7 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
       <label class="pref-advanced"><input id="splitLong" type="checkbox" checked /> Split Chatterbox multi-sentence text into chunks and concatenate</label>
       <label>Text to synthesize</label>
       <textarea id="text" placeholder="Your line here."></textarea>
-      <div class="sticky-actions"><button onclick="generateSingle()">Generate</button></div>
+      <div class="sticky-actions"><button id="generateSingleButton" onclick="generateSingle()">Generate</button><div id="synthActionStatus" class="small inline-status"></div></div>
     </div>
 
     <div id="pane-batch" class="hidden">
@@ -4870,6 +5435,7 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 TUCKER: The logs say three engines work and one is pretending to be a software landmine.
 ANALYST: I can provide fourteen implementation paths.
 EXEC: Pick one.</textarea>
+      <div id="batchPreflightStatus" class="small inline-status"></div>
       <label>Default engine</label>
       <select id="defaultEngine"></select>
       <div class="role-builder">
@@ -4887,7 +5453,16 @@ EXEC: Pick one.</textarea>
       <label>Advanced role map JSON</label>
       <textarea id="roleMap" style="min-height:180px"></textarea>
       <div class="small">Advanced JSON is still the source used by generation. The builder writes JSON here and tries to preserve fields it does not expose yet.</div>
-      <div class="sticky-actions"><button onclick="generateBatch()">Generate tagged script</button></div>
+      <div class="role-builder">
+        <h3>Assembly / mixdown</h3>
+        <label><input id="batchAssembleMixdown" type="checkbox" checked onchange="scheduleFormStateSave()" /> Assemble full tagged script into one finished file after all lines render</label>
+        <div class="row3">
+          <div><label>Final format</label><select id="batchMixdownFormat" onchange="scheduleFormStateSave()"><option value="mp3" selected>MP3 - podcast draft/export</option><option value="wav">WAV - lossless/intermediate</option></select></div>
+          <div><label>Pause between lines, seconds</label><input id="batchLineGap" type="number" min="0" step="0.05" value="0.35" oninput="scheduleFormStateSave()" /></div>
+          <div><label>&nbsp;</label><div class="small">Individual line files are still preserved for repairs/re-renders.</div></div>
+        </div>
+      </div>
+      <div class="sticky-actions"><button id="batchGenerateButton" onclick="generateBatch()">Generate tagged script</button><div id="batchActionStatus" class="small inline-status"></div></div>
     </div>
 
     <div id="pane-profiles" class="hidden">
@@ -5462,6 +6037,8 @@ let stateSaveTimer = null;
 let currentSttJobId = null;
 let currentSpeechAnalysisResult = null;
 let currentMetadataJobId = null;
+let currentSingleJobId = null;
+let currentBatchJobId = null;
 let lastSttSelectedPath = null;
 const TAB_NAMES = ['single','batch','profiles','refs','options','stt','video','audio','metadata','resemble','maintenance','jobs'];
 let uiDiagEvents = [];
@@ -5560,16 +6137,175 @@ function renderProfileSelect(){
   for (const p of profiles) { const o=document.createElement('option'); o.value=p.slug; o.textContent=p.name + (p.style ? ' — '+p.style : ''); sel.appendChild(o); }
 }
 function applySelectedProfile(){ const slug=$('profileSelect').value; const p=profiles.find(x=>x.slug===slug); if(!p) { scheduleFormStateSave(); return; } $('ref').value=p.audio_path; $('refText').value=p.transcript || ''; $('role').value=p.name || ''; if($('synthRefUploadStatus')) $('synthRefUploadStatus').innerHTML=''; $('synthProfileStatus').innerHTML = '<span class="ok">Selected profile:</span> <b>'+esc(p.name || slug)+'</b><br><span class="small">Role/name was filled from the profile name. You can edit it before generating.</span>'; scheduleFormStateSave(); }
+const TAGGED_SCRIPT_INVISIBLE_RE = /[\uFEFF\u200B\u200C\u200D\u2060]/g;
+function cleanTaggedScriptText(value){
+  const text = String(value || '');
+  const matches = text.match(TAGGED_SCRIPT_INVISIBLE_RE) || [];
+  return {text:text.replace(TAGGED_SCRIPT_INVISIBLE_RE, ''), invisibleCount:matches.length};
+}
+function taggedScriptPreflightInfo(scriptOverride=null){
+  const raw = scriptOverride === null ? readFieldValue('script', '') : String(scriptOverride || '');
+  const cleaned = cleanTaggedScriptText(raw);
+  const roleRe = /^\s*([A-Za-z][A-Za-z0-9_ -]{0,31})\s*:\s*(.+?)\s*$/;
+  const roles = [];
+  const roleCounts = {};
+  const lines = [];
+  for(const rawLine of cleaned.text.split(/\r?\n/)){
+    const m = rawLine.match(roleRe);
+    if(!m) continue;
+    const role = m[1].trim();
+    const text = m[2].trim();
+    if(!text) continue;
+    if(!roleCounts[role]) roles.push(role);
+    roleCounts[role] = (roleCounts[role] || 0) + 1;
+    lines.push({role, text});
+  }
+  let roleMap = {}, roleMapError = '';
+  try{ roleMap = JSON.parse(readFieldValue('roleMap', '{}') || '{}') || {}; }
+  catch(e){ roleMapError = String(e); roleMap = {}; }
+  const hasRoleMap = role => !!(roleMap && typeof roleMap === 'object' && (roleMap[role] || roleMap[role.toUpperCase()] || roleMap[role.toLowerCase()]));
+  const unmapped = roles.filter(r => !hasRoleMap(r));
+  return {invisibleCount:cleaned.invisibleCount, cleanedText:cleaned.text, lineCount:lines.length, roles, roleCounts, unmapped, roleMapError, defaultEngine:readFieldValue('defaultEngine', 'chatterbox')};
+}
+function updateTaggedScriptPreflight(){
+  const el = $('batchPreflightStatus');
+  if(!el) return;
+  const info = taggedScriptPreflightInfo();
+  const parts = [];
+  if(info.invisibleCount) parts.push('<span class="warn">'+esc(info.invisibleCount)+' invisible Unicode marker(s) detected; they will be stripped before parsing.</span>');
+  if(info.roleMapError) parts.push('<span class="bad">Role map JSON is invalid: '+esc(info.roleMapError)+'</span>');
+  if(info.lineCount) parts.push('<span class="ok">Detected '+esc(info.lineCount)+' tagged line(s) across '+esc(info.roles.length)+' role(s): '+esc(info.roles.join(', '))+'</span>');
+  else parts.push('<span class="warn">No tagged lines detected yet. Use ROLE: dialogue.</span>');
+  if(info.unmapped.length){
+    parts.push('<span class="warn">Unmapped role(s) will use Default engine <b>'+esc(info.defaultEngine)+'</b>: '+esc(info.unmapped.join(', '))+'</span>');
+    if(info.defaultEngine === 'qwen3') parts.push('<span class="warn">Default engine is Qwen3. On 6GB GPUs, unmapped long lines may run out of VRAM; map roles deliberately or use Chatterbox.</span>');
+  }
+  el.innerHTML = parts.join('<br>');
+}
+function initTaggedScriptPreflightHooks(){
+  ['script','roleMap','defaultEngine'].forEach(id=>{
+    const el=$(id);
+    if(!el || el.dataset.preflightHooked === '1') return;
+    el.dataset.preflightHooked = '1';
+    el.addEventListener('input', updateTaggedScriptPreflight);
+    el.addEventListener('change', updateTaggedScriptPreflight);
+  });
+  updateTaggedScriptPreflight();
+}
+function queueCompletedBatchMixdown(jobId, manifest){
+  const statusId = 'batch-mixdown-status-' + jobId;
+  if(!manifest){ setInlineStatus(statusId, '<span class="bad">No manifest path is available for this batch.</span>'); return; }
+  const fmt = readFieldValue('batch-mixdown-format-' + jobId, 'mp3');
+  const gap = readFieldValue('batch-mixdown-gap-' + jobId, '0.35');
+  setInlineStatus(statusId, '<span class="warn">Queueing post-run mixdown...</span>');
+  api('/api/batch/mixdown', {method:'POST', body:JSON.stringify({manifest, mixdown_format:fmt, line_gap_seconds:gap, output_name:'tagged_script_mixdown_manual'})})
+    .then(r=>{ setInlineStatus(statusId, queuedJobStatus('post-run batch mixdown', r.job || r)); lastJobsSig=''; refreshJobs(); startPoll(); })
+    .catch(err=>{ setInlineStatus(statusId, '<span class="bad">Could not queue post-run mixdown: '+esc(err)+'</span>'); });
+}
+function batchMixdownControls(j){
+  const result = j && j.result ? j.result : {};
+  const children = (j && j.children && j.children.length) ? j.children : (Array.isArray(result.children) ? result.children : []);
+  const manifest = (j && j.manifest) || result.manifest || '';
+  if(!j || j.kind !== 'batch' || !manifest || !children.length) return '';
+  if(['queued','running','canceling'].includes(String(j.status || ''))) return '';
+  const okCount = children.filter(c => c && c.ok && c.output).length;
+  if(!okCount) return '';
+  const id = String(j.id || 'batch');
+  const currentMix = result.mixdown && result.mixdown.output_audio ? '<div class="small"><span class="ok">Existing launch-time mixdown:</span> <code>'+esc(result.mixdown.output_audio)+'</code></div>' : '';
+  return `<div class="meta-panel">
+    <b>Post-run Tagged Script mixdown</b>
+    <div class="small">Use the ${esc(okCount)} successful rendered line file(s) from this batch. This does not re-run TTS.</div>
+    ${currentMix}
+    <div class="inline-tools">
+      <select id="batch-mixdown-format-${esc(id)}" style="width:auto;min-width:120px"><option value="mp3" selected>MP3</option><option value="wav">WAV</option></select>
+      <label class="small" style="display:inline-block;margin:2px 6px 2px 0">gap seconds <input id="batch-mixdown-gap-${esc(id)}" type="number" min="0" step="0.05" value="0.35" style="width:90px;display:inline-block;margin-left:4px" /></label>
+      <button class="mini secondary" type="button" onclick="queueCompletedBatchMixdown(${jsStr(id)}, ${jsStr(manifest)})">Mix down this completed batch</button>
+    </div>
+    <div id="batch-mixdown-status-${esc(id)}" class="small inline-status"></div>
+  </div>`;
+}
+
+function setGenerateStatus(targetId, html, kind=''){
+  const el=$(targetId);
+  if(!el) return;
+  const cls = kind === 'ok' ? 'ok' : (kind === 'bad' ? 'bad' : (kind === 'warn' ? 'warn' : ''));
+  el.innerHTML = cls && html.indexOf('<span') < 0 ? '<span class="'+cls+'">'+esc(html)+'</span>' : html;
+}
+function setButtonBusy(buttonId, busy){ const btn=$(buttonId); if(btn) btn.disabled=!!busy; }
 function generateSingle(){
   const profileSlug = $('profileSelect').value;
   const body = {engine:$('engine').value, role:$('role').value, profile:profileSlug, ref:$('ref').value, ref_text:$('refText').value, x_vector_only:$('xVector').checked, split_on_sentences:$('splitLong').checked, text:$('text').value};
+  if(!String(body.text || '').trim()){ setGenerateStatus('synthActionStatus', 'Enter text to synthesize first.', 'bad'); return; }
+  setButtonBusy('generateSingleButton', true);
+  setGenerateStatus('synthActionStatus', '<span class="warn">Queueing synthesis job...</span>'+openJobsButtonHtml());
   saveFormStateNow();
-  api('/api/generate', {method:'POST', body:JSON.stringify(body)}).then(()=>{ lastJobsSig=''; refreshJobs(); startPoll(); }).catch(alert);
+  api('/api/generate', {method:'POST', body:JSON.stringify(body)})
+    .then(r=>{ currentSingleJobId = r.job && r.job.id; setGenerateStatus('synthActionStatus', queuedJobStatus('synthesis', r.job || r)); lastJobsSig=''; refreshJobs(); startPoll(); })
+    .catch(err=>{ currentSingleJobId=null; setButtonBusy('generateSingleButton', false); setGenerateStatus('synthActionStatus', 'Could not queue synthesis job: '+err, 'bad'); });
 }
 function generateBatch(){
-  let roleMap = {}; try { roleMap = JSON.parse($('roleMap').value || '{}'); } catch(e){ alert('Role map JSON is invalid: '+e); return; }
-  const body = {script:$('script').value, role_map:roleMap, default_engine:$('defaultEngine').value, default_ref:$('ref').value, default_ref_text:$('refText').value, default_x_vector_only:true};
-  api('/api/batch', {method:'POST', body:JSON.stringify(body)}).then(()=>{ lastJobsSig=''; refreshJobs(); startPoll(); }).catch(alert);
+  let roleMap = {}; try { roleMap = JSON.parse($('roleMap').value || '{}'); } catch(e){ setGenerateStatus('batchActionStatus', 'Role map JSON is invalid: '+e, 'bad'); return; }
+  let script = $('script').value || '';
+  const cleaned = cleanTaggedScriptText(script);
+  if(cleaned.invisibleCount){ script = cleaned.text; $('script').value = script; updateTaggedScriptPreflight(); }
+  if(!script.trim()){ setGenerateStatus('batchActionStatus', 'Paste or type a tagged script first.', 'bad'); return; }
+  const body = {
+    script,
+    role_map:roleMap,
+    default_engine:$('defaultEngine').value,
+    default_ref:$('ref').value,
+    default_ref_text:$('refText').value,
+    default_x_vector_only:true,
+    assemble_mixdown:readFieldChecked('batchAssembleMixdown', true),
+    mixdown_format:readFieldValue('batchMixdownFormat', 'mp3'),
+    line_gap_seconds:readFieldValue('batchLineGap', '0.35')
+  };
+  setButtonBusy('batchGenerateButton', true);
+  setGenerateStatus('batchActionStatus', '<span class="warn">Queueing tagged script job...</span>'+openJobsButtonHtml());
+  saveFormStateNow();
+  api('/api/batch', {method:'POST', body:JSON.stringify(body)})
+    .then(r=>{ currentBatchJobId = r.job && r.job.id; setGenerateStatus('batchActionStatus', queuedJobStatus('tagged script', r.job || r)); lastJobsSig=''; refreshJobs(); startPoll(); })
+    .catch(err=>{ currentBatchJobId=null; setButtonBusy('batchGenerateButton', false); setGenerateStatus('batchActionStatus', 'Could not queue tagged script job: '+err, 'bad'); });
+}
+function updateCurrentGenerationFromJobs(data){
+  if(currentSingleJobId){
+    const j=(data.jobs||[]).find(x=>x.id===currentSingleJobId);
+    if(j){
+      if(j.status === 'done'){
+        setGenerateStatus('synthActionStatus', '<span class="ok">Synthesis done.</span> '+(j.output_path||j.output?'<code>'+esc(j.output_path||j.output)+'</code> ':'')+openJobsButtonHtml(), 'ok');
+        setButtonBusy('generateSingleButton', false);
+        currentSingleJobId=null;
+      } else if(j.status === 'error' || j.status === 'canceled'){
+        setGenerateStatus('synthActionStatus', j.status === 'canceled' ? 'Synthesis canceled.' : 'Synthesis failed. Open Jobs for the log. '+(j.error||''), 'bad');
+        setButtonBusy('generateSingleButton', false);
+        currentSingleJobId=null;
+      } else {
+        setGenerateStatus('synthActionStatus', '<span class="warn">Synthesis '+esc(j.status)+'...</span>'+openJobsButtonHtml());
+      }
+    }
+  }
+  if(currentBatchJobId){
+    const j=(data.jobs||[]).find(x=>x.id===currentBatchJobId);
+    if(j){
+      if(j.status === 'done'){
+        const result = j.result || {};
+        const mix = result.mixdown || {};
+        const path = mix.output_audio || j.output_path || j.output || '';
+        const msg = path ? '<span class="ok">Tagged script done. Final mixdown:</span> <code>'+esc(path)+'</code> ' : '<span class="ok">Tagged script done.</span> ';
+        setGenerateStatus('batchActionStatus', msg+openJobsButtonHtml(), 'ok');
+        setButtonBusy('batchGenerateButton', false);
+        currentBatchJobId=null;
+      } else if(j.status === 'error' || j.status === 'canceled'){
+        setGenerateStatus('batchActionStatus', j.status === 'canceled' ? 'Tagged script canceled.' : 'Tagged script failed. Open Jobs for the log. '+(j.error||''), 'bad');
+        setButtonBusy('batchGenerateButton', false);
+        currentBatchJobId=null;
+      } else {
+        const p = j.result && j.result.progress ? j.result.progress : null;
+        const detail = p ? ' · '+esc(p.completed_lines||0)+'/'+esc(p.total_lines||'?')+' lines · ETA '+esc(etaText(p.estimated_remaining_seconds)) : '';
+        setGenerateStatus('batchActionStatus', '<span class="warn">Tagged script '+esc(j.status)+detail+'...</span>'+openJobsButtonHtml());
+      }
+    }
+  }
 }
 function statusClass(s){ return s==='done'?'ok':(s==='error'?'bad':((s==='running'||s==='queued'||s==='canceling')?'warn':(s==='canceled'?'bad':''))); }
 function jsStr(s){ return JSON.stringify(String(s ?? '')); }
@@ -6353,7 +7089,10 @@ function collectFormState(){
     audio_lab_channels:readFieldValue('audioLabChannels', 'unchanged'),
     audio_lab_normalize:readFieldChecked('audioLabNormalize', true),
     metadata_download_when_done:readFieldChecked('metadataDownloadWhenDone', false),
-    role_map:readFieldValue('roleMap', '')
+    role_map:readFieldValue('roleMap', ''),
+    batch_assemble_mixdown:readFieldChecked('batchAssembleMixdown', true),
+    batch_mixdown_format:readFieldValue('batchMixdownFormat', 'mp3'),
+    batch_line_gap:readFieldValue('batchLineGap', '0.35')
   };
 }
 function saveFormStateNow(){ if(!formStateLoaded) return Promise.resolve(); return api('/api/state', {method:'POST', body:JSON.stringify(collectFormState())}).catch(err=>console.warn('state save failed', err)); }
@@ -6498,6 +7237,7 @@ function renderJobs(data){
     const title = `${j.kind}${j.engine?' / '+j.engine:''}${j.role?' / '+j.role:''}`;
     const isStt = j.kind === 'stt';
     return `<div class="job"><b>${esc(j.kind)} ${j.engine?'/ '+esc(j.engine):''}</b> <span class="${statusClass(j.status)}">${esc(j.status)}</span> ${j.kind==='historical-output'?'<span class="pill">recovered from output</span>':''}<br>
+    ${jobTimingBlock(j)}${jobProgressBlock(j)}
     <span class="small">${j.role?esc(j.role)+' — ':''}${esc((j.text||'').slice(0,150))}</span><br>
     ${isStt ? sttJobBlock(j) : ''}
     ${j.kind==='audio' ? audioLabJobBlock(j) : ''}
@@ -6526,6 +7266,7 @@ function detectHfAuthNoticeFromJobs(data){
 function refreshJobs(){
   return api('/api/jobs').then(data=>{
     detectHfAuthNoticeFromJobs(data);
+    updateCurrentGenerationFromJobs(data);
     updateCurrentSttFromJobs(data);
     updateCurrentSpeechAnalysisFromJobs(data);
     updateCurrentMetadataFromJobs(data);
@@ -7482,6 +8223,50 @@ function loadResembleStatus(){
 function openJobsButtonHtml(){
   return ' <button class="mini secondary" type="button" onclick="showTab(\'jobs\')">Open Jobs</button>';
 }
+function jobTimeLabel(j){
+  const status = String(j && j.status || '');
+  const created = Number(j && j.created_at || 0);
+  const started = Number(j && j.started_at || 0);
+  const finished = Number(j && j.finished_at || 0);
+  if(started && finished) return 'runtime: ' + fmtDuration(Math.max(0, finished-started));
+  if(started && ['running','canceling'].includes(status)) return 'elapsed: ' + fmtDuration(Math.max(0, Date.now()/1000-started));
+  if(created && status === 'queued') return 'waiting: ' + fmtDuration(Math.max(0, Date.now()/1000-created));
+  if(created && !finished && !started) return 'created: ' + fmtDuration(Math.max(0, Date.now()/1000-created)) + ' ago';
+  return '';
+}
+function refreshJobTimers(){
+  document.querySelectorAll('.job-timer').forEach(el=>{
+    const status = el.dataset.status || '';
+    const created = Number(el.dataset.created || 0);
+    const started = Number(el.dataset.started || 0);
+    const finished = Number(el.dataset.finished || 0);
+    let txt = '';
+    if(started && finished) txt = 'runtime: ' + fmtDuration(Math.max(0, finished-started));
+    else if(started && ['running','canceling'].includes(status)) txt = 'elapsed: ' + fmtDuration(Math.max(0, Date.now()/1000-started));
+    else if(created && status === 'queued') txt = 'waiting: ' + fmtDuration(Math.max(0, Date.now()/1000-created));
+    else if(created && !finished && !started) txt = 'created: ' + fmtDuration(Math.max(0, Date.now()/1000-created)) + ' ago';
+    el.textContent = txt;
+  });
+}
+function jobTimingBlock(j){
+  const label = jobTimeLabel(j);
+  if(!label) return '';
+  return `<div class="small">Time: <span class="job-timer" data-status="${esc(j.status||'')}" data-created="${esc(j.created_at||0)}" data-started="${esc(j.started_at||0)}" data-finished="${esc(j.finished_at||0)}">${esc(label)}</span></div>`;
+}
+function pct(n,d){ return d ? Math.max(0, Math.min(100, (Number(n||0)/Number(d||1))*100)).toFixed(1)+'%' : '0%'; }
+function etaText(sec){ return (sec === null || sec === undefined || !isFinite(Number(sec))) ? 'warming up...' : 'about ' + fmtDuration(sec) + ' remaining'; }
+function jobProgressBlock(j){
+  const p = j && j.result && j.result.progress ? j.result.progress : null;
+  if(!p || p.kind !== 'tagged-script') return '';
+  const line = `${esc(p.completed_lines||0)} / ${esc(p.total_lines||0)} lines`;
+  const words = `${esc(p.completed_words||0)} / ${esc(p.total_words||0)} words`;
+  const units = `${esc(p.completed_units||0)} / ${esc(p.total_units||0)} weighted units (${esc(pct(p.completed_units, p.total_units))})`;
+  const eta = (j.status === 'running' || j.status === 'queued') ? ` · ETA: ${esc(etaText(p.estimated_remaining_seconds))}` : '';
+  const cur = p.current_role ? `<div class="small">Current: line <code>${esc(p.current_line||'')}</code>, <code>${esc(p.current_role)}</code>${p.current_engine?' via <code>'+esc(p.current_engine)+'</code>':''}${p.current_text_preview?' — '+esc(p.current_text_preview):''}</div>` : '';
+  const note = p.status_note ? ` · ${esc(p.status_note)}` : '';
+  return `<div class="small"><b>Tagged Script progress:</b> ${line} · ${words} · ${units}${eta}${note}</div>${cur}`;
+}
+
 function queuedJobStatus(label, job){
   const jobId = job && job.id ? ' Job ID: <code>'+esc(job.id)+'</code>.' : '';
   return '<span class="warn">Queued '+esc(label)+' job.'+jobId+' Status and full logs are in Jobs.</span>'+openJobsButtonHtml();
@@ -7724,7 +8509,77 @@ function startPoll(){
     }
   }, 2500);
 }
-api('/api/meta').then(setupEngines).then(loadAll).then(restoreFormState).then(restoreTabFromHash).catch(alert);
+setInterval(refreshJobTimers, 1000);
+
+function v0932MixdownCandidate(j){
+  if(!j || j.kind !== 'batch') return false;
+  if(['queued','running','canceling'].includes(String(j.status || ''))) return false;
+  const children = Array.isArray(j.children) ? j.children : [];
+  return children.some(c => c && c.output && c.ok !== false);
+}
+function v0932LegacyBatchMixdownPanel(j){
+  const id = String(j && j.id || '');
+  if(!id) return '';
+  const children = Array.isArray(j.children) ? j.children : [];
+  const usable = children.filter(c => c && c.output && c.ok !== false).length;
+  if(!usable) return '';
+  const fmtId = 'legacyBatchMixdownFormat-' + id;
+  const gapId = 'legacyBatchMixdownGap-' + id;
+  const statusId = 'legacyBatchMixdownStatus-' + id;
+  return `<div class="meta-panel" data-legacy-batch-mixdown="${esc(id)}">
+    <b>Post-run Tagged Script mixdown</b>
+    <div class="small">Assemble ${usable} already-rendered line files without re-running TTS. This works for older completed batches that have no top-level Actions menu.</div>
+    <div class="row3">
+      <div><label>Final format</label><select id="${esc(fmtId)}"><option value="mp3" selected>MP3 - podcast draft/export</option><option value="wav">WAV - editor-safe</option></select></div>
+      <div><label>Pause between lines, seconds</label><input id="${esc(gapId)}" type="number" min="0" max="10" step="0.05" value="0.35" /></div>
+      <div><label>&nbsp;</label><button class="mini secondary" type="button" onclick="v0932QueueLegacyBatchMixdown('${esc(id)}')">Mix down this completed batch</button></div>
+    </div>
+    <div id="${esc(statusId)}" class="small inline-status"></div>
+  </div>`;
+}
+function v0932FindJobCard(j, index){
+  const cards = Array.from(document.querySelectorAll('#jobs .job'));
+  const id = String(j && j.id || '');
+  if(id){
+    const found = cards.find(card => card.innerHTML.includes(id));
+    if(found) return found;
+  }
+  return cards[index] || null;
+}
+function v0932InjectLegacyBatchMixdownPanels(){
+  return api('/api/jobs').then(data=>{
+    const jobs = data.jobs || [];
+    jobs.forEach((j, index)=>{
+      if(!v0932MixdownCandidate(j)) return;
+      const card = v0932FindJobCard(j, index);
+      if(!card) return;
+      const id = String(j.id || '');
+      if(card.querySelector('[data-legacy-batch-mixdown="'+CSS.escape(id)+'"]')) return;
+      card.insertAdjacentHTML('beforeend', v0932LegacyBatchMixdownPanel(j));
+    });
+  }).catch(err=>logUiEvent('legacy batch mixdown panel injection failed', {error:String(err)}, 'warn'));
+}
+function v0932QueueLegacyBatchMixdown(jobId){
+  const fmt = readFieldValue('legacyBatchMixdownFormat-' + jobId, 'mp3');
+  const gap = readFieldValue('legacyBatchMixdownGap-' + jobId, '0.35');
+  const statusId = 'legacyBatchMixdownStatus-' + jobId;
+  setInlineStatus(statusId, '<span class="warn">Queueing post-run mixdown...</span>');
+  const body = {job_id:jobId, source_job_id:jobId, output_format:fmt, format:fmt, mixdown_format:fmt, line_gap_seconds:gap, gap_seconds:gap, pause_seconds:gap};
+  api('/api/batch/mixdown', {method:'POST', body:JSON.stringify(body)})
+    .then(r=>{ setInlineStatus(statusId, queuedJobStatus('post-run Tagged Script mixdown', r.job || r)); lastJobsSig=''; refreshJobs(); startPoll(); })
+    .catch(err=>{ setInlineStatus(statusId, '<span class="bad">Could not queue post-run mixdown: '+esc(err)+'</span>'); logUiEvent('post-run batch mixdown queue failed', {job_id:jobId, error:String(err)}, 'error'); });
+}
+if(typeof refreshJobs === 'function' && !window.__v0932LegacyBatchMixdownWrapped){
+  window.__v0932LegacyBatchMixdownWrapped = true;
+  const __v0932OriginalRefreshJobs = refreshJobs;
+  refreshJobs = async function(...args){
+    const active = await __v0932OriginalRefreshJobs.apply(this, args);
+    setTimeout(v0932InjectLegacyBatchMixdownPanels, 50);
+    return active;
+  };
+}
+
+api('/api/meta').then(setupEngines).then(loadAll).then(restoreFormState).then(restoreTabFromHash).then(()=>{ initTaggedScriptPreflightHooks(); updateTaggedScriptPreflight(); }).catch(alert);
 </script>
 </body>
 </html>
@@ -7954,6 +8809,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/batch":
                 job = Job(id=uuid.uuid4().hex, kind="batch")
                 JOBS.add(job, body)
+                self.send_json({"job": job.public()})
+            elif path == "/api/batch/mixdown":
+                job = Job(id=uuid.uuid4().hex, kind="batch-mixdown")
+                JOBS.add(job, dict(body))
                 self.send_json({"job": job.public()})
             elif path == "/api/hf-token/save":
                 self.send_json(save_hf_token(str(body.get("token", ""))))

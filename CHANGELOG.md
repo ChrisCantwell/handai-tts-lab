@@ -1,3 +1,35 @@
+## v0.93.3 - Post-run Mixdown Backend Fix
+
+- Fixes post-run Tagged Script mixdown jobs that were queued from legacy completed batch cards without a manifest filesystem path.
+- Adds a backend override that accepts source job IDs and recovers rendered line files from job children, manifest URLs/paths, or batch output directory scanning.
+- Keeps the operation non-destructive: existing TTS line files are reused and not re-rendered.
+
+## v0.93.2 - Legacy Batch Mixdown Visibility
+
+- Fixes post-run Tagged Script mixdown controls not appearing on older completed batch jobs with manifest/child line outputs but no top-level assembled audio.
+- Adds a defensive `/api/batch/mixdown` backend path and `batch-mixdown` job type when missing.
+- Provides a direct `Mix down this completed batch` panel on eligible batch job cards.
+
+## v0.93.1 - Tagged Script Hotfix
+
+- Strip BOM and zero-width Unicode marker characters before Tagged Script backend parsing.
+- Add browser-side Tagged Script preflight warnings for invisible characters, detected roles, unmapped roles, and Qwen3 fallback risk.
+- Add post-run mixdown support for completed or partial Tagged Script batch jobs without re-rendering TTS lines.
+- Add `/api/batch/mixdown` and a `batch-mixdown` job kind for assembling existing batch line outputs.
+- Update Jobs cards with a **Mix down this completed batch** control when a batch manifest and successful line outputs are available.
+
+## v0.93 - Tagged Script Production Feedback / ETA / Mixdown
+
+- Added inline queue/running/done/error feedback for Synthesize → Generate.
+- Added inline queue/running/done/error feedback for Tagged Script → Generate tagged script.
+- Added live elapsed/waiting/runtime timers to Jobs cards.
+- Added Tagged Script progress by lines, words, and weighted units.
+- Added rough ETA for Tagged Script batches after enough line work has completed.
+- Added Tagged Script Assembly / mixdown controls.
+- Preserved per-line outputs while optionally producing one final full-script WAV or MP3.
+- Added configurable pause between generated tagged-script lines.
+- Added batch job result metadata for progress and final assembled files.
+
 ## v0.92 - Tagged Script Role Map Builder
 
 - Added a visual role-map builder above the Tagged Script JSON field.
