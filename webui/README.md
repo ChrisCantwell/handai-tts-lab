@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.92
+# TTS Lab Unified Web UI v0.93.3.3
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.92 adds a visual Tagged Script role-map builder for assigning script roles to saved voice profiles, while preserving the local speech API, WhisperX Maintenance, Metadata, Speech Repair Analysis, AI Studio Bridge, stack diagnostics, and Actions dropdown/external launch work.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.93.2 adds a visual Tagged Script role-map builder for assigning script roles to saved voice profiles, while preserving the local speech API, WhisperX Maintenance, Metadata, Speech Repair Analysis, AI Studio Bridge, stack diagnostics, and Actions dropdown/external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.92.zip
+unzip -o tts_unified_webui_v0.93.3.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -55,6 +55,31 @@ The changelog below is ordered newest-to-oldest. Early project versions used lab
 
 
 
+
+## New in v0.93.3
+
+- Fixes post-run Tagged Script mixdown for legacy completed batches where the UI can queue by source job ID but no manifest filesystem path is present in the public job card.
+- Adds a backend override that can recover rendered line files from source job children, manifest URLs, manifest paths, or the batch output directory.
+- Does not re-render TTS lines; it assembles already-rendered line audio.
+
+## New in v0.93.2
+
+- Strips UTF-8 BOM and zero-width marker characters from pasted Tagged Script text before parsing.
+- Adds Tagged Script preflight status for detected line count, roles, invisible characters, unmapped roles, and risky Qwen3 fallback.
+- Adds a post-run **Mix down this completed batch** control on completed or partial Tagged Script batch job cards.
+- Adds `/api/batch/mixdown` so already-rendered batch line files can be assembled without re-running TTS.
+- Keeps the v0.93.2 launch-time mixdown behavior and per-line file preservation.
+
+## New in v0.93
+
+- Adds immediate inline feedback when clicking **Generate** on the Synthesize tab.
+- Adds immediate inline feedback when clicking **Generate tagged script** on the Tagged Script tab.
+- Adds live elapsed/waiting/runtime timers to Jobs cards.
+- Adds Tagged Script weighted progress and rough ETA based on completed words plus per-line overhead.
+- Adds optional **Assembly / mixdown** controls for Tagged Script batches.
+- Preserves individual line files while creating one final full-script WAV or MP3 when all lines render successfully.
+- Adds configurable pause between rendered tagged-script lines.
+- Completed batch jobs expose final mixdown metadata and the final assembled file in Jobs.
 
 ## New in v0.92
 
