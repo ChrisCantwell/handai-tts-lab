@@ -1,3 +1,16 @@
+## v0.94.2 - Tagged Script Workspace refresh polish
+
+- Changed the Tagged Script Workspace refresh button so it reports `Refreshed projects, scripts, casts.` after a successful manual refresh.
+- Prevented the stale previous workspace status message, such as `Saved project`, from remaining visible after refresh.
+
+## v0.94.1 - Tagged Script Workspace polish
+
+- Added independent names for saved scripts, casts, and projects in the Tagged Script Workspace panel.
+- Changed script and cast saving so they do not inherit the project name by default.
+- Preserved optional script/cast display names inside saved project JSON.
+- Improved historical-output recovery by skipping internal Tagged Script silence/intermediate mixdown WAV helpers.
+- Added clearer recovered-job labels for Tagged Script mixdowns and generic recovered outputs.
+
 ## v0.94 - Tagged Script Workspace
 
 - Adds Tagged Script Workspace save/load controls.
