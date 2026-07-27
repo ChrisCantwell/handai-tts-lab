@@ -1,3 +1,11 @@
+## v0.94 - Tagged Script Workspace
+
+- Adds Tagged Script Workspace save/load controls.
+- Saves scripts, casts, and full projects separately so unfinished scripts and reusable casts can be preserved.
+- Adds browser upload for `.txt` / `.md` scripts and cast/project JSON.
+- Stores workspace files under `/home/user/tts-lab/projects/tagged-script/`.
+- Preserves project script text, role map, default engine, and mixdown settings.
+
 ## v0.93.3 - Post-run Mixdown Backend Fix
 
 - Fixes post-run Tagged Script mixdown jobs that were queued from legacy completed batch cards without a manifest filesystem path.
