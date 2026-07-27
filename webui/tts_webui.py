@@ -43,6 +43,10 @@ PROFILE_DIR = Path(os.environ.get("TTS_PROFILE_DIR", str(REF_DIR / "profiles")))
 JOB_DIR = Path(os.environ.get("TTS_JOB_DIR", str(OUT_DIR / "job_history")))
 CONFIG_DIR = Path(os.environ.get("TTS_CONFIG_DIR", str(LAB / "config")))
 WEBUI_STATE = CONFIG_DIR / "webui_state.json"
+TAGGED_WORKSPACE_DIR = Path(os.environ.get("TTS_TAGGED_WORKSPACE_DIR", str(LAB / "projects" / "tagged-script")))
+TAGGED_SCRIPT_LIBRARY_DIR = TAGGED_WORKSPACE_DIR / "scripts"
+TAGGED_CAST_LIBRARY_DIR = TAGGED_WORKSPACE_DIR / "casts"
+TAGGED_PROJECT_LIBRARY_DIR = TAGGED_WORKSPACE_DIR / "projects"
 UI_DIAGNOSTICS_DIR = Path(os.environ.get("TTS_UI_DIAGNOSTICS_DIR", str(LAB / "logs" / "ui-diagnostics")))
 EXTERNAL_ACTION_LOG = UI_DIAGNOSTICS_DIR / "external-actions.log"
 HF_TOKEN_FILE = CONFIG_DIR / "huggingface_token"
@@ -83,7 +87,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.93.3"
+VERSION = "0.94"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -2992,6 +2996,203 @@ def import_profile_zip(zip_bytes: bytes, overwrite: bool = False) -> dict[str, A
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def tagged_workspace_dirs() -> dict[str, Path]:
+    return {
+        "script": TAGGED_SCRIPT_LIBRARY_DIR,
+        "cast": TAGGED_CAST_LIBRARY_DIR,
+        "project": TAGGED_PROJECT_LIBRARY_DIR,
+    }
+
+
+def ensure_tagged_workspace_dirs() -> None:
+    for p in tagged_workspace_dirs().values():
+        p.mkdir(parents=True, exist_ok=True)
+
+
+def tagged_workspace_ext(kind: str) -> str:
+    k = str(kind or "").strip().lower()
+    if k == "script":
+        return ".txt"
+    if k == "cast":
+        return ".cast.json"
+    if k == "project":
+        return ".project.json"
+    raise ValueError("Workspace kind must be script, cast, or project.")
+
+
+def tagged_workspace_dir(kind: str) -> Path:
+    k = str(kind or "").strip().lower()
+    dirs = tagged_workspace_dirs()
+    if k not in dirs:
+        raise ValueError("Workspace kind must be script, cast, or project.")
+    ensure_tagged_workspace_dirs()
+    return dirs[k]
+
+
+def tagged_workspace_slug_from_file(path: Path, kind: str) -> str:
+    suffix = tagged_workspace_ext(kind)
+    name = path.name
+    if name.endswith(suffix):
+        return name[: -len(suffix)]
+    return path.stem
+
+
+def tagged_workspace_path(kind: str, name_or_slug: str, existing: bool = False) -> Path:
+    k = str(kind or "").strip().lower()
+    ext = tagged_workspace_ext(k)
+    raw = str(name_or_slug or "").strip()
+    if not raw:
+        raise ValueError("A workspace name is required.")
+    slug = safe_slug(raw, f"tagged-{k}")
+    base = tagged_workspace_dir(k)
+    candidate = (base / f"{slug}{ext}").resolve()
+    if not inside(candidate, base.resolve()):
+        raise ValueError("Unsafe workspace path.")
+    if existing and not candidate.exists():
+        # tolerate exact filenames returned by the picker
+        raw_file = safe_filename(raw, f"{slug}{ext}")
+        candidate2 = (base / raw_file).resolve()
+        if inside(candidate2, base.resolve()) and candidate2.exists():
+            candidate = candidate2
+        else:
+            raise FileNotFoundError(f"Saved tagged-script {k} not found: {raw}")
+    return candidate
+
+
+def tagged_workspace_display_name(path: Path, kind: str, data: Any | None = None) -> str:
+    if isinstance(data, dict):
+        name = str(data.get("name") or "").strip()
+        if name:
+            return name
+    slug = tagged_workspace_slug_from_file(path, kind)
+    return slug.replace("-", " ").strip().title() or path.stem
+
+
+def tagged_workspace_read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def tagged_workspace_list_one(kind: str) -> list[dict[str, Any]]:
+    base = tagged_workspace_dir(kind)
+    ext = tagged_workspace_ext(kind)
+    if kind == "script":
+        paths = [p for p in base.iterdir() if p.is_file() and p.suffix.lower() in {".txt", ".md", ".markdown"}]
+    else:
+        paths = [p for p in base.iterdir() if p.is_file() and p.name.endswith(ext)]
+    out: list[dict[str, Any]] = []
+    for p in sorted(paths, key=lambda x: x.stat().st_mtime, reverse=True):
+        data = tagged_workspace_read_json(p) if kind != "script" else {}
+        out.append({
+            "kind": kind,
+            "name": tagged_workspace_display_name(p, kind, data),
+            "slug": tagged_workspace_slug_from_file(p, kind),
+            "filename": p.name,
+            "path": str(p),
+            "size": p.stat().st_size,
+            "updated_at": iso_time(p.stat().st_mtime),
+        })
+    return out
+
+
+def tagged_workspace_list_payload() -> dict[str, Any]:
+    ensure_tagged_workspace_dirs()
+    return {
+        "base_dir": str(TAGGED_WORKSPACE_DIR),
+        "scripts": tagged_workspace_list_one("script"),
+        "casts": tagged_workspace_list_one("cast"),
+        "projects": tagged_workspace_list_one("project"),
+    }
+
+
+def parse_workspace_role_map(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        data = json.loads(value)
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def tagged_workspace_save_payload(body: dict[str, Any]) -> dict[str, Any]:
+    kind = str(body.get("kind") or "").strip().lower()
+    name = str(body.get("name") or body.get("title") or body.get("slug") or "").strip()
+    if not name:
+        name = {
+            "script": "Tagged Script",
+            "cast": "Tagged Cast",
+            "project": "Tagged Script Project",
+        }.get(kind, "Tagged Workspace Item")
+    path = tagged_workspace_path(kind, name)
+    created_at = iso_time()
+    if path.exists() and kind != "script":
+        old = tagged_workspace_read_json(path)
+        created_at = str(old.get("created_at") or old.get("created") or created_at)
+
+    if kind == "script":
+        script = str(body.get("script") if body.get("script") is not None else body.get("content") or "")
+        path.write_text(script.rstrip() + "\n", encoding="utf-8")
+    elif kind == "cast":
+        role_map = parse_workspace_role_map(body.get("role_map") if "role_map" in body else body.get("content"))
+        data = {
+            "kind": "tagged-script-cast",
+            "version": VERSION,
+            "name": name,
+            "slug": tagged_workspace_slug_from_file(path, kind),
+            "created_at": created_at,
+            "updated_at": iso_time(),
+            "role_map": role_map,
+        }
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    elif kind == "project":
+        role_map = parse_workspace_role_map(body.get("role_map"))
+        try:
+            line_gap = float(body.get("line_gap_seconds") or body.get("batch_line_gap") or 0.35)
+        except Exception:
+            line_gap = 0.35
+        data = {
+            "kind": "tagged-script-project",
+            "version": VERSION,
+            "name": name,
+            "slug": tagged_workspace_slug_from_file(path, kind),
+            "created_at": created_at,
+            "updated_at": iso_time(),
+            "script": str(body.get("script") or ""),
+            "role_map": role_map,
+            "default_engine": str(body.get("default_engine") or "chatterbox"),
+            "assembly": {
+                "assemble_mixdown": bool(body.get("assemble_mixdown", True)),
+                "mixdown_format": str(body.get("mixdown_format") or "mp3"),
+                "line_gap_seconds": max(0.0, min(line_gap, 10.0)),
+            },
+        }
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    else:
+        raise ValueError("Workspace kind must be script, cast, or project.")
+
+    return {"ok": True, "kind": kind, "name": name, "slug": tagged_workspace_slug_from_file(path, kind), "path": str(path), "library": tagged_workspace_list_payload()}
+
+
+def tagged_workspace_load_payload(body: dict[str, Any]) -> dict[str, Any]:
+    kind = str(body.get("kind") or "").strip().lower()
+    slug = str(body.get("slug") or body.get("name") or body.get("filename") or "").strip()
+    path = tagged_workspace_path(kind, slug, existing=True)
+    if kind == "script":
+        text = path.read_text(encoding="utf-8-sig")
+        return {"ok": True, "kind": kind, "name": tagged_workspace_display_name(path, kind), "slug": tagged_workspace_slug_from_file(path, kind), "path": str(path), "script": text}
+    data = tagged_workspace_read_json(path)
+    if not data:
+        raise ValueError(f"Could not read saved tagged-script {kind} JSON: {path}")
+    if kind == "cast":
+        return {"ok": True, "kind": kind, "name": tagged_workspace_display_name(path, kind, data), "slug": tagged_workspace_slug_from_file(path, kind), "path": str(path), "role_map": data.get("role_map") or {}}
+    if kind == "project":
+        return {"ok": True, "kind": kind, "name": tagged_workspace_display_name(path, kind, data), "slug": tagged_workspace_slug_from_file(path, kind), "path": str(path), "project": data}
+    raise ValueError("Workspace kind must be script, cast, or project.")
+
 @dataclass
 class Job:
     id: str
@@ -5371,7 +5572,7 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 </head>
 <body>
 <header>
-  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.93.3</span></h1>
+  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.94</span></h1>
   <div class="small">Voice profiles, Tagged Script role-map builder, mixdown, ETA, preflight checks, post-run mixdown fixes, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Metadata cover-art tagging, WhisperX setup/testing, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
 </header>
 <main>
@@ -5430,6 +5631,29 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 
     <div id="pane-batch" class="hidden">
       <p class="small">Paste dialogue as <code>ROLE: line</code>. Role-map entries can use saved voice-profile slugs so you do not hardcode audio paths.</p>
+      <div class="role-builder tagged-workspace">
+        <h3>Tagged Script Workspace</h3>
+        <p class="small">Save and reload unfinished work. Scripts store only the tagged dialogue, casts store only the role map, and projects store both plus default engine and mixdown settings.</p>
+        <div class="row3">
+          <div><label>Workspace / project name</label><input id="taggedWorkspaceName" placeholder="Go Fax Somebody Pops" oninput="scheduleFormStateSave && scheduleFormStateSave()" /></div>
+          <div><label>Saved project</label><select id="taggedProjectSelect"></select></div>
+          <div><label>&nbsp;</label><button class="mini secondary" type="button" onclick="loadTaggedWorkspaceItem('project')">Load project</button> <button class="mini secondary" type="button" onclick="saveTaggedWorkspaceItem('project')">Save project</button></div>
+        </div>
+        <div class="row3">
+          <div><label>Saved script</label><select id="taggedScriptSelect"></select></div>
+          <div><label>Upload script file</label><input id="taggedScriptUpload" type="file" accept=".txt,.md,.markdown,text/plain,text/markdown" onchange="uploadTaggedWorkspaceFile('script')" /></div>
+          <div><label>&nbsp;</label><button class="mini secondary" type="button" onclick="loadTaggedWorkspaceItem('script')">Load script</button> <button class="mini secondary" type="button" onclick="saveTaggedWorkspaceItem('script')">Save script</button></div>
+        </div>
+        <div class="row3">
+          <div><label>Saved cast</label><select id="taggedCastSelect"></select></div>
+          <div><label>Upload cast/project JSON</label><input id="taggedCastUpload" type="file" accept=".json,.cast.json,.project.json,application/json" onchange="uploadTaggedWorkspaceFile('cast')" /></div>
+          <div><label>&nbsp;</label><button class="mini secondary" type="button" onclick="loadTaggedWorkspaceItem('cast')">Load cast</button> <button class="mini secondary" type="button" onclick="saveTaggedWorkspaceItem('cast')">Save cast</button></div>
+        </div>
+        <div class="inline-tools">
+          <button class="mini secondary" type="button" onclick="loadTaggedWorkspaceLibrary()">Refresh saved scripts/casts/projects</button>
+          <span id="taggedWorkspaceStatus" class="small inline-status"></span>
+        </div>
+      </div>
       <label>Tagged script</label>
       <textarea id="script" style="min-height:220px">EXEC: Tucker, status.
 TUCKER: The logs say three engines work and one is pretending to be a software landmine.
@@ -6243,6 +6467,168 @@ function generateSingle(){
     .then(r=>{ currentSingleJobId = r.job && r.job.id; setGenerateStatus('synthActionStatus', queuedJobStatus('synthesis', r.job || r)); lastJobsSig=''; refreshJobs(); startPoll(); })
     .catch(err=>{ currentSingleJobId=null; setButtonBusy('generateSingleButton', false); setGenerateStatus('synthActionStatus', 'Could not queue synthesis job: '+err, 'bad'); });
 }
+let taggedWorkspaceLibrary = {scripts:[], casts:[], projects:[]};
+function taggedWorkspaceStatus(message, kind=''){
+  const el = $('taggedWorkspaceStatus');
+  if(!el) return;
+  const cls = kind === 'ok' ? 'ok' : (kind === 'bad' ? 'bad' : (kind === 'warn' ? 'warn' : ''));
+  el.innerHTML = cls ? `<span class="${cls}">${esc(message || '')}</span>` : esc(message || '');
+}
+function optionForWorkspaceItem(item){
+  return `<option value="${esc(item.slug || item.filename || '')}">${esc(item.name || item.slug || item.filename || 'untitled')}</option>`;
+}
+function renderTaggedWorkspaceLibrary(data){
+  taggedWorkspaceLibrary = data || {scripts:[], casts:[], projects:[]};
+  const configs = [
+    ['taggedScriptSelect', taggedWorkspaceLibrary.scripts || [], 'No saved scripts yet'],
+    ['taggedCastSelect', taggedWorkspaceLibrary.casts || [], 'No saved casts yet'],
+    ['taggedProjectSelect', taggedWorkspaceLibrary.projects || [], 'No saved projects yet'],
+  ];
+  for(const [id, items, emptyLabel] of configs){
+    const sel=$(id); if(!sel) continue;
+    const previous = sel.value;
+    sel.innerHTML = items.length ? items.map(optionForWorkspaceItem).join('') : `<option value="">${esc(emptyLabel)}</option>`;
+    if(previous && Array.from(sel.options).some(o=>o.value===previous)) sel.value = previous;
+  }
+  return taggedWorkspaceLibrary;
+}
+function loadTaggedWorkspaceLibrary(){
+  return api('/api/tagged-workspace').then(data=>{
+    renderTaggedWorkspaceLibrary(data);
+    return data;
+  }).catch(err=>{ taggedWorkspaceStatus('Could not load saved workspace library: '+err, 'bad'); });
+}
+function workspaceNameFallback(){
+  const name = readFieldValue('taggedWorkspaceName', '').trim();
+  if(name) return name;
+  const firstLine = (readFieldValue('script', '').split(/\r?\n/).find(x=>x.trim()) || '').replace(/^\s*[A-Za-z][A-Za-z0-9_ -]{0,31}\s*:\s*/, '').trim();
+  return firstLine ? firstLine.slice(0, 60) : 'Tagged Script Project';
+}
+function workspaceRoleMapObject(){
+  try{
+    if(typeof applyRoleBuilderToJson === 'function') applyRoleBuilderToJson(false);
+  }catch(e){}
+  const raw = readFieldValue('roleMap', '{}') || '{}';
+  const parsed = JSON.parse(raw);
+  return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+}
+function taggedWorkspacePayload(kind){
+  kind = String(kind || '').toLowerCase();
+  const name = workspaceNameFallback();
+  if(kind === 'script'){
+    return {kind, name, script:readFieldValue('script', '')};
+  }
+  if(kind === 'cast'){
+    return {kind, name, role_map:workspaceRoleMapObject()};
+  }
+  if(kind === 'project'){
+    return {
+      kind, name,
+      script:readFieldValue('script', ''),
+      role_map:workspaceRoleMapObject(),
+      default_engine:readFieldValue('defaultEngine', 'chatterbox'),
+      assemble_mixdown:readFieldChecked('batchAssembleMixdown', true),
+      mixdown_format:readFieldValue('batchMixdownFormat', 'mp3'),
+      line_gap_seconds:readFieldValue('batchLineGap', '0.35'),
+    };
+  }
+  throw new Error('Unknown workspace kind: ' + kind);
+}
+function saveTaggedWorkspaceItem(kind){
+  let body;
+  try{ body = taggedWorkspacePayload(kind); }
+  catch(err){ taggedWorkspaceStatus('Could not prepare '+kind+': '+err, 'bad'); return; }
+  taggedWorkspaceStatus('Saving '+kind+'...');
+  api('/api/tagged-workspace/save', {method:'POST', body:JSON.stringify(body)}).then(r=>{
+    if(r.library) renderTaggedWorkspaceLibrary(r.library);
+    if(r.slug){
+      const sel = kind === 'script' ? $('taggedScriptSelect') : (kind === 'cast' ? $('taggedCastSelect') : $('taggedProjectSelect'));
+      if(sel && Array.from(sel.options).some(o=>o.value===r.slug)) sel.value = r.slug;
+    }
+    taggedWorkspaceStatus('Saved '+kind+': '+(r.name || r.slug || ''), 'ok');
+  }).catch(err=>{ taggedWorkspaceStatus('Save failed: '+err, 'bad'); });
+}
+function selectedWorkspaceSlug(kind){
+  const sel = kind === 'script' ? $('taggedScriptSelect') : (kind === 'cast' ? $('taggedCastSelect') : $('taggedProjectSelect'));
+  return sel ? (sel.value || '') : '';
+}
+function applyLoadedRoleMap(roleMap){
+  setFieldValue('roleMap', JSON.stringify(roleMap || {}, null, 2));
+  try{ if(typeof syncRoleBuilderFromJson === 'function') syncRoleBuilderFromJson(false); }catch(e){}
+  try{ if(typeof updateTaggedScriptPreflight === 'function') updateTaggedScriptPreflight(); }catch(e){}
+}
+function applyLoadedProject(project){
+  project = project || {};
+  setFieldValue('script', project.script || '');
+  applyLoadedRoleMap(project.role_map || {});
+  setFieldValue('defaultEngine', project.default_engine || readFieldValue('defaultEngine', 'chatterbox'));
+  const assembly = project.assembly || {};
+  setFieldChecked('batchAssembleMixdown', assembly.assemble_mixdown !== false);
+  setFieldValue('batchMixdownFormat', assembly.mixdown_format || 'mp3');
+  setFieldValue('batchLineGap', assembly.line_gap_seconds !== undefined ? String(assembly.line_gap_seconds) : '0.35');
+  setFieldValue('taggedWorkspaceName', project.name || project.slug || '');
+  try{ if(typeof updateTaggedScriptPreflight === 'function') updateTaggedScriptPreflight(); }catch(e){}
+  scheduleFormStateSave && scheduleFormStateSave();
+}
+function loadTaggedWorkspaceItem(kind){
+  const slug = selectedWorkspaceSlug(kind);
+  if(!slug){ taggedWorkspaceStatus('Choose a saved '+kind+' first.', 'warn'); return; }
+  taggedWorkspaceStatus('Loading '+kind+'...');
+  api('/api/tagged-workspace/load', {method:'POST', body:JSON.stringify({kind, slug})}).then(r=>{
+    if(kind === 'script'){
+      setFieldValue('script', r.script || '');
+      setFieldValue('taggedWorkspaceName', r.name || r.slug || '');
+      try{ if(typeof updateTaggedScriptPreflight === 'function') updateTaggedScriptPreflight(); }catch(e){}
+    } else if(kind === 'cast'){
+      applyLoadedRoleMap(r.role_map || {});
+      setFieldValue('taggedWorkspaceName', r.name || r.slug || readFieldValue('taggedWorkspaceName', ''));
+    } else if(kind === 'project'){
+      applyLoadedProject(r.project || {});
+    }
+    scheduleFormStateSave && scheduleFormStateSave();
+    taggedWorkspaceStatus('Loaded '+kind+': '+(r.name || r.slug || ''), 'ok');
+  }).catch(err=>{ taggedWorkspaceStatus('Load failed: '+err, 'bad'); });
+}
+function basenameWithoutKnownExt(name){
+  return String(name || 'Tagged Script Project').replace(/\.(project|cast)\.json$/i, '').replace(/\.(txt|md|markdown|json)$/i, '');
+}
+async function uploadTaggedWorkspaceFile(kind){
+  const input = kind === 'script' ? $('taggedScriptUpload') : $('taggedCastUpload');
+  const file = input && input.files ? input.files[0] : null;
+  if(!file) return;
+  let text = '';
+  try{ text = await fileToText(file); }
+  catch(err){ taggedWorkspaceStatus('Could not read file: '+err, 'bad'); return; }
+  setFieldValue('taggedWorkspaceName', basenameWithoutKnownExt(file.name));
+  if(kind === 'script'){
+    setFieldValue('script', text.replace(/^\uFEFF/, ''));
+    taggedWorkspaceStatus('Loaded uploaded script into editor. Use Save script or Save project to preserve it on the server.', 'ok');
+    try{ if(typeof updateTaggedScriptPreflight === 'function') updateTaggedScriptPreflight(); }catch(e){}
+    return;
+  }
+  try{
+    const data = JSON.parse(text);
+    if(data && data.kind === 'tagged-script-project'){
+      applyLoadedProject(data);
+      taggedWorkspaceStatus('Loaded uploaded project JSON into editor. Use Save project to preserve it on the server.', 'ok');
+    } else if(data && data.role_map){
+      applyLoadedRoleMap(data.role_map || {});
+      taggedWorkspaceStatus('Loaded uploaded cast JSON into role map. Use Save cast or Save project to preserve it on the server.', 'ok');
+    } else if(data && typeof data === 'object' && !Array.isArray(data)){
+      applyLoadedRoleMap(data);
+      taggedWorkspaceStatus('Loaded uploaded raw role-map JSON. Use Save cast or Save project to preserve it on the server.', 'ok');
+    } else {
+      taggedWorkspaceStatus('Uploaded JSON did not look like a cast or project.', 'bad');
+    }
+  }catch(err){
+    taggedWorkspaceStatus('Cast/project upload must be JSON: '+err, 'bad');
+  }
+}
+function initTaggedScriptWorkspace(){
+  loadTaggedWorkspaceLibrary();
+  try{ if(typeof updateTaggedScriptPreflight === 'function') updateTaggedScriptPreflight(); }catch(e){}
+}
+
 function generateBatch(){
   let roleMap = {}; try { roleMap = JSON.parse($('roleMap').value || '{}'); } catch(e){ setGenerateStatus('batchActionStatus', 'Role map JSON is invalid: '+e, 'bad'); return; }
   let script = $('script').value || '';
@@ -8683,6 +9069,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"refs": loose_refs_payload()})
             elif path == "/api/outputs":
                 self.send_json({"outputs": outputs_payload()})
+            elif path == "/api/tagged-workspace":
+                self.send_json(tagged_workspace_list_payload())
             elif path == "/api/jobs":
                 self.send_json({"jobs": JOBS.list_recent()})
             elif path == "/api/state":
@@ -8806,6 +9194,10 @@ class Handler(BaseHTTPRequestHandler):
                 job = Job(id=uuid.uuid4().hex, kind="single")
                 JOBS.add(job, body)
                 self.send_json({"job": job.public()})
+            elif path == "/api/tagged-workspace/save":
+                self.send_json(tagged_workspace_save_payload(body))
+            elif path == "/api/tagged-workspace/load":
+                self.send_json(tagged_workspace_load_payload(body))
             elif path == "/api/batch":
                 job = Job(id=uuid.uuid4().hex, kind="batch")
                 JOBS.add(job, body)

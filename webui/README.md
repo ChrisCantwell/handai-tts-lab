@@ -1,4 +1,4 @@
-# TTS Lab Unified Web UI v0.93.3.3
+# TTS Lab Unified Web UI v0.94.3
 
 Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.93.2 adds a visual Tagged Script role-map builder for assigning script roles to saved voice profiles, while preserving the local speech API, WhisperX Maintenance, Metadata, Speech Repair Analysis, AI Studio Bridge, stack diagnostics, and Actions dropdown/external launch work.
 
@@ -55,6 +55,13 @@ The changelog below is ordered newest-to-oldest. Early project versions used lab
 
 
 
+
+## New in v0.94
+
+- Adds a Tagged Script Workspace panel for saving and reloading production work.
+- Saves scripts as dialogue text, casts as role-map JSON, and projects as script + cast + default engine + mixdown settings.
+- Adds browser upload controls for script text/Markdown files and cast/project JSON files.
+- Adds server-side saved-script, saved-cast, and saved-project pickers under `/home/user/tts-lab/projects/tagged-script/`.
 
 ## New in v0.93.3
 
