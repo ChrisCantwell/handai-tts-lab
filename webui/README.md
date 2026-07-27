@@ -1,6 +1,6 @@
-# TTS Lab Unified Web UI v0.90
+# TTS Lab Unified Web UI v0.92
 
-Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.90 adds Maintenance install/repair and smoke-test controls for the isolated WhisperX speech-repair backend, while preserving the v0.89 Metadata tab, v0.88.2 Speech Repair Analysis handoff helpers, v0.87 AI Studio Bridge, v0.86 stack diagnostics, and v0.85 Actions dropdown/external launch work.
+Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.92 adds a visual Tagged Script role-map builder for assigning script roles to saved voice profiles, while preserving the local speech API, WhisperX Maintenance, Metadata, Speech Repair Analysis, AI Studio Bridge, stack diagnostics, and Actions dropdown/external launch work.
 
 A dependency-light local web dashboard for the voice/TTS stack Grok installed under `/home/user/tts-lab`.
 
@@ -17,7 +17,7 @@ That keeps Chatterbox, Qwen3, CosyVoice, and F5 isolated in their own conda envi
 This ZIP filename is versioned, but the folder inside the ZIP is intentionally unversioned for repeatable install commands.
 
 ```bash
-unzip -o tts_unified_webui_v0.90.zip
+unzip -o tts_unified_webui_v0.92.zip
 cd tts_unified_webui
 ./install.sh
 ```
@@ -55,6 +55,15 @@ The changelog below is ordered newest-to-oldest. Early project versions used lab
 
 
 
+
+## New in v0.92
+
+- Adds a visual **Role map builder** to the Tagged Script tab.
+- Lets users type independent script role names and assign each role to a saved voice profile from a dropdown.
+- Adds per-role engine selection and Qwen x-vector-only checkbox controls.
+- Adds **Add Role**, **Auto-detect roles from script**, **Sync builder from JSON**, and **Apply builder to JSON** actions.
+- Keeps the advanced role-map JSON field as the source of truth and tries to preserve unknown/manual JSON fields.
+- Saves the role-map JSON with the remembered Web UI form state so assignments survive refreshes and installs.
 ## New in v0.90
 
 - Adds Maintenance status checks for an isolated WhisperX speech-repair backend.
