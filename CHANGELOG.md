@@ -1,3 +1,13 @@
+## v0.92 - Tagged Script Role Map Builder
+
+- Added a visual role-map builder above the Tagged Script JSON field.
+- Script role names are now explicitly independent from saved voice-profile names.
+- Added dropdown selection for saved voice profiles per role.
+- Added per-role engine selection and Qwen x-vector-only toggle.
+- Added Add Role, Auto-detect roles from script, Sync builder from JSON, and Apply builder to JSON controls.
+- Preserves the advanced JSON escape hatch and unknown role config fields where possible.
+- Saves role-map JSON in the remembered form state.
+
 ## v0.91 - Local Speech API / AI Studio Bridge STT
 
 - Added internal Local Speech API routes for Faster-Whisper and WhisperX:

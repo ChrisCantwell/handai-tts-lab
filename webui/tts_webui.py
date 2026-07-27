@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.90 adds Maintenance install/repair and smoke-test controls for the isolated WhisperX speech-repair backend.
+Version 0.92 adds a Tagged Script role-map builder for assigning script roles to saved voice profiles without hand-editing JSON.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -83,7 +83,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.91"
+VERSION = "0.92"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -2186,10 +2186,33 @@ def main() -> int:
                         diarize_cls = getattr(whisperx.diarize, "DiarizationPipeline", None)
                     if diarize_cls is None:
                         raise RuntimeError("WhisperX DiarizationPipeline was not found in this installation.")
-                    diarize_model = diarize_cls(use_auth_token=token, device=device)
+                    # WhisperX/pyannote auth kwarg compatibility:
+                    # newer local stacks may require token=..., while older stacks used use_auth_token=....
+                    diarize_model = None
+                    diarize_auth_argument = ""
+                    diarize_init_errors = []
+                    for kwargs, auth_argument in (
+                        ({"token": token, "device": device}, "token"),
+                        ({"use_auth_token": token, "device": device}, "use_auth_token"),
+                    ):
+                        try:
+                            diarize_model = diarize_cls(**kwargs)
+                            diarize_auth_argument = auth_argument
+                            break
+                        except TypeError as init_exc:
+                            msg = str(init_exc)
+                            diarize_init_errors.append(f"{auth_argument}: {msg}")
+                            if "unexpected keyword argument" in msg:
+                                continue
+                            raise
+                    if diarize_model is None:
+                        raise TypeError(
+                            "Could not initialize WhisperX DiarizationPipeline with token=... "
+                            "or use_auth_token=.... Attempts: " + " | ".join(diarize_init_errors)
+                        )
                     diarize_segments = diarize_model(audio)
                     aligned = whisperx.assign_word_speakers(diarize_segments, aligned)
-                    result["diarization"] = {"requested": True, "status": "ok"}
+                    result["diarization"] = {"requested": True, "status": "ok", "auth_argument": diarize_auth_argument}
                 except Exception as exc:
                     result["diarization"] = {"requested": True, "status": "failed", "message": str(exc)}
                     result["warnings"].append("Diarization failed; transcription/alignment may still be usable.")
@@ -4769,14 +4792,22 @@ audio { width: 100%; margin: 6px 0; }
 .maintenance-item { border:1px solid #303747; background:#111722; border-radius:10px; padding:10px; margin:10px 0; }
 .maintenance-item h3 { margin-top:0; }
 .maintenance-status { margin-top:6px; }
+.role-builder { border:1px solid #303747; background:#111722; border-radius:10px; padding:10px; margin:12px 0; }
+.role-builder h3 { margin:0 0 6px; }
+.role-builder-rows { display:flex; flex-direction:column; gap:8px; margin:10px 0; }
+.role-builder-row { display:grid; grid-template-columns:minmax(120px,.8fr) minmax(240px,1.4fr) minmax(140px,.75fr) auto auto; gap:8px; align-items:end; padding:8px; border:1px solid #303747; border-radius:10px; background:#0f131a; }
+.role-builder-row label { margin-top:0; }
+.role-builder-row input, .role-builder-row select { min-width:0; }
+.role-builder-xvec { white-space:nowrap; color:var(--muted); font-size:13px; padding:9px 4px; }
+@media (max-width: 950px) { .role-builder-row { grid-template-columns:1fr; } .role-builder-row button { width:100%; } }
 hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 @media (max-width: 950px) { body { overflow:auto; } main { grid-template-columns:1fr; height:auto; overflow:visible; } body.layout-stack main { display:block; } body.layout-stack .left-panel, body.layout-stack .right-panel { flex:auto; } section { overflow:visible; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.90</span></h1>
-  <div class="small">Voice profiles, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Metadata cover-art tagging, WhisperX setup/testing, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
+  <h1>TTS Lab Unified Web UI <span id="versionPill" class="pill">v0.92</span></h1>
+  <div class="small">Voice profiles, Tagged Script role-map builder, STT transcription, Video Intake archiving/extraction, abortable jobs, Audio Lab processing with waveform previews, Metadata cover-art tagging, WhisperX setup/testing, Resemble Enhance setup/testing, inline playback, ZIP import/export, and one-at-a-time synthesis for the 6GB GPU.</div>
 </header>
 <main>
   <section class="left-panel">
@@ -4833,7 +4864,7 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
     </div>
 
     <div id="pane-batch" class="hidden">
-      <p class="small">Paste dialogue as <code>ROLE: line</code>. Role-map entries can use <code>profile</code> slugs so you do not hardcode paths.</p>
+      <p class="small">Paste dialogue as <code>ROLE: line</code>. Role-map entries can use saved voice-profile slugs so you do not hardcode audio paths.</p>
       <label>Tagged script</label>
       <textarea id="script" style="min-height:220px">EXEC: Tucker, status.
 TUCKER: The logs say three engines work and one is pretending to be a software landmine.
@@ -4841,8 +4872,21 @@ ANALYST: I can provide fourteen implementation paths.
 EXEC: Pick one.</textarea>
       <label>Default engine</label>
       <select id="defaultEngine"></select>
-      <label>Role map JSON</label>
+      <div class="role-builder">
+        <h3>Role map builder</h3>
+        <p class="small">Script roles are independent from voice-profile names. Type the role used in the script, then choose which saved voice profile and engine should speak it. The advanced JSON below remains available for manual edits and unusual options.</p>
+        <div id="roleBuilderRows" class="role-builder-rows"></div>
+        <div class="inline-tools">
+          <button class="mini secondary" type="button" onclick="addRoleBuilderRow()">Add Role</button>
+          <button class="mini secondary" type="button" onclick="autoDetectRoleBuilderRows()">Auto-detect roles from script</button>
+          <button class="mini secondary" type="button" onclick="syncRoleBuilderFromJson(true)">Sync builder from JSON</button>
+          <button class="mini secondary" type="button" onclick="applyRoleBuilderToJson(true)">Apply builder to JSON</button>
+        </div>
+        <div id="roleBuilderStatus" class="small inline-status"></div>
+      </div>
+      <label>Advanced role map JSON</label>
       <textarea id="roleMap" style="min-height:180px"></textarea>
+      <div class="small">Advanced JSON is still the source used by generation. The builder writes JSON here and tries to preserve fields it does not expose yet.</div>
       <div class="sticky-actions"><button onclick="generateBatch()">Generate tagged script</button></div>
     </div>
 
@@ -6308,7 +6352,8 @@ function collectFormState(){
     audio_lab_sample_rate:readFieldValue('audioLabSampleRate', 'unchanged'),
     audio_lab_channels:readFieldValue('audioLabChannels', 'unchanged'),
     audio_lab_normalize:readFieldChecked('audioLabNormalize', true),
-    metadata_download_when_done:readFieldChecked('metadataDownloadWhenDone', false)
+    metadata_download_when_done:readFieldChecked('metadataDownloadWhenDone', false),
+    role_map:readFieldValue('roleMap', '')
   };
 }
 function saveFormStateNow(){ if(!formStateLoaded) return Promise.resolve(); return api('/api/state', {method:'POST', body:JSON.stringify(collectFormState())}).catch(err=>console.warn('state save failed', err)); }
@@ -6355,6 +6400,7 @@ function restoreFormState(){
     setFieldValue('audioLabChannels', s.audio_lab_channels);
     setFieldChecked('audioLabNormalize', s.audio_lab_normalize);
     setFieldChecked('metadataDownloadWhenDone', s.metadata_download_when_done);
+    if(s.role_map !== undefined){ setFieldValue('roleMap', s.role_map || ''); syncRoleBuilderFromJson(false); }
     dismissedNotices = new Set(Array.isArray(s.dismissed_notices) ? s.dismissed_notices : []);
     if(localStorage.getItem('ttsLabHfTokenSetupDismissed') === '1') dismissedNotices.add('hf_token_setup');
     if(localStorage.getItem('ttsLabGpuSetupHidden') === '1') dismissedNotices.add('whisper_gpu_setup');
@@ -6371,7 +6417,7 @@ function restoreFormState(){
   });
 }
 function attachFormStateHandlers(){
-  for(const id of ['engine','profileSelect','role','ref','refText','text','xVector','splitLong','rememberForm','uiMode','optAdvanced','optProfileTools','optExperimental','optMetadata','optLogs','optDelete','optStickyTabs','optPanelOrientation','optJobsAsTab','optOpsWidth','globalName','globalNameMode','globalFunctionMode','globalDateMode','globalVersionMode','globalFilenameTemplate','resembleInstallMode','resembleDevice','videoFormat','videoMp3Bitrate','videoSampleRate','videoChannels','videoNormalize','audioLabFormat','audioLabMp3Bitrate','audioLabSampleRate','audioLabChannels','audioLabNormalize','metadataDownloadWhenDone','speechAnalysisEngine','speechDiarizationMode']){
+  for(const id of ['engine','profileSelect','role','ref','refText','text','xVector','splitLong','rememberForm','uiMode','optAdvanced','optProfileTools','optExperimental','optMetadata','optLogs','optDelete','optStickyTabs','optPanelOrientation','optJobsAsTab','optOpsWidth','globalName','globalNameMode','globalFunctionMode','globalDateMode','globalVersionMode','globalFilenameTemplate','resembleInstallMode','resembleDevice','videoFormat','videoMp3Bitrate','videoSampleRate','videoChannels','videoNormalize','audioLabFormat','audioLabMp3Bitrate','audioLabSampleRate','audioLabChannels','audioLabNormalize','metadataDownloadWhenDone','roleMap','speechAnalysisEngine','speechDiarizationMode']){
     const el=$(id); if(!el || el.dataset.stateHooked) continue;
     el.dataset.stateHooked='1'; el.addEventListener('input', ()=>{ updateNamingSummaries(); scheduleFormStateSave(); }); el.addEventListener('change', ()=>{ updateNamingSummaries(); scheduleFormStateSave(); });
   }
@@ -6500,16 +6546,221 @@ function refreshJobs(){
     return active;
   }).catch(err=>{ console.warn(err); return false; });
 }
-function loadProfiles(){ return api('/api/profiles').then(data=>{ profiles=data.profiles; renderProfileSelect(); renderProfiles(); updateRoleMapTemplate(); }); }
-function updateRoleMapTemplate(){
+let roleBuilderRows = [];
+let roleBuilderInitialized = false;
+
+function loadProfiles(){
+  return api('/api/profiles').then(data=>{
+    profiles=data.profiles || [];
+    renderProfileSelect();
+    renderProfiles();
+    initializeRoleBuilder();
+  });
+}
+
+function roleBuilderDefaultRows(){
   const first = profiles[0]?.slug || '';
-  const second = profiles[1]?.slug || first;
-  const third = profiles[2]?.slug || second;
-  $('roleMap').value = JSON.stringify({
-    "EXEC": {"engine":"chatterbox", "profile": first},
-    "TUCKER": {"engine":"qwen3", "profile": second, "x_vector_only": true},
-    "ANALYST": {"engine":"qwen3", "profile": third, "x_vector_only": true}
-  }, null, 2);
+  return [{role:'EXEC', profile:first, engine:'chatterbox', x_vector_only:false, extra:{}}];
+}
+
+function engineDisplayName(key){
+  const e = (engines || {})[key] || {};
+  return e.label ? `${e.label} (${key})` : key;
+}
+
+function profileDisplayName(p){
+  const bits = [];
+  bits.push(p.name || p.slug || 'profile');
+  if(p.speaker) bits.push(p.speaker);
+  if(p.style) bits.push(p.style);
+  if(p.slug) bits.push(p.slug);
+  return bits.join(' · ');
+}
+
+function profileOptionsHtml(selected=''){
+  let out = '<option value="">choose voice profile...</option>';
+  for(const p of profiles || []){
+    const slug = p.slug || '';
+    out += `<option value="${esc(slug)}"${slug===selected?' selected':''}>${esc(profileDisplayName(p))}</option>`;
+  }
+  return out;
+}
+
+function engineOptionsHtml(selected=''){
+  const keys = Object.keys(engines || {});
+  const fallback = ['chatterbox','qwen3','cosyvoice','f5'];
+  const list = keys.length ? keys : fallback;
+  if(!selected) selected = readFieldValue('defaultEngine', 'chatterbox') || 'chatterbox';
+  return list.map(k=>`<option value="${esc(k)}"${k===selected?' selected':''}>${esc(engineDisplayName(k))}</option>`).join('');
+}
+
+function roleBuilderSetStatus(message='', kind=''){
+  const el = $('roleBuilderStatus');
+  if(!el) return;
+  const cls = kind === 'ok' ? 'ok' : (kind === 'bad' ? 'bad' : (kind === 'warn' ? 'warn' : ''));
+  el.innerHTML = cls ? `<span class="${cls}">${esc(message)}</span>` : esc(message);
+}
+
+function cleanRoleBuilderRole(value){ return String(value ?? '').trim(); }
+function cloneRoleExtra(value){ return (value && typeof value === 'object' && !Array.isArray(value)) ? Object.assign({}, value) : {}; }
+
+function roleBuilderRowsFromJson(){
+  const raw = ($('roleMap') && $('roleMap').value || '').trim();
+  if(!raw) return roleBuilderDefaultRows();
+  const obj = JSON.parse(raw);
+  if(!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('Role map JSON must be an object keyed by role names.');
+  const rows = [];
+  for(const [role, cfgRaw] of Object.entries(obj)){
+    const cfg = cloneRoleExtra(cfgRaw);
+    const engine = String(cfg.engine || readFieldValue('defaultEngine', 'chatterbox') || 'chatterbox');
+    const profile = String(cfg.profile || '');
+    const xvec = !!cfg.x_vector_only;
+    delete cfg.engine; delete cfg.profile; delete cfg.x_vector_only;
+    rows.push({role, profile, engine, x_vector_only:xvec, extra:cfg});
+  }
+  return rows.length ? rows : roleBuilderDefaultRows();
+}
+
+function initializeRoleBuilder(){
+  try{
+    if(!roleBuilderInitialized){
+      roleBuilderRows = roleBuilderRowsFromJson();
+      if(!($('roleMap') && $('roleMap').value.trim())) applyRoleBuilderToJson(false);
+      roleBuilderInitialized = true;
+    }
+    renderRoleBuilder();
+  }catch(e){
+    roleBuilderRows = roleBuilderDefaultRows();
+    renderRoleBuilder();
+    roleBuilderSetStatus('Could not initialize from JSON: '+String(e.message || e), 'bad');
+  }
+}
+
+function updateRoleMapTemplate(){
+  if($('roleMap') && !$('roleMap').value.trim()){
+    roleBuilderRows = roleBuilderDefaultRows();
+    roleBuilderInitialized = true;
+    applyRoleBuilderToJson(false);
+  } else {
+    syncRoleBuilderFromJson(false);
+  }
+}
+
+function renderRoleBuilder(){
+  const box = $('roleBuilderRows');
+  if(!box) return;
+  if(!roleBuilderRows.length) roleBuilderRows = roleBuilderDefaultRows();
+  box.innerHTML = roleBuilderRows.map((row, idx)=>`
+    <div class="role-builder-row" data-role-row="${idx}">
+      <div><label>Script role</label><input value="${esc(row.role || '')}" placeholder="EXEC, NARRATOR, JUDGE" oninput="roleBuilderFieldChanged(${idx}, 'role', this.value)" /></div>
+      <div><label>Voice profile</label><select onchange="roleBuilderFieldChanged(${idx}, 'profile', this.value)">${profileOptionsHtml(row.profile || '')}</select></div>
+      <div><label>Engine</label><select onchange="roleBuilderFieldChanged(${idx}, 'engine', this.value)">${engineOptionsHtml(row.engine || '')}</select></div>
+      <label class="role-builder-xvec"><input type="checkbox"${row.x_vector_only?' checked':''} onchange="roleBuilderFieldChanged(${idx}, 'x_vector_only', this.checked)" /> Qwen x-vector</label>
+      <button class="mini danger" type="button" onclick="removeRoleBuilderRow(${idx})">remove</button>
+    </div>`).join('');
+}
+
+function roleBuilderFieldChanged(idx, field, value){
+  if(!roleBuilderRows[idx]) return;
+  roleBuilderRows[idx][field] = value;
+  applyRoleBuilderToJson(false);
+}
+
+function addRoleBuilderRow(role='', profile='', engine=''){
+  roleBuilderRows.push({role: role || '', profile: profile || '', engine: engine || readFieldValue('defaultEngine', 'chatterbox') || 'chatterbox', x_vector_only:false, extra:{}});
+  renderRoleBuilder();
+  applyRoleBuilderToJson(false);
+  roleBuilderSetStatus('Added role row. Type the role name and choose a profile.', 'ok');
+}
+
+function removeRoleBuilderRow(idx){
+  roleBuilderRows.splice(idx, 1);
+  if(!roleBuilderRows.length) roleBuilderRows = roleBuilderDefaultRows();
+  renderRoleBuilder();
+  applyRoleBuilderToJson(false);
+  roleBuilderSetStatus('Role row removed.', 'warn');
+}
+
+function roleMapObjectFromBuilder(){
+  const out = {};
+  const seen = new Set();
+  const duplicates = new Set();
+  for(const row of roleBuilderRows){
+    const role = cleanRoleBuilderRole(row.role);
+    if(!role) continue;
+    const key = role.toLowerCase();
+    if(seen.has(key)) duplicates.add(role);
+    seen.add(key);
+    const cfg = cloneRoleExtra(row.extra);
+    cfg.engine = row.engine || readFieldValue('defaultEngine', 'chatterbox') || 'chatterbox';
+    if(row.profile) cfg.profile = row.profile; else delete cfg.profile;
+    if(row.x_vector_only) cfg.x_vector_only = true; else delete cfg.x_vector_only;
+    out[role] = cfg;
+  }
+  return {out, duplicates:[...duplicates]};
+}
+
+function applyRoleBuilderToJson(showStatus=true){
+  const el = $('roleMap');
+  if(!el) return;
+  const built = roleMapObjectFromBuilder();
+  el.value = JSON.stringify(built.out, null, 2);
+  if(showStatus){
+    const count = Object.keys(built.out).length;
+    const dup = built.duplicates.length ? ' Duplicate role names overwritten: '+built.duplicates.join(', ') : '';
+    roleBuilderSetStatus(`Applied ${count} role${count===1?'':'s'} to JSON.${dup}`, built.duplicates.length ? 'warn' : 'ok');
+  }
+  scheduleFormStateSave();
+}
+
+function syncRoleBuilderFromJson(showStatus=true){
+  try{
+    roleBuilderRows = roleBuilderRowsFromJson();
+    roleBuilderInitialized = true;
+    renderRoleBuilder();
+    if(showStatus) roleBuilderSetStatus('Builder synced from role map JSON.', 'ok');
+  }catch(e){
+    roleBuilderSetStatus('Role map JSON is invalid: '+String(e.message || e), 'bad');
+  }
+}
+
+function detectedRolesFromScript(){
+  const text = $('script') ? $('script').value || '' : '';
+  const roles = [];
+  const seen = new Set();
+  for(const line of text.split(/\r?\n/)){
+    const m = line.match(/^\s*([A-Za-z][A-Za-z0-9_ -]{0,31})\s*:/);
+    if(!m) continue;
+    const role = m[1].trim();
+    const key = role.toLowerCase();
+    if(!seen.has(key)){ seen.add(key); roles.push(role); }
+  }
+  return roles;
+}
+
+function autoDetectRoleBuilderRows(){
+  const roles = detectedRolesFromScript();
+  if(!roles.length){ roleBuilderSetStatus('No ROLE: lines detected in the tagged script.', 'warn'); return; }
+  const byKey = new Map(roleBuilderRows.map(r=>[cleanRoleBuilderRole(r.role).toLowerCase(), r]));
+  const next = [];
+  let added = 0;
+  for(const role of roles){
+    const key = role.toLowerCase();
+    if(byKey.has(key)){
+      const existing = byKey.get(key); existing.role = role; next.push(existing);
+    } else {
+      next.push({role, profile:'', engine:readFieldValue('defaultEngine', 'chatterbox') || 'chatterbox', x_vector_only:false, extra:{}});
+      added += 1;
+    }
+  }
+  for(const row of roleBuilderRows){
+    const key = cleanRoleBuilderRole(row.role).toLowerCase();
+    if(key && !roles.some(r=>r.toLowerCase()===key)) next.push(row);
+  }
+  roleBuilderRows = next.length ? next : roleBuilderDefaultRows();
+  renderRoleBuilder();
+  applyRoleBuilderToJson(false);
+  roleBuilderSetStatus(`Detected ${roles.length} script role${roles.length===1?'':'s'}${added?`; added ${added} new row${added===1?'':'s'}`:''}.`, 'ok');
 }
 function renderProfiles(){
   $('profilesList').innerHTML = '<h2>Voice profiles</h2>' + (profiles.map(p=>`<div class="card"><b>${esc(p.name)}</b> <span class="pill">${esc(p.slug)}</span> ${durationBadge(p.duration_seconds, p.duration_warning)} ${p.ok?'':'<span class="bad">missing audio</span>'}<br>
