@@ -2,7 +2,7 @@
 """
 Unified local web interface for /home/user/tts-lab voice/TTS engines.
 
-Version 0.93 adds immediate production feedback, live job timers, tagged-script ETA, and optional full-script mixdown.
+Version 0.94.2 adds Tagged Script workspace refresh-status polish.
 
 No third-party Python dependencies. It calls Grok's existing tts-lab.sh wrapper,
 which keeps each model in its own conda environment.
@@ -87,7 +87,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.94"
+VERSION = "0.94.2"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -3162,6 +3162,8 @@ def tagged_workspace_save_payload(body: dict[str, Any]) -> dict[str, Any]:
             "created_at": created_at,
             "updated_at": iso_time(),
             "script": str(body.get("script") or ""),
+            "script_name": str(body.get("script_name") or ""),
+            "cast_name": str(body.get("cast_name") or ""),
             "role_map": role_map,
             "default_engine": str(body.get("default_engine") or "chatterbox"),
             "assembly": {
@@ -3290,6 +3292,32 @@ class JobManager:
                 if not kwargs.get("id"):
                     continue
                 job = Job(**kwargs)
+                if job.kind == "historical-output" and job.output:
+                    try:
+                        op = Path(str(job.output)).resolve()
+                        rel_out = op.relative_to(OUT_DIR)
+                        in_batch_dir = any(str(part).startswith("batch_") for part in rel_out.parts[:-1])
+                        lower_name = op.name.lower()
+                        sidecar_exists = op.with_suffix(op.suffix + ".json").exists()
+                        if in_batch_dir and (
+                            lower_name.startswith(("silence_", "post_mixdown_silence_"))
+                            or "concat" in lower_name
+                            or (lower_name.startswith(("tagged_script_mixdown", "tagged_script_post_mixdown")) and not sidecar_exists)
+                        ):
+                            continue
+                        meta = read_output_sidecar(op)
+                        meta_kind = str(meta.get("kind", ""))
+                        if meta_kind in {"tagged-script-mixdown", "tagged-script-post-run-mixdown"}:
+                            line_count = meta.get("source_line_count") or meta.get("line_count") or meta.get("total_lines") or ""
+                            line_note = f"{line_count} rendered lines" if line_count else "rendered lines"
+                            job.kind = "batch-mixdown"
+                            job.engine = "ffmpeg"
+                            job.role = "tagged-script-mixdown"
+                            job.text = f"Recovered Tagged Script mixdown: {line_note} — {op.name}"
+                            job.source_path = str(meta.get("manifest", ""))
+                            job.result = meta
+                    except Exception:
+                        pass
                 log_path = self._job_log_path(job.id)
                 if log_path.exists():
                     job.log = read_tail_text(log_path)
@@ -3305,13 +3333,44 @@ class JobManager:
                 rel = p.relative_to(OUT_DIR)
                 if any(part.endswith("_parts") for part in rel.parts):
                     continue
+                lower_name = p.name.lower()
+                sidecar_exists = p.with_suffix(p.suffix + ".json").exists()
+                in_batch_dir = any(str(part).startswith("batch_") for part in rel.parts[:-1])
+                if in_batch_dir:
+                    if lower_name.startswith(("silence_", "post_mixdown_silence_")):
+                        continue
+                    if "concat" in lower_name:
+                        continue
+                    # MP3 mixdowns create intermediate WAVs. Keep final WAV mixdowns only when a sidecar exists.
+                    if lower_name.startswith(("tagged_script_mixdown", "tagged_script_post_mixdown")) and not sidecar_exists:
+                        continue
                 meta = read_output_sidecar(p)
                 hist_id = str(meta.get("job_id") or uuid.uuid5(uuid.NAMESPACE_URL, str(p.resolve())))
                 if hist_id in jobs:
                     continue
                 st = p.stat()
                 meta_kind = str(meta.get("kind", ""))
-                if meta_kind == "resemble-enhance-output":
+                if meta_kind in {"tagged-script-mixdown", "tagged-script-post-run-mixdown"}:
+                    line_count = meta.get("source_line_count") or meta.get("line_count") or meta.get("total_lines") or ""
+                    line_note = f"{line_count} rendered lines" if line_count else "rendered lines"
+                    jobs[hist_id] = Job(
+                        id=hist_id,
+                        kind="batch-mixdown",
+                        status="done",
+                        created_at=st.st_mtime,
+                        finished_at=st.st_mtime,
+                        engine="ffmpeg",
+                        role="tagged-script-mixdown",
+                        text=f"Recovered Tagged Script mixdown: {line_note} — {p.name}",
+                        output=str(p),
+                        source_path=str(meta.get("manifest", "")),
+                        result=meta,
+                        log=(
+                            "Recovered Tagged Script mixdown from sidecar metadata. "
+                            "The original job log was not available after upgrade/restart, but output, manifest, and mixdown metadata were preserved.\n"
+                        ),
+                    )
+                elif meta_kind == "resemble-enhance-output":
                     function_label = str(meta.get("function_label") or meta.get("mode") or "resemble").strip()
                     source_label = str(meta.get("source_label") or Path(str(meta.get("source_audio") or "")).name or p.name).strip()
                     jobs[hist_id] = Job(
@@ -3374,9 +3433,9 @@ class JobManager:
                         status="done",
                         created_at=st.st_mtime,
                         finished_at=st.st_mtime,
-                        engine=str(meta.get("engine", "")),
-                        role=str(meta.get("role", "")),
-                        text=str(meta.get("text", "")),
+                        engine=str(meta.get("engine") or "recovered-output"),
+                        role=str(meta.get("role") or meta.get("function_label") or meta.get("mode") or p.stem),
+                        text=str(meta.get("text") or meta.get("source_label") or meta.get("source_audio") or meta.get("source_media") or p.name),
                         output=str(p),
                         log=(
                             "No saved subprocess log exists for this completed output. "
@@ -5563,6 +5622,7 @@ audio { width: 100%; margin: 6px 0; }
 .role-builder-rows { display:flex; flex-direction:column; gap:8px; margin:10px 0; }
 .role-builder-row { display:grid; grid-template-columns:minmax(120px,.8fr) minmax(240px,1.4fr) minmax(140px,.75fr) auto auto; gap:8px; align-items:end; padding:8px; border:1px solid #303747; border-radius:10px; background:#0f131a; }
 .role-builder-row label { margin-top:0; }
+.tagged-workspace .workspace-subtools { margin: 6px 0 10px; }
 .role-builder-row input, .role-builder-row select { min-width:0; }
 .role-builder-xvec { white-space:nowrap; color:var(--muted); font-size:13px; padding:9px 4px; }
 @media (max-width: 950px) { .role-builder-row { grid-template-columns:1fr; } .role-builder-row button { width:100%; } }
@@ -5635,22 +5695,32 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
         <h3>Tagged Script Workspace</h3>
         <p class="small">Save and reload unfinished work. Scripts store only the tagged dialogue, casts store only the role map, and projects store both plus default engine and mixdown settings.</p>
         <div class="row3">
-          <div><label>Workspace / project name</label><input id="taggedWorkspaceName" placeholder="Go Fax Somebody Pops" oninput="scheduleFormStateSave && scheduleFormStateSave()" /></div>
+          <div><label>Project name</label><input id="taggedWorkspaceName" placeholder="Go Fax Somebody Pops project" oninput="scheduleFormStateSave && scheduleFormStateSave()" /></div>
           <div><label>Saved project</label><select id="taggedProjectSelect"></select></div>
           <div><label>&nbsp;</label><button class="mini secondary" type="button" onclick="loadTaggedWorkspaceItem('project')">Load project</button> <button class="mini secondary" type="button" onclick="saveTaggedWorkspaceItem('project')">Save project</button></div>
         </div>
         <div class="row3">
+          <div><label>Script name</label><input id="taggedScriptName" placeholder="Go Fax draft script" oninput="scheduleFormStateSave && scheduleFormStateSave()" /></div>
           <div><label>Saved script</label><select id="taggedScriptSelect"></select></div>
           <div><label>Upload script file</label><input id="taggedScriptUpload" type="file" accept=".txt,.md,.markdown,text/plain,text/markdown" onchange="uploadTaggedWorkspaceFile('script')" /></div>
-          <div><label>&nbsp;</label><button class="mini secondary" type="button" onclick="loadTaggedWorkspaceItem('script')">Load script</button> <button class="mini secondary" type="button" onclick="saveTaggedWorkspaceItem('script')">Save script</button></div>
+        </div>
+        <div class="workspace-subtools inline-tools">
+          <button class="mini secondary" type="button" onclick="loadTaggedWorkspaceItem('script')">Load script</button>
+          <button class="mini secondary" type="button" onclick="saveTaggedWorkspaceItem('script')">Save script</button>
+          <span class="small">Scripts save independently and do not inherit the project name.</span>
         </div>
         <div class="row3">
+          <div><label>Cast name</label><input id="taggedCastName" placeholder="Chris and ChatGPT cast" oninput="scheduleFormStateSave && scheduleFormStateSave()" /></div>
           <div><label>Saved cast</label><select id="taggedCastSelect"></select></div>
           <div><label>Upload cast/project JSON</label><input id="taggedCastUpload" type="file" accept=".json,.cast.json,.project.json,application/json" onchange="uploadTaggedWorkspaceFile('cast')" /></div>
-          <div><label>&nbsp;</label><button class="mini secondary" type="button" onclick="loadTaggedWorkspaceItem('cast')">Load cast</button> <button class="mini secondary" type="button" onclick="saveTaggedWorkspaceItem('cast')">Save cast</button></div>
+        </div>
+        <div class="workspace-subtools inline-tools">
+          <button class="mini secondary" type="button" onclick="loadTaggedWorkspaceItem('cast')">Load cast</button>
+          <button class="mini secondary" type="button" onclick="saveTaggedWorkspaceItem('cast')">Save cast</button>
+          <span class="small">Casts save independently and do not inherit the project name.</span>
         </div>
         <div class="inline-tools">
-          <button class="mini secondary" type="button" onclick="loadTaggedWorkspaceLibrary()">Refresh saved scripts/casts/projects</button>
+          <button class="mini secondary" type="button" onclick="loadTaggedWorkspaceLibrary(true)">Refresh saved scripts/casts/projects</button>
           <span id="taggedWorkspaceStatus" class="small inline-status"></span>
         </div>
       </div>
@@ -6492,17 +6562,36 @@ function renderTaggedWorkspaceLibrary(data){
   }
   return taggedWorkspaceLibrary;
 }
-function loadTaggedWorkspaceLibrary(){
+function loadTaggedWorkspaceLibrary(showStatus=false){
   return api('/api/tagged-workspace').then(data=>{
     renderTaggedWorkspaceLibrary(data);
+    if(showStatus) taggedWorkspaceStatus('Refreshed projects, scripts, casts.', 'ok');
     return data;
   }).catch(err=>{ taggedWorkspaceStatus('Could not load saved workspace library: '+err, 'bad'); });
 }
-function workspaceNameFallback(){
-  const name = readFieldValue('taggedWorkspaceName', '').trim();
-  if(name) return name;
+function workspaceNameFallback(kind='project'){
+  const k = String(kind || 'project').toLowerCase();
+  const field = k === 'script' ? 'taggedScriptName' : (k === 'cast' ? 'taggedCastName' : 'taggedWorkspaceName');
+  const explicitName = readFieldValue(field, '').trim();
+  if(explicitName) return explicitName;
+
+  if(k === 'script'){
+    const firstLine = (readFieldValue('script', '').split(/\r?\n/).find(x=>x.trim()) || '').replace(/^\s*[A-Za-z][A-Za-z0-9_ -]{0,31}\s*:\s*/, '').trim();
+    return firstLine ? firstLine.slice(0, 60) : 'Tagged Script';
+  }
+
+  if(k === 'cast'){
+    try{
+      const roles = Object.keys(workspaceRoleMapObject() || {});
+      if(roles.length) return ('Cast - ' + roles.slice(0, 4).join(', ')).slice(0, 70);
+    }catch(e){}
+    return 'Tagged Cast';
+  }
+
+  const projectName = readFieldValue('taggedWorkspaceName', '').trim();
+  if(projectName) return projectName;
   const firstLine = (readFieldValue('script', '').split(/\r?\n/).find(x=>x.trim()) || '').replace(/^\s*[A-Za-z][A-Za-z0-9_ -]{0,31}\s*:\s*/, '').trim();
-  return firstLine ? firstLine.slice(0, 60) : 'Tagged Script Project';
+  return firstLine ? firstLine.slice(0, 60) + ' Project' : 'Tagged Script Project';
 }
 function workspaceRoleMapObject(){
   try{
@@ -6514,7 +6603,7 @@ function workspaceRoleMapObject(){
 }
 function taggedWorkspacePayload(kind){
   kind = String(kind || '').toLowerCase();
-  const name = workspaceNameFallback();
+  const name = workspaceNameFallback(kind);
   if(kind === 'script'){
     return {kind, name, script:readFieldValue('script', '')};
   }
@@ -6530,6 +6619,8 @@ function taggedWorkspacePayload(kind){
       assemble_mixdown:readFieldChecked('batchAssembleMixdown', true),
       mixdown_format:readFieldValue('batchMixdownFormat', 'mp3'),
       line_gap_seconds:readFieldValue('batchLineGap', '0.35'),
+      script_name:readFieldValue('taggedScriptName', ''),
+      cast_name:readFieldValue('taggedCastName', ''),
     };
   }
   throw new Error('Unknown workspace kind: ' + kind);
@@ -6567,6 +6658,8 @@ function applyLoadedProject(project){
   setFieldValue('batchMixdownFormat', assembly.mixdown_format || 'mp3');
   setFieldValue('batchLineGap', assembly.line_gap_seconds !== undefined ? String(assembly.line_gap_seconds) : '0.35');
   setFieldValue('taggedWorkspaceName', project.name || project.slug || '');
+  setFieldValue('taggedScriptName', project.script_name || readFieldValue('taggedScriptName', ''));
+  setFieldValue('taggedCastName', project.cast_name || readFieldValue('taggedCastName', ''));
   try{ if(typeof updateTaggedScriptPreflight === 'function') updateTaggedScriptPreflight(); }catch(e){}
   scheduleFormStateSave && scheduleFormStateSave();
 }
@@ -6577,11 +6670,11 @@ function loadTaggedWorkspaceItem(kind){
   api('/api/tagged-workspace/load', {method:'POST', body:JSON.stringify({kind, slug})}).then(r=>{
     if(kind === 'script'){
       setFieldValue('script', r.script || '');
-      setFieldValue('taggedWorkspaceName', r.name || r.slug || '');
+      setFieldValue('taggedScriptName', r.name || r.slug || '');
       try{ if(typeof updateTaggedScriptPreflight === 'function') updateTaggedScriptPreflight(); }catch(e){}
     } else if(kind === 'cast'){
       applyLoadedRoleMap(r.role_map || {});
-      setFieldValue('taggedWorkspaceName', r.name || r.slug || readFieldValue('taggedWorkspaceName', ''));
+      setFieldValue('taggedCastName', r.name || r.slug || readFieldValue('taggedCastName', ''));
     } else if(kind === 'project'){
       applyLoadedProject(r.project || {});
     }
@@ -6599,8 +6692,9 @@ async function uploadTaggedWorkspaceFile(kind){
   let text = '';
   try{ text = await fileToText(file); }
   catch(err){ taggedWorkspaceStatus('Could not read file: '+err, 'bad'); return; }
-  setFieldValue('taggedWorkspaceName', basenameWithoutKnownExt(file.name));
+  const uploadedBaseName = basenameWithoutKnownExt(file.name);
   if(kind === 'script'){
+    setFieldValue('taggedScriptName', uploadedBaseName);
     setFieldValue('script', text.replace(/^\uFEFF/, ''));
     taggedWorkspaceStatus('Loaded uploaded script into editor. Use Save script or Save project to preserve it on the server.', 'ok');
     try{ if(typeof updateTaggedScriptPreflight === 'function') updateTaggedScriptPreflight(); }catch(e){}
@@ -6610,12 +6704,15 @@ async function uploadTaggedWorkspaceFile(kind){
     const data = JSON.parse(text);
     if(data && data.kind === 'tagged-script-project'){
       applyLoadedProject(data);
+      setFieldValue('taggedWorkspaceName', data.name || data.slug || uploadedBaseName);
       taggedWorkspaceStatus('Loaded uploaded project JSON into editor. Use Save project to preserve it on the server.', 'ok');
     } else if(data && data.role_map){
       applyLoadedRoleMap(data.role_map || {});
+      setFieldValue('taggedCastName', data.name || data.slug || uploadedBaseName);
       taggedWorkspaceStatus('Loaded uploaded cast JSON into role map. Use Save cast or Save project to preserve it on the server.', 'ok');
     } else if(data && typeof data === 'object' && !Array.isArray(data)){
       applyLoadedRoleMap(data);
+      setFieldValue('taggedCastName', uploadedBaseName);
       taggedWorkspaceStatus('Loaded uploaded raw role-map JSON. Use Save cast or Save project to preserve it on the server.', 'ok');
     } else {
       taggedWorkspaceStatus('Uploaded JSON did not look like a cast or project.', 'bad');
