@@ -691,3 +691,30 @@ local-whisperx-diarize -> WhisperX + pyannote diarization
 ```
 
 For long files, use the bridge-native JSON endpoint with `mode: "async"`, then poll `/api/ai-studio-bridge/jobs/<job_id>`.
+
+### v0.95 Tagged Script Take Manager
+
+Tagged Script batches now treat each line as a script line with one or more performance takes. Completed batch lines expose a Take Manager in the Jobs panel. You can regenerate a single line with edited text, a different engine, or a different voice profile; the regenerated audio is saved as an alternate take and is not automatically selected. Choose **Use this take in mixdown** when a take should become the selected performance, then rebuild the batch mixdown from selected takes without re-rendering the full script.
+
+Future engine-specific style/emotion/speed controls should attach to the saved `engine_options` field on each take rather than pretending every engine supports the same sliders.
+
+### v0.95.1 Take Manager click fix
+
+Fixed the Take Manager's inline click handlers so Generate alternate take and Use this take in mixdown report status immediately instead of failing silently with a browser `Unexpected end of input` JavaScript error. The issue was caused by raw JSON string quotes inside double-quoted `onclick` attributes.
+
+### v0.95.2 Take Manager tab
+
+Added a dedicated **Take Manager** tab for completed Tagged Script batches. Batch job cards now include **Send to Take Manager**, and the tab can also select completed batches from a dropdown. This keeps line-repair work in one stable place instead of forcing the operator to scroll back through Jobs, expand a batch, expand a line, and reopen the nested Take Manager after each alternate render.
+
+### v0.95.3 UI performance / boot layout
+
+Reduced visible pauses in the single-page Web UI by caching the latest Jobs payload, skipping hidden Jobs-panel rerenders when Jobs are configured as a tab, skipping hidden Take Manager rerenders, and saving layout preferences to `localStorage` so the browser paints Jobs-as-tab layout immediately on reload before `/api/state` returns.
+
+### v0.95.4 initial-load Jobs render gate
+
+Fixed the remaining page-load stall after the v0.95.3 layout-performance pass. v0.95.3 painted the saved Jobs-as-tab layout early, but the first `/api/jobs` refresh still read the default unchecked Options checkbox before `/api/state` populated it, causing the hidden Jobs pane to render during startup. v0.95.4 makes the Jobs visibility gate trust the early `localStorage` boot preference until form state is loaded, and logs when hidden Jobs rendering is skipped.
+
+### v0.95.5 Jobs startup render budget
+
+Reduced the remaining startup/page-refresh browser hang by keeping the Jobs panel lightweight. The Jobs panel now renders only a small recent-job window by default, provides **show 12 more jobs** / **show fewer jobs** controls, and lazy-renders Tagged Script batch line/take details only when the operator opens that batch block. This avoids constructing hundreds of hidden audio players and Take Manager controls during initial page load.
+
