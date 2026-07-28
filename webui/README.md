@@ -718,3 +718,10 @@ Fixed the remaining page-load stall after the v0.95.3 layout-performance pass. v
 
 Reduced the remaining startup/page-refresh browser hang by keeping the Jobs panel lightweight. The Jobs panel now renders only a small recent-job window by default, provides **show 12 more jobs** / **show fewer jobs** controls, and lazy-renders Tagged Script batch line/take details only when the operator opens that batch block. This avoids constructing hundreds of hidden audio players and Take Manager controls during initial page load.
 
+
+
+### v0.97 Chatterbox-Turbo controls
+
+Chatterbox-Turbo exposes temperature, repetition penalty, top-p, top-k, optional seed, and reference-loudness normalization. Blank seed preserves ordinary random generation. Tagged Scripts accept leading inline performance tags and standalone performance blocks; vocal-event tags stay positioned inside dialogue. The parser validates block structure before queuing work, and each completed take preserves its effective style and sampling options.
+
+Turbo does not support CFG, min-p, or exaggeration. Those controls are reserved for the later original-Chatterbox engine integration rather than displayed as no-op fields.

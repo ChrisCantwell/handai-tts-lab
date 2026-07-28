@@ -87,7 +87,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.96"
+VERSION = "0.97"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -120,6 +120,16 @@ ENGINE_META = {
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_. -]+")
 SAFE_SLUG = re.compile(r"[^A-Za-z0-9_.-]+")
 ROLE_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_ -]{0,31})\s*:\s*(.+?)\s*$")
+CHATTERBOX_TURBO_PERFORMANCE_STYLES = {
+    "advertisement", "angry", "crying", "dramatic", "fear", "happy",
+    "narration", "sarcastic", "surprised", "whispering",
+}
+CHATTERBOX_TURBO_VOCAL_EVENTS = {
+    "chuckle", "clear throat", "cough", "gasp", "groan", "laugh", "shush", "sigh", "sniff",
+}
+CHATTERBOX_TAG_RE = re.compile(r"\[(/?)([A-Za-z][A-Za-z ]{0,31})\]")
+CHATTERBOX_TAG_ONLY_RE = re.compile(r"^\s*\[(/?)([A-Za-z][A-Za-z ]{0,31})\]\s*$")
+CHATTERBOX_LEADING_TAG_RE = re.compile(r"^\s*\[([A-Za-z][A-Za-z ]{0,31})\]\s*(.*)$", re.DOTALL)
 TAGGED_SCRIPT_INVISIBLE_CHARS = "\ufeff\u200b\u200c\u200d\u2060"
 TAGGED_SCRIPT_INVISIBLE_TRANSLATION = {ord(ch): None for ch in TAGGED_SCRIPT_INVISIBLE_CHARS}
 
@@ -131,6 +141,156 @@ def clean_tagged_script_text(value: str) -> tuple[str, int]:
     if count:
         text = text.translate(TAGGED_SCRIPT_INVISIBLE_TRANSLATION)
     return text, count
+
+
+
+
+def _bounded_float(value: Any, default: float, low: float, high: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    if not math.isfinite(number):
+        number = default
+    return max(low, min(high, number))
+
+
+def _bounded_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(low, min(high, number))
+
+
+def _option_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def normalize_chatterbox_turbo_options(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    seed_raw = raw.get("seed")
+    seed: int | None
+    if seed_raw is None or str(seed_raw).strip() == "":
+        seed = None
+    else:
+        seed = _bounded_int(seed_raw, 0, 0, 2_147_483_647)
+    return {
+        "temperature": _bounded_float(raw.get("temperature"), 0.8, 0.05, 2.0),
+        "repetition_penalty": _bounded_float(raw.get("repetition_penalty"), 1.2, 0.5, 3.0),
+        "top_p": _bounded_float(raw.get("top_p"), 0.95, 0.05, 1.0),
+        "top_k": _bounded_int(raw.get("top_k"), 1000, 1, 5000),
+        "seed": seed,
+        "norm_loudness": _option_bool(raw.get("norm_loudness"), True),
+    }
+
+
+def normalize_performance_style(value: Any) -> str:
+    style = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return style if style in CHATTERBOX_TURBO_PERFORMANCE_STYLES else ""
+
+
+def split_leading_performance_style(text: str) -> tuple[str, str]:
+    match = CHATTERBOX_LEADING_TAG_RE.match(str(text or ""))
+    if not match:
+        return "", str(text or "").strip()
+    candidate = normalize_performance_style(match.group(1))
+    if not candidate:
+        return "", str(text or "").strip()
+    return candidate, match.group(2).strip()
+
+
+def parse_tagged_script_dialogue(script: str) -> tuple[list[dict[str, Any]], list[str]]:
+    lines: list[dict[str, Any]] = []
+    errors: list[str] = []
+    active_style = ""
+    active_style_line = 0
+
+    for line_number, raw in enumerate(str(script or "").splitlines(), start=1):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+
+        tag_only = CHATTERBOX_TAG_ONLY_RE.match(stripped)
+        if tag_only:
+            closing = bool(tag_only.group(1))
+            name = re.sub(r"\s+", " ", tag_only.group(2).strip().lower())
+            if name not in CHATTERBOX_TURBO_PERFORMANCE_STYLES:
+                if name in CHATTERBOX_TURBO_VOCAL_EVENTS:
+                    errors.append(f"line {line_number}: vocal event [{name}] must be positioned inside a speaker line")
+                else:
+                    errors.append(f"line {line_number}: unsupported Chatterbox-Turbo tag [{('/' if closing else '')}{name}]")
+                continue
+            if closing:
+                if not active_style:
+                    errors.append(f"line {line_number}: closing [/{name}] has no open performance block")
+                elif active_style != name:
+                    errors.append(f"line {line_number}: closing [/{name}] does not match open [{active_style}] from line {active_style_line}")
+                    active_style = ""
+                    active_style_line = 0
+                else:
+                    active_style = ""
+                    active_style_line = 0
+            else:
+                if active_style:
+                    errors.append(f"line {line_number}: nested performance block [{name}] is not allowed while [{active_style}] is open")
+                else:
+                    active_style = name
+                    active_style_line = line_number
+            continue
+
+        match = ROLE_LINE.match(raw)
+        if not match:
+            continue
+        role, spoken_text = match.group(1).strip(), match.group(2).strip()
+        if not spoken_text:
+            continue
+
+        style = active_style
+        leading_style, remainder = split_leading_performance_style(spoken_text)
+        if leading_style:
+            style = leading_style
+            spoken_text = remainder
+
+        for tag_match in CHATTERBOX_TAG_RE.finditer(spoken_text):
+            closing = bool(tag_match.group(1))
+            tag_name = re.sub(r"\s+", " ", tag_match.group(2).strip().lower())
+            if tag_name not in CHATTERBOX_TURBO_PERFORMANCE_STYLES and tag_name not in CHATTERBOX_TURBO_VOCAL_EVENTS:
+                errors.append(f"line {line_number}: unsupported Chatterbox-Turbo tag {tag_match.group(0)}")
+            elif closing:
+                errors.append(f"line {line_number}: closing performance tags belong on their own line, not inside dialogue")
+            elif tag_name in CHATTERBOX_TURBO_PERFORMANCE_STYLES:
+                errors.append(f"line {line_number}: performance tag [{tag_name}] must lead the line or open a standalone block")
+
+        if not spoken_text:
+            errors.append(f"line {line_number}: performance tag has no spoken text")
+            continue
+        words = len(re.findall(r"\b\w+\b", CHATTERBOX_TAG_RE.sub(" ", spoken_text)))
+        units = max(1, words) + 8
+        lines.append({
+            "role": role,
+            "text": spoken_text,
+            "spoken_text": spoken_text,
+            "performance_style": style,
+            "words": words,
+            "units": units,
+            "source_line": line_number,
+        })
+
+    if active_style:
+        errors.append(f"line {active_style_line}: performance block [{active_style}] was not closed with [/{active_style}]")
+    return lines, errors
 
 
 def now() -> float:
@@ -3786,6 +3946,11 @@ class JobManager:
         ref_text = str(payload.get("ref_text", "")).strip()
         x_vector_only = bool(payload.get("x_vector_only", engine == "qwen3"))
 
+        if engine == "chatterbox":
+            style = normalize_performance_style(payload.get("performance_style"))
+            if style and not text.lower().startswith(f"[{style}]"):
+                text = f"[{style}] {text}"
+
         cmd = [str(LAUNCHER), "synth", engine, "--text", text, "--ref", ref, "--out", str(output)]
         # Qwen3 x-vector-only mode is meant to avoid depending on the exact
         # reference transcript. Do not pass --ref-text in that mode; earlier
@@ -3794,6 +3959,18 @@ class JobManager:
             cmd += ["--ref-text", ref_text]
         if engine == "qwen3" and x_vector_only:
             cmd += ["--x-vector-only"]
+        if engine == "chatterbox":
+            options = normalize_chatterbox_turbo_options(payload.get("engine_options"))
+            cmd += [
+                "--temperature", f"{options['temperature']:g}",
+                "--repetition-penalty", f"{options['repetition_penalty']:g}",
+                "--top-p", f"{options['top_p']:g}",
+                "--top-k", str(options["top_k"]),
+            ]
+            if options["seed"] is not None:
+                cmd += ["--seed", str(options["seed"])]
+            if not options["norm_loudness"]:
+                cmd += ["--no-norm-loudness"]
         return cmd
 
     def _run_subprocess(self, job: Job, cmd: list[str], cwd: Path | None = None) -> int:
@@ -4596,6 +4773,15 @@ class JobManager:
         engine = str(payload.get("engine", "")).strip().lower()
         role = str(payload.get("role", "single")).strip() or "single"
         text = str(payload.get("text", "")).strip()
+        if engine == "chatterbox":
+            payload = dict(payload)
+            leading_style, spoken_text = split_leading_performance_style(text)
+            if leading_style:
+                payload["performance_style"] = leading_style
+                payload["spoken_text"] = spoken_text
+                payload["text"] = spoken_text
+                text = spoken_text
+            payload["engine_options"] = normalize_chatterbox_turbo_options(payload.get("engine_options"))
         output = Path(str(payload.get("output") or unique_wav(f"{role}_{engine}")))
         self._set(job, status="running", started_at=now(), engine=engine, role=role, text=text, output=str(output))
         chunks = split_synthesis_text(text)
@@ -5241,7 +5427,13 @@ class JobManager:
             raise ValueError(f"Line {line_index} was not found in the manifest.")
 
         role = str(payload.get("role") or item.get("role") or "LINE").strip() or "LINE"
-        text_value = str(payload.get("text") if payload.get("text") is not None else item.get("text") or "").strip()
+        text_value = str(payload.get("spoken_text") if payload.get("spoken_text") is not None else (payload.get("text") if payload.get("text") is not None else item.get("spoken_text") or item.get("text") or "")).strip()
+        explicit_style = payload.get("performance_style") if "performance_style" in payload else item.get("performance_style")
+        performance_style = normalize_performance_style(explicit_style)
+        leading_style, text_without_style = split_leading_performance_style(text_value)
+        if leading_style:
+            performance_style = leading_style
+            text_value = text_without_style
         if not text_value:
             raise ValueError("Line text is required for Tagged Script take regeneration.")
         engine = str(payload.get("engine") or item.get("engine") or "chatterbox").strip().lower()
@@ -5258,6 +5450,8 @@ class JobManager:
         ref = str(payload.get("ref") or (profile or {}).get("audio_path") or item.get("ref") or DEFAULT_REF)
         ref_text = str(payload.get("ref_text") or (profile or {}).get("transcript") or item.get("ref_text") or "")
         x_vector_only = bool(payload.get("x_vector_only", item.get("x_vector_only", engine == "qwen3")))
+        raw_engine_options = payload.get("engine_options") if isinstance(payload.get("engine_options"), dict) else item.get("engine_options")
+        engine_options = normalize_chatterbox_turbo_options(raw_engine_options) if engine == "chatterbox" else (raw_engine_options if isinstance(raw_engine_options, dict) else {})
         take_id = tagged_take_id("take")
         take_dir = manifest_path.parent / "takes"
         take_dir.mkdir(parents=True, exist_ok=True)
@@ -5266,11 +5460,13 @@ class JobManager:
             "engine": engine,
             "role": role,
             "text": text_value,
+            "spoken_text": text_value,
+            "performance_style": performance_style,
             "ref": ref,
             "ref_text": ref_text,
             "x_vector_only": x_vector_only,
             "profile": profile_slug,
-            "engine_options": {},
+            "engine_options": engine_options,
             "tagged_script_take": {
                 "manifest": str(manifest_path),
                 "line_index": line_index,
@@ -5313,12 +5509,14 @@ class JobManager:
             "index": line_index,
             "role": role,
             "text": text_value,
+            "spoken_text": text_value,
+            "performance_style": performance_style,
             "engine": engine,
             "profile": profile_slug,
             "ref": ref,
             "ref_text": ref_text,
             "x_vector_only": x_vector_only,
-            "engine_options": {},
+            "engine_options": engine_options,
             "output": str(output),
             "audio_url": preview_url_for(output) if output.exists() else "",
             "preview_url": preview_url_for(output) if output.exists() else "",
@@ -5636,18 +5834,11 @@ class JobManager:
         default_ref = str(payload.get("default_ref", str(DEFAULT_REF)))
         default_ref_text = str(payload.get("default_ref_text", ""))
         default_x_vector = bool(payload.get("default_x_vector_only", True))
+        default_engine_options = payload.get("default_engine_options") if isinstance(payload.get("default_engine_options"), dict) else {}
 
-        lines: list[dict[str, Any]] = []
-        for raw in script.splitlines():
-            match = ROLE_LINE.match(raw)
-            if not match:
-                continue
-            role, text = match.group(1).strip(), match.group(2).strip()
-            if text:
-                words = len(re.findall(r"\b\w+\b", text))
-                # A fixed per-line overhead keeps short interjections from making ETA wildly optimistic.
-                units = max(1, words) + 8
-                lines.append({"role": role, "text": text, "words": words, "units": units})
+        lines, tag_errors = parse_tagged_script_dialogue(script)
+        if tag_errors:
+            raise ValueError("Tagged Script performance-tag errors: " + " | ".join(tag_errors[:12]))
         if not lines:
             raise ValueError("No tagged lines found. Use ROLE: dialogue")
 
@@ -5717,7 +5908,12 @@ class JobManager:
                 self._mark_canceled(job)
                 return
             role = str(item_meta["role"])
-            text = str(item_meta["text"])
+            spoken_text = str(item_meta.get("spoken_text") or item_meta["text"])
+            # Compatibility alias: the mature batch renderer still has a few
+            # local references to `text`; v0.97 stores the authoritative value
+            # in `spoken_text`.
+            text = spoken_text
+            performance_style = normalize_performance_style(item_meta.get("performance_style"))
             cfg = role_map.get(role) or role_map.get(role.upper()) or role_map.get(role.lower()) or {}
             if not isinstance(cfg, dict):
                 cfg = {}
@@ -5727,22 +5923,29 @@ class JobManager:
             ref = str(cfg.get("ref") or (profile or {}).get("audio_path") or default_ref)
             ref_text = str(cfg.get("ref_text") or (profile or {}).get("transcript") or default_ref_text)
             x_vector_only = bool(cfg.get("x_vector_only", default_x_vector))
+            raw_engine_options = dict(default_engine_options)
+            if isinstance(cfg.get("engine_options"), dict):
+                raw_engine_options.update(cfg.get("engine_options") or {})
+            engine_options = normalize_chatterbox_turbo_options(raw_engine_options) if engine == "chatterbox" else raw_engine_options
             output = batch_dir / f"{idx:03d}_{safe_slug(role)}_{engine}.wav"
             line_payload = {
                 "engine": engine,
                 "role": role,
-                "text": text,
+                "text": spoken_text,
+                "spoken_text": spoken_text,
+                "performance_style": performance_style,
                 "ref": ref,
                 "ref_text": ref_text,
                 "x_vector_only": x_vector_only,
                 "profile": profile_slug,
+                "engine_options": engine_options,
             }
             current = {
                 "index": idx,
                 "role": role,
                 "engine": engine,
                 "words": item_meta["words"],
-                "text": text,
+                "text": spoken_text,
             }
             self._set(job, result={"kind": "tagged-script-batch", "progress": progress_payload(idx - 1, "rendering", current)})
             self._append_log(job, f"\n=== {idx:03d}/{total_lines:03d} {role} via {engine} ({item_meta['words']} words) ===\n")
@@ -5765,7 +5968,9 @@ class JobManager:
                 "role": role,
                 "engine": engine,
                 "profile": profile_slug,
-                "text": text,
+                "text": spoken_text,
+                "spoken_text": spoken_text,
+                "performance_style": performance_style,
                 "word_count": int(item_meta["words"]),
                 "weighted_units": int(item_meta["units"]),
                 "output": str(output),
@@ -5778,7 +5983,7 @@ class JobManager:
                 "ref": ref,
                 "ref_text": ref_text,
                 "x_vector_only": x_vector_only,
-                "engine_options": {},
+                "engine_options": engine_options,
                 "take_id": "take-1",
                 "selected_take_id": "take-1" if ok else "",
                 "selected_output": str(output) if ok else "",
@@ -5786,13 +5991,15 @@ class JobManager:
                     "take_id": "take-1",
                     "index": idx,
                     "role": role,
-                    "text": text,
+                    "text": spoken_text,
+                    "spoken_text": spoken_text,
+                    "performance_style": performance_style,
                     "engine": engine,
                     "profile": profile_slug,
                     "ref": ref,
                     "ref_text": ref_text,
                     "x_vector_only": x_vector_only,
-                    "engine_options": {},
+                    "engine_options": engine_options,
                     "output": str(output),
                     "audio_url": preview_url_for(output) if output.exists() else "",
                     "preview_url": preview_url_for(output) if output.exists() else "",
@@ -6072,6 +6279,31 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
       <button class="mini secondary" onclick="clearRememberedForm()">clear remembered form</button>
       <label class="pref-advanced"><input id="xVector" type="checkbox" checked /> Qwen3 x-vector-only mode</label>
       <label class="pref-advanced"><input id="splitLong" type="checkbox" checked /> Split Chatterbox multi-sentence text into chunks and concatenate</label>
+      <div id="chatterboxTurboControls" class="role-builder">
+        <h3>Chatterbox-Turbo performance</h3>
+        <div class="row3">
+          <div><label>Temperature</label><input id="cbTemperature" type="number" min="0.05" max="2" step="0.05" value="0.8" /><div class="small">Higher permits more varied sampling.</div></div>
+          <div><label>Repetition penalty</label><input id="cbRepetitionPenalty" type="number" min="0.5" max="3" step="0.05" value="1.2" /><div class="small">Higher discourages repeated speech tokens.</div></div>
+          <div><label>Top-p</label><input id="cbTopP" type="number" min="0.05" max="1" step="0.01" value="0.95" /><div class="small">Lower keeps sampling more conservative.</div></div>
+        </div>
+        <details class="pref-advanced">
+          <summary>Advanced sampling and reproducibility</summary>
+          <div class="row3">
+            <div><label>Top-k</label><input id="cbTopK" type="number" min="1" max="5000" step="1" value="1000" /></div>
+            <div><label>Seed (blank = random)</label><input id="cbSeed" type="number" min="0" max="2147483647" step="1" placeholder="random" /></div>
+            <div><label>&nbsp;</label><label class="small"><input id="cbIncrementSeed" type="checkbox" checked /> Increment seed for queued takes</label></div>
+          </div>
+          <label><input id="cbNormLoudness" type="checkbox" checked /> Normalize reference loudness before conditioning</label>
+        </details>
+        <div class="inline-tools">
+          <select id="synthPerformanceTag" style="width:auto"><option value="">performance style...</option></select>
+          <button class="mini secondary" type="button" onclick="insertSynthPerformanceTag()">Insert style</button>
+          <select id="synthVocalEventTag" style="width:auto"><option value="">vocal event...</option></select>
+          <button class="mini secondary" type="button" onclick="insertSynthVocalEventTag()">Insert event</button>
+          <button class="mini secondary" type="button" onclick="resetChatterboxTurboControls()">Reset Turbo defaults</button>
+        </div>
+        <div class="small">Turbo supports temperature, repetition penalty, top-p, top-k, loudness normalization, and optional deterministic seeding. CFG, min-p, and exaggeration are intentionally omitted because Turbo ignores them.</div>
+      </div>
       <label>Text to synthesize</label>
       <textarea id="text" placeholder="Your line here."></textarea>
       <label>Queue takes
@@ -6121,6 +6353,14 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 TUCKER: The logs say three engines work and one is pretending to be a software landmine.
 ANALYST: I can provide fourteen implementation paths.
 EXEC: Pick one.</textarea>
+      <div class="inline-tools">
+        <select id="scriptPerformanceTag" style="width:auto"><option value="">performance style...</option></select>
+        <button class="mini secondary" type="button" onclick="insertScriptInlineStyle()">Insert inline style</button>
+        <button class="mini secondary" type="button" onclick="wrapScriptStyleBlock()">Wrap selection as block</button>
+        <select id="scriptVocalEventTag" style="width:auto"><option value="">vocal event...</option></select>
+        <button class="mini secondary" type="button" onclick="insertScriptVocalEvent()">Insert event</button>
+      </div>
+      <div class="small">Styles may lead one speaker line or wrap consecutive lines with standalone opening/closing tags. Vocal events remain at their exact position inside dialogue.</div>
       <div id="batchPreflightStatus" class="small inline-status"></div>
       <label>Default engine</label>
       <select id="defaultEngine"></select>
@@ -9811,7 +10051,7 @@ api('/api/meta').then(setupEngines).then(loadAll).then(restoreFormState).then(re
       x_vector_only: $('xVector').checked,
       split_on_sentences: $('splitLong').checked,
       text: $('text').value,
-      engine_options: Object.freeze({}),
+      engine_options: Object.freeze(window.collectChatterboxTurboOptions ? window.collectChatterboxTurboOptions() : {}),
     });
   }
 
@@ -9896,7 +10136,12 @@ api('/api/meta').then(setupEngines).then(loadAll).then(restoreFormState).then(re
 
     const requests = [];
     for (let takeNumber = 1; takeNumber <= count; takeNumber += 1) {
-      const requestBody = JSON.stringify(requestSnapshot);
+      const effectiveOptions = Object.assign({}, requestSnapshot.engine_options || {});
+      if (requestSnapshot.engine === 'chatterbox' && effectiveOptions.seed !== null && effectiveOptions.seed !== undefined && window.chatterboxIncrementSeedEnabled && window.chatterboxIncrementSeedEnabled()) {
+        effectiveOptions.seed = Math.min(2147483647, Number(effectiveOptions.seed) + takeNumber - 1);
+      }
+      const takeSnapshot = Object.assign({}, requestSnapshot, {engine_options: effectiveOptions});
+      const requestBody = JSON.stringify(takeSnapshot);
       requests.push(
         api('/api/generate', {method: 'POST', body: requestBody})
           .then(response => {
@@ -9982,6 +10227,239 @@ api('/api/meta').then(setupEngines).then(loadAll).then(restoreFormState).then(re
   }).catch(error => {
     logUiEvent('could not restore Synthesize queue count', {error: String(error)}, 'warn');
   }).finally(attachQueueStateHandler);
+})();
+</script>
+
+<script>
+// HandAI TTS Lab v0.97 — Chatterbox-Turbo controls and performance tags
+(() => {
+  const PERFORMANCE_STYLES = ['advertisement','angry','crying','dramatic','fear','happy','narration','sarcastic','surprised','whispering'];
+  const VOCAL_EVENTS = ['chuckle','clear throat','cough','gasp','groan','laugh','shush','sigh','sniff'];
+  const DEFAULTS = {temperature:0.8,repetition_penalty:1.2,top_p:0.95,top_k:1000,seed:null,norm_loudness:true};
+
+  function numberValue(id, fallback, min, max){
+    const n = Number(readFieldValue(id, String(fallback)));
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+  }
+  function seedValue(id='cbSeed'){
+    const raw = readFieldValue(id, '').trim();
+    if(!raw) return null;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) ? Math.max(0, Math.min(2147483647, n)) : null;
+  }
+  window.collectChatterboxTurboOptions = function(prefix='cb'){
+    const id = suffix => prefix + suffix;
+    return {
+      temperature:numberValue(id('Temperature'), DEFAULTS.temperature, 0.05, 2),
+      repetition_penalty:numberValue(id('RepetitionPenalty'), DEFAULTS.repetition_penalty, 0.5, 3),
+      top_p:numberValue(id('TopP'), DEFAULTS.top_p, 0.05, 1),
+      top_k:Math.round(numberValue(id('TopK'), DEFAULTS.top_k, 1, 5000)),
+      seed:seedValue(id('Seed')),
+      norm_loudness:readFieldChecked(id('NormLoudness'), true),
+    };
+  };
+  window.chatterboxIncrementSeedEnabled = function(){ return readFieldChecked('cbIncrementSeed', true); };
+  window.resetChatterboxTurboControls = function(){
+    setFieldValue('cbTemperature', DEFAULTS.temperature);
+    setFieldValue('cbRepetitionPenalty', DEFAULTS.repetition_penalty);
+    setFieldValue('cbTopP', DEFAULTS.top_p);
+    setFieldValue('cbTopK', DEFAULTS.top_k);
+    setFieldValue('cbSeed', '');
+    setFieldChecked('cbIncrementSeed', true);
+    setFieldChecked('cbNormLoudness', true);
+    saveTurboControlState();
+    logUiEvent('Chatterbox-Turbo controls reset to engine defaults');
+  };
+
+  function fillTagSelect(id, values){
+    const select=$(id); if(!select) return;
+    const first=select.options.length ? select.options[0].outerHTML : '<option value="">choose...</option>';
+    select.innerHTML=first + values.map(v=>`<option value="${esc(v)}">[${esc(v)}]</option>`).join('');
+  }
+  function insertAtCursor(id, value){
+    const el=$(id); if(!el) return;
+    const start=Number.isFinite(el.selectionStart)?el.selectionStart:el.value.length;
+    const end=Number.isFinite(el.selectionEnd)?el.selectionEnd:start;
+    el.value=el.value.slice(0,start)+value+el.value.slice(end);
+    el.focus(); el.selectionStart=el.selectionEnd=start+value.length;
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+  }
+  window.insertSynthPerformanceTag=function(){ const tag=readFieldValue('synthPerformanceTag',''); if(tag) insertAtCursor('text',`[${tag}] `); };
+  window.insertSynthVocalEventTag=function(){ const tag=readFieldValue('synthVocalEventTag',''); if(tag) insertAtCursor('text',`[${tag}] `); };
+  window.insertScriptInlineStyle=function(){ const tag=readFieldValue('scriptPerformanceTag',''); if(tag) insertAtCursor('script',`[${tag}] `); };
+  window.insertScriptVocalEvent=function(){ const tag=readFieldValue('scriptVocalEventTag',''); if(tag) insertAtCursor('script',`[${tag}] `); };
+  window.wrapScriptStyleBlock=function(){
+    const tag=readFieldValue('scriptPerformanceTag',''); const el=$('script'); if(!tag||!el) return;
+    const start=Number.isFinite(el.selectionStart)?el.selectionStart:el.value.length;
+    const end=Number.isFinite(el.selectionEnd)?el.selectionEnd:start;
+    const selected=el.value.slice(start,end);
+    const body=selected || 'ROLE: Dialogue';
+    const value=`[${tag}]\n${body}\n[/${tag}]`;
+    el.value=el.value.slice(0,start)+value+el.value.slice(end);
+    el.focus(); el.selectionStart=start; el.selectionEnd=start+value.length;
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+  };
+
+  function updateTurboVisibility(){
+    const show=readFieldValue('engine','chatterbox')==='chatterbox';
+    const panel=$('chatterboxTurboControls'); if(panel) panel.classList.toggle('hidden',!show);
+  }
+  const oldUpdateEngineNote=window.updateEngineNote;
+  window.updateEngineNote=function(){ if(oldUpdateEngineNote) oldUpdateEngineNote(); updateTurboVisibility(); };
+
+  function saveTurboControlState(){
+    try{
+      localStorage.setItem('ttsLabChatterboxTurboV097',JSON.stringify({
+        options:collectChatterboxTurboOptions(),
+        increment_seed:readFieldChecked('cbIncrementSeed',true)
+      }));
+    }catch(e){}
+    scheduleFormStateSave();
+  }
+  function restoreTurboControlState(){
+    try{
+      const state=JSON.parse(localStorage.getItem('ttsLabChatterboxTurboV097')||'{}');
+      const o=state.options||{};
+      setFieldValue('cbTemperature',o.temperature??DEFAULTS.temperature);
+      setFieldValue('cbRepetitionPenalty',o.repetition_penalty??DEFAULTS.repetition_penalty);
+      setFieldValue('cbTopP',o.top_p??DEFAULTS.top_p);
+      setFieldValue('cbTopK',o.top_k??DEFAULTS.top_k);
+      setFieldValue('cbSeed',o.seed===null||o.seed===undefined?'':o.seed);
+      setFieldChecked('cbNormLoudness',o.norm_loudness!==false);
+      setFieldChecked('cbIncrementSeed',state.increment_seed!==false);
+    }catch(e){ logUiEvent('could not restore Chatterbox-Turbo control state',{error:String(e)},'warn'); }
+  }
+
+  const oldGenerateBatch=window.generateBatch;
+  window.generateBatch=function generateBatchV097(){
+    let roleMap={}; try{ roleMap=JSON.parse($('roleMap').value||'{}'); }catch(e){ setGenerateStatus('batchActionStatus','Role map JSON is invalid: '+e,'bad'); return; }
+    let script=$('script').value||'';
+    const cleaned=cleanTaggedScriptText(script);
+    if(cleaned.invisibleCount){ script=cleaned.text; $('script').value=script; updateTaggedScriptPreflight(); }
+    if(!script.trim()){ setGenerateStatus('batchActionStatus','Paste or type a tagged script first.','bad'); return; }
+    const info=taggedScriptPreflightInfo(script);
+    if(info.tagErrors && info.tagErrors.length){ setGenerateStatus('batchActionStatus','Fix performance-tag errors before generating: '+info.tagErrors.join(' | '),'bad'); return; }
+    const body={
+      script, role_map:roleMap,
+      default_engine:$('defaultEngine').value,
+      default_ref:$('ref').value,
+      default_ref_text:$('refText').value,
+      default_x_vector_only:true,
+      default_engine_options:collectChatterboxTurboOptions(),
+      assemble_mixdown:readFieldChecked('batchAssembleMixdown',true),
+      mixdown_format:readFieldValue('batchMixdownFormat','mp3'),
+      line_gap_seconds:readFieldValue('batchLineGap','0.35')
+    };
+    setButtonBusy('batchGenerateButton',true);
+    setGenerateStatus('batchActionStatus','<span class="warn">Queueing tagged script job...</span>'+openJobsButtonHtml());
+    saveFormStateNow();
+    api('/api/batch',{method:'POST',body:JSON.stringify(body)})
+      .then(r=>{ currentBatchJobId=r.job&&r.job.id; setGenerateStatus('batchActionStatus',queuedJobStatus('tagged script',r.job||r)); lastJobsSig=''; refreshJobs(); startPoll(); })
+      .catch(err=>{ currentBatchJobId=null; setButtonBusy('batchGenerateButton',false); setGenerateStatus('batchActionStatus','Could not queue tagged script job: '+err,'bad'); });
+  };
+
+  window.taggedScriptPreflightInfo=function taggedScriptPreflightInfoV097(scriptOverride=null){
+    const raw=scriptOverride===null?readFieldValue('script',''):String(scriptOverride||'');
+    const cleaned=cleanTaggedScriptText(raw);
+    const roleRe=/^\s*([A-Za-z][A-Za-z0-9_ -]{0,31})\s*:\s*(.+?)\s*$/;
+    const tagOnly=/^\s*\[(\/?)([A-Za-z][A-Za-z ]{0,31})\]\s*$/;
+    const leading=/^\s*\[([A-Za-z][A-Za-z ]{0,31})\]\s*(.*)$/;
+    const allTags=/\[(\/?)([A-Za-z][A-Za-z ]{0,31})\]/g;
+    const styleSet=new Set(PERFORMANCE_STYLES), eventSet=new Set(VOCAL_EVENTS);
+    const roles=[], roleCounts={}, lines=[], tagErrors=[], stylesUsed=new Set(), eventsUsed=new Set();
+    let activeStyle='', activeLine=0;
+    cleaned.text.split(/\r?\n/).forEach((rawLine,index)=>{
+      const lineNo=index+1, stripped=rawLine.trim(); if(!stripped) return;
+      const only=stripped.match(tagOnly);
+      if(only){
+        const closing=!!only[1], name=only[2].trim().toLowerCase().replace(/\s+/g,' ');
+        if(!styleSet.has(name)){ tagErrors.push(`line ${lineNo}: ${eventSet.has(name)?'vocal event must be inside dialogue':'unsupported tag'} ${only[0]}`); return; }
+        if(closing){
+          if(!activeStyle) tagErrors.push(`line ${lineNo}: closing [/${name}] has no open block`);
+          else if(activeStyle!==name){ tagErrors.push(`line ${lineNo}: [/${name}] does not match [${activeStyle}] from line ${activeLine}`); activeStyle=''; activeLine=0; }
+          else { activeStyle=''; activeLine=0; }
+        } else if(activeStyle) tagErrors.push(`line ${lineNo}: nested [${name}] block is not allowed while [${activeStyle}] is open`);
+        else { activeStyle=name; activeLine=lineNo; stylesUsed.add(name); }
+        return;
+      }
+      const m=rawLine.match(roleRe); if(!m) return;
+      const role=m[1].trim(); let spoken=m[2].trim(); let style=activeStyle;
+      const lead=spoken.match(leading);
+      if(lead){ const candidate=lead[1].trim().toLowerCase().replace(/\s+/g,' '); if(styleSet.has(candidate)){ style=candidate; spoken=lead[2].trim(); stylesUsed.add(candidate); } }
+      for(const tm of spoken.matchAll(allTags)){
+        const name=tm[2].trim().toLowerCase().replace(/\s+/g,' ');
+        if(eventSet.has(name)) eventsUsed.add(name);
+        else if(!styleSet.has(name)) tagErrors.push(`line ${lineNo}: unsupported tag ${tm[0]}`);
+        else if(tm[1]) tagErrors.push(`line ${lineNo}: closing performance tag must be on its own line`);
+        else tagErrors.push(`line ${lineNo}: performance tag [${name}] must lead the line or open a block`);
+      }
+      if(!roleCounts[role]) roles.push(role);
+      roleCounts[role]=(roleCounts[role]||0)+1;
+      lines.push({role,text:spoken,performance_style:style});
+    });
+    if(activeStyle) tagErrors.push(`line ${activeLine}: [${activeStyle}] block is not closed`);
+    let roleMap={},roleMapError=''; try{ roleMap=JSON.parse(readFieldValue('roleMap','{}')||'{}')||{}; }catch(e){ roleMapError=String(e); }
+    const hasRoleMap=role=>!!(roleMap&&typeof roleMap==='object'&&(roleMap[role]||roleMap[role.toUpperCase()]||roleMap[role.toLowerCase()]));
+    const unmapped=roles.filter(r=>!hasRoleMap(r));
+    return {invisibleCount:cleaned.invisibleCount,cleanedText:cleaned.text,lineCount:lines.length,roles,roleCounts,unmapped,roleMapError,defaultEngine:readFieldValue('defaultEngine','chatterbox'),tagErrors,stylesUsed:[...stylesUsed],eventsUsed:[...eventsUsed]};
+  };
+  window.updateTaggedScriptPreflight=function updateTaggedScriptPreflightV097(){
+    const el=$('batchPreflightStatus'); if(!el) return;
+    const info=taggedScriptPreflightInfo(),parts=[];
+    if(info.invisibleCount) parts.push(`<span class="warn">${esc(info.invisibleCount)} invisible Unicode marker(s) detected; they will be stripped.</span>`);
+    if(info.roleMapError) parts.push(`<span class="bad">Role map JSON is invalid: ${esc(info.roleMapError)}</span>`);
+    if(info.tagErrors.length) parts.push(`<span class="bad">Performance-tag errors: ${esc(info.tagErrors.join(' | '))}</span>`);
+    if(info.lineCount) parts.push(`<span class="ok">Detected ${esc(info.lineCount)} tagged line(s) across ${esc(info.roles.length)} role(s): ${esc(info.roles.join(', '))}</span>`);
+    else parts.push('<span class="warn">No tagged lines detected yet. Use ROLE: dialogue.</span>');
+    if(info.stylesUsed.length||info.eventsUsed.length) parts.push(`<span class="ok">Turbo directions: ${esc(info.stylesUsed.length?('styles '+info.stylesUsed.join(', ')):'no styles')}; ${esc(info.eventsUsed.length?('events '+info.eventsUsed.join(', ')):'no vocal events')}.</span>`);
+    if(info.unmapped.length){ parts.push(`<span class="warn">Unmapped role(s) will use Default engine <b>${esc(info.defaultEngine)}</b>: ${esc(info.unmapped.join(', '))}</span>`); }
+    el.innerHTML=parts.join('<br>');
+  };
+
+  function takeOptions(prefix, base={}){
+    const o=base&&typeof base==='object'?base:{};
+    return `<div class="row3 chatterbox-take-options" data-prefix="${esc(prefix)}">
+      <div><label>Performance style</label><select id="${esc(prefix+'Style')}"><option value="">none / inherit</option>${PERFORMANCE_STYLES.map(v=>`<option value="${esc(v)}"${v===(base.performance_style||'')?' selected':''}>[${esc(v)}]</option>`).join('')}</select></div>
+      <div><label>Temperature</label><input id="${esc(prefix+'Temperature')}" type="number" min="0.05" max="2" step="0.05" value="${esc(o.temperature??0.8)}" /></div>
+      <div><label>Repetition penalty</label><input id="${esc(prefix+'RepetitionPenalty')}" type="number" min="0.5" max="3" step="0.05" value="${esc(o.repetition_penalty??1.2)}" /></div>
+      <div><label>Top-p</label><input id="${esc(prefix+'TopP')}" type="number" min="0.05" max="1" step="0.01" value="${esc(o.top_p??0.95)}" /></div>
+      <div><label>Top-k</label><input id="${esc(prefix+'TopK')}" type="number" min="1" max="5000" step="1" value="${esc(o.top_k??1000)}" /></div>
+      <div><label>Seed (blank = random)</label><input id="${esc(prefix+'Seed')}" type="number" min="0" max="2147483647" value="${o.seed===null||o.seed===undefined?'':esc(o.seed)}" /></div>
+      <label class="small"><input id="${esc(prefix+'NormLoudness')}" type="checkbox"${o.norm_loudness===false?'':' checked'} /> Normalize reference loudness</label>
+    </div>`;
+  }
+  window.batchLineTakesBlock=function batchLineTakesBlockV097(j,c){
+    const manifest=(j&&(j.manifest||(j.result&&j.result.manifest)))||''; if(!manifest||!c||!c.index) return '';
+    const takes=takeListForLine(c),selected=takes.find(t=>t.selected)||takes[0]||{};
+    const idText=takeLineControlId(j.id,c.index,'text'),idEngine=takeLineControlId(j.id,c.index,'engine'),idProfile=takeLineControlId(j.id,c.index,'profile'),idXvec=takeLineControlId(j.id,c.index,'xvec'),idStatus=takeLineControlId(j.id,c.index,'status');
+    const prefix=takeLineControlId(j.id,c.index,'cb');
+    const baseOptions=Object.assign({},c.engine_options||selected.engine_options||{}, {performance_style:c.performance_style||selected.performance_style||''});
+    const takeRows=takes.map((t,n)=>{
+      const ok=t.ok?'ok':'bad',sel=t.selected?'<span class="pill ok">selected for mixdown</span>':'';
+      const audio=t.audio_url?`<audio controls preload="none" src="${esc(t.preview_url||t.audio_url)}"></audio>${durationBadge(t.duration_seconds,false)}`:'<span class="bad">no audio</span>';
+      const choose=(t.ok&&!t.selected)?`<button class="mini secondary" type="button" onclick="selectBatchLineTake(${jsAttr(manifest)},${Number(c.index)||0},${jsAttr(t.take_id||'')},${jsAttr(idStatus)})">Use this take in mixdown</button>`:'';
+      const options=t.engine_options&&Object.keys(t.engine_options).length?` · options <code>${esc(JSON.stringify(t.engine_options))}</code>`:'';
+      return `<div class="card"><b>Take ${esc(n+1)}</b> ${sel} <span class="${ok}">${t.ok?'ready':'failed'}</span><div class="small">Engine: <code>${esc(t.engine||'')}</code>${t.performance_style?` · style <code>[${esc(t.performance_style)}]</code>`:''}${options}</div><div class="small">${esc((t.spoken_text||t.text||'').slice(0,220))}</div>${audio}<div class="inline-tools">${choose}${t.output?outputActions(t.output,t.spoken_text||t.text||c.text,(j.id||'batch')+'-'+c.index+'-'+(t.take_id||n)):''}</div></div>`;
+    }).join('');
+    return `<details class="meta-panel take-manager"><summary>Take manager — ${esc(takes.length)} take${takes.length===1?'':'s'}; selected ${esc(selected.take_id||'none')}</summary><div class="small">Regenerated takes are saved as alternates and do not replace the selected mixdown take until chosen.</div><label>Edit text for a new take</label><textarea id="${esc(idText)}" style="min-height:80px">${esc(c.spoken_text||c.text||'')}</textarea><div class="row3"><div><label>Engine for new take</label><select id="${esc(idEngine)}">${engineOptionsHtml(c.engine||'')}</select></div><div><label>Profile for new take</label><select id="${esc(idProfile)}">${takeSelectProfileOptions(c.profile||'')}</select></div><div><label>&nbsp;</label><label class="small"><input id="${esc(idXvec)}" type="checkbox"${c.x_vector_only?' checked':''} /> Qwen x-vector</label></div></div>${takeOptions(prefix,baseOptions)}<div class="inline-tools"><button class="mini secondary" type="button" onclick="queueBatchLineTake(${jsAttr(manifest)},${Number(c.index)||0},${jsAttr(idText)},${jsAttr(idEngine)},${jsAttr(idProfile)},${jsAttr(idXvec)},${jsAttr(idStatus)},${jsAttr(prefix)})">Generate alternate take</button><span id="${esc(idStatus)}" class="small inline-status"></span></div>${takeRows}</details>`;
+  };
+  window.queueBatchLineTake=function queueBatchLineTakeV097(manifest,lineIndex,textId,engineId,profileId,xvecId,statusId,prefix=''){
+    const text=readFieldValue(textId,'').trim(); if(!manifest||!lineIndex){ setInlineStatus(statusId,'<span class="bad">Missing manifest or line index.</span>'); return; } if(!text){ setInlineStatus(statusId,'<span class="bad">Line text is empty.</span>'); return; }
+    const engine=readFieldValue(engineId,'chatterbox');
+    const body={manifest,line_index:Number(lineIndex),text,spoken_text:text,engine,profile:readFieldValue(profileId,''),x_vector_only:readFieldChecked(xvecId,true),auto_select:false};
+    if(engine==='chatterbox'&&prefix){ body.performance_style=readFieldValue(prefix+'Style',''); body.engine_options=collectChatterboxTurboOptions(prefix); }
+    logUiEvent('take manager: generate alternate take clicked',{manifest,lineIndex,engine,performance_style:body.performance_style||'',engine_options:body.engine_options||{}});
+    setInlineStatus(statusId,'<span class="warn">Queueing alternate take...</span>');
+    api('/api/batch/take',{method:'POST',body:JSON.stringify(body)}).then(r=>{ setInlineStatus(statusId,queuedJobStatus('alternate take',r.job||r)); takeManagerSetStatus('Queued alternate take for line '+Number(lineIndex)+'.','ok'); lastJobsSig=''; refreshJobs(); startPoll(); }).catch(err=>setInlineStatus(statusId,'<span class="bad">Could not queue take: '+esc(err)+'</span>'));
+  };
+
+  fillTagSelect('synthPerformanceTag',PERFORMANCE_STYLES); fillTagSelect('scriptPerformanceTag',PERFORMANCE_STYLES);
+  fillTagSelect('synthVocalEventTag',VOCAL_EVENTS); fillTagSelect('scriptVocalEventTag',VOCAL_EVENTS);
+  restoreTurboControlState(); updateTurboVisibility();
+  ['cbTemperature','cbRepetitionPenalty','cbTopP','cbTopK','cbSeed','cbIncrementSeed','cbNormLoudness'].forEach(id=>{ const el=$(id); if(!el)return; el.addEventListener('input',saveTurboControlState); el.addEventListener('change',saveTurboControlState); });
+  const engineEl=$('engine'); if(engineEl) engineEl.addEventListener('change',updateTurboVisibility);
+  const scriptEl=$('script'); if(scriptEl) scriptEl.addEventListener('input',updateTaggedScriptPreflight);
+  updateTaggedScriptPreflight();
 })();
 </script>
 </body>
