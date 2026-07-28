@@ -1,5 +1,54 @@
 ## v0.94.2 - Tagged Script Workspace refresh polish
 
+## v0.95.5 - Jobs startup render budget
+
+- Reduced startup/page-refresh stalls by rendering only a small recent-job window in the Jobs panel by default.
+- Added Jobs panel controls to show 12 more jobs or return to fewer jobs.
+- Lazy-rendered Tagged Script batch line/take details only when the batch-details panel is opened, avoiding hundreds of startup audio elements and action menus.
+- Replaced the expensive Jobs refresh signature with a lightweight child/take count signature while preserving detailed Take Manager refresh behavior.
+- Added UI diagnostics for slow Jobs renders and slow lazy batch-line renders.
+
+
+## v0.95.4 - Initial-load Jobs render gate
+
+- Fixed the remaining startup/page-refresh freeze after v0.95.3 by making hidden-Jobs render detection use the early `localStorage` boot preference before `/api/state` has filled the Options form.
+- Prevented the first `/api/jobs` refresh from rendering the full hidden Jobs pane when Jobs are configured as a separate tab.
+- Added a one-time UI diagnostic log entry when hidden Jobs rendering is skipped during startup/polling.
+
+
+## v0.95.3 - UI performance / boot layout
+
+- Saved Jobs-as-tab/layout preferences in browser localStorage so the chosen layout paints immediately on reload before `/api/state` returns.
+- Cached the latest Jobs payload for Take Manager tab activation instead of forcing an immediate duplicate `/api/jobs` fetch.
+- Stopped rendering hidden Jobs DOM when Jobs are configured as a tab and the Jobs tab is not visible.
+- Stopped rendering the hidden Take Manager on every job poll; it now auto-renders only while the Take Manager tab is visible.
+- Avoided full layout reapplication while rendering Take Manager content, reducing unnecessary DOM movement.
+
+
+## v0.95.2 - Take Manager tab
+
+- Added a dedicated Take Manager tab for completed Tagged Script batch repair.
+- Added a Send to Take Manager button on batch job cards.
+- Added a completed-batch dropdown and refresh control inside the Take Manager tab.
+- Kept the Take Manager synchronized while job polling updates alternate takes and selected-take state.
+- Added clearer top-level status after queueing alternate takes or selecting a take for mixdown.
+
+
+## v0.95.1 - Take Manager click/status fix
+
+- Fixed malformed inline Take Manager click handlers that could throw `Uncaught SyntaxError: Unexpected end of input` when generating alternate takes.
+- Added immediate visible status and UI diagnostics when Generate alternate take or Use this take in mixdown is clicked.
+
+
+## v0.95 - Tagged Script Take Manager
+
+- Added per-line alternate-take management for completed Tagged Script batches.
+- Added one-line regeneration with editable text, engine override, profile override, and Qwen x-vector toggle.
+- Added selected-take tracking so rebuilt mixdowns use the chosen performance for each line.
+- Added backend manifest take metadata with future-ready `engine_options` fields for later engine-specific style controls.
+- Updated Jobs rendering and refresh signatures so new takes and selected-take changes appear without confusing stale UI.
+
+
 - Changed the Tagged Script Workspace refresh button so it reports `Refreshed projects, scripts, casts.` after a successful manual refresh.
 - Prevented the stale previous workspace status message, such as `Saved project`, from remaining visible after refresh.
 

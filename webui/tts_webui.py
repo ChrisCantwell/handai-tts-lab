@@ -87,7 +87,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.94.2"
+VERSION = "0.95.5"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -3195,6 +3195,126 @@ def tagged_workspace_load_payload(body: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "kind": kind, "name": tagged_workspace_display_name(path, kind, data), "slug": tagged_workspace_slug_from_file(path, kind), "path": str(path), "project": data}
     raise ValueError("Workspace kind must be script, cast, or project.")
 
+
+def tagged_manifest_read(path: Path) -> list[dict[str, Any]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Tagged Script manifest must be a list.")
+    return [x for x in data if isinstance(x, dict)]
+
+
+def tagged_manifest_write(path: Path, manifest: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def tagged_manifest_path_from_payload(payload: dict[str, Any]) -> Path:
+    raw = str(payload.get("manifest") or payload.get("manifest_path") or "").strip()
+    if not raw:
+        raise ValueError("Tagged Script take management requires a batch manifest path.")
+    path = safe_existing_path(raw, [OUT_DIR])
+    if path.name != "manifest.json":
+        raise ValueError("Tagged Script take management expects a manifest.json file.")
+    return path
+
+
+def tagged_take_id(prefix: str = "take") -> str:
+    return f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def tagged_manifest_selected_output(item: dict[str, Any]) -> str:
+    selected_id = str(item.get("selected_take_id") or "").strip()
+    takes = item.get("takes") if isinstance(item.get("takes"), list) else []
+    if selected_id:
+        for take in takes:
+            if isinstance(take, dict) and str(take.get("take_id") or "") == selected_id and take.get("ok") and str(take.get("output") or "").strip():
+                return str(take.get("output") or "").strip()
+    selected_output = str(item.get("selected_output") or "").strip()
+    if selected_output:
+        return selected_output
+    return str(item.get("output") or "").strip()
+
+
+def tagged_manifest_normalize_takes(manifest: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for item in manifest:
+        if not isinstance(item, dict):
+            continue
+        takes = item.get("takes") if isinstance(item.get("takes"), list) else []
+        if not takes and str(item.get("output") or "").strip():
+            take_id = str(item.get("take_id") or "take-1")
+            takes = [{
+                "take_id": take_id,
+                "index": item.get("index"),
+                "role": item.get("role", ""),
+                "text": item.get("text", ""),
+                "engine": item.get("engine", ""),
+                "profile": item.get("profile", ""),
+                "ref": item.get("ref", ""),
+                "ref_text": item.get("ref_text", ""),
+                "x_vector_only": bool(item.get("x_vector_only", False)),
+                "engine_options": item.get("engine_options") if isinstance(item.get("engine_options"), dict) else {},
+                "output": item.get("output", ""),
+                "audio_url": item.get("audio_url", ""),
+                "preview_url": item.get("preview_url", ""),
+                "wav_url": item.get("wav_url", ""),
+                "duration_seconds": item.get("duration_seconds"),
+                "returncode": item.get("returncode"),
+                "ok": bool(item.get("ok", False)),
+                "selected": True,
+                "created_at": item.get("created_at", ""),
+                "source": "initial-batch-render",
+            }]
+        selected_id = str(item.get("selected_take_id") or "").strip()
+        if not selected_id and takes:
+            first_ok = next((t for t in takes if isinstance(t, dict) and t.get("ok")), takes[0])
+            selected_id = str(first_ok.get("take_id") or "take-1")
+            item["selected_take_id"] = selected_id
+        found_selected = False
+        for take in takes:
+            if not isinstance(take, dict):
+                continue
+            is_selected = bool(selected_id and str(take.get("take_id") or "") == selected_id)
+            take["selected"] = is_selected
+            found_selected = found_selected or is_selected
+        if takes and not found_selected:
+            takes[0]["selected"] = True
+            item["selected_take_id"] = str(takes[0].get("take_id") or "take-1")
+        item["takes"] = takes
+        item["take_count"] = len(takes)
+        selected_output = tagged_manifest_selected_output(item)
+        if selected_output:
+            item["selected_output"] = selected_output
+            try:
+                p = Path(selected_output)
+                if p.exists():
+                    item["audio_url"] = preview_url_for(p)
+                    item["preview_url"] = preview_url_for(p)
+                    item["wav_url"] = audio_url_for(p)
+                    item["duration_seconds"] = audio_duration_seconds(p)
+            except Exception:
+                pass
+    return manifest
+
+
+def tagged_manifest_selected_audio_paths(manifest: list[dict[str, Any]]) -> list[Path]:
+    tagged_manifest_normalize_takes(manifest)
+    out: list[Path] = []
+    for item in manifest:
+        if not isinstance(item, dict) or not bool(item.get("ok")):
+            continue
+        raw = tagged_manifest_selected_output(item)
+        if not raw:
+            continue
+        try:
+            p = Path(raw).expanduser().resolve()
+        except Exception:
+            continue
+        if inside(p, OUT_DIR) and p.exists() and p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+            out.append(p)
+    return out
+
 @dataclass
 class Job:
     id: str
@@ -3261,6 +3381,17 @@ class Job:
                 data["transcript"] = self.transcript
             if self.result:
                 data["result"] = self.result
+        if self.kind == "batch" and self.manifest:
+            try:
+                mp = Path(self.manifest)
+                if mp.exists() and inside(mp.resolve(), OUT_DIR):
+                    manifest = tagged_manifest_read(mp)
+                    tagged_manifest_normalize_takes(manifest)
+                    data["children"] = manifest
+                    if isinstance(data.get("result"), dict):
+                        data["result"]["children"] = manifest
+            except Exception:
+                pass
         if self.manifest:
             data["manifest_url"] = f"/manifest/{Path(self.manifest).name}"
         return data
@@ -3518,6 +3649,75 @@ class JobManager:
         self._append_log(job, "\n" + message + "\n")
         self._set(job, status="canceled", error=None, warning=message, finished_at=now(), canceled_at=now(), process_pid=None)
 
+
+    def _sync_tagged_batch_jobs_from_manifest(self, manifest_path: Path, manifest: list[dict[str, Any]]) -> None:
+        manifest_path = manifest_path.resolve()
+        with self.lock:
+            for job in self.jobs.values():
+                try:
+                    if job.kind != "batch" or not job.manifest:
+                        continue
+                    if Path(job.manifest).resolve() != manifest_path:
+                        continue
+                    job.children = [dict(x) for x in manifest]
+                    if not isinstance(job.result, dict):
+                        job.result = {}
+                    job.result["children"] = [dict(x) for x in manifest]
+                    job.result["manifest"] = str(manifest_path)
+                    self._persist_job(job)
+                except Exception:
+                    continue
+
+    def select_batch_take(self, payload: dict[str, Any]) -> dict[str, Any]:
+        manifest_path = tagged_manifest_path_from_payload(payload)
+        manifest = tagged_manifest_normalize_takes(tagged_manifest_read(manifest_path))
+        try:
+            line_index = int(payload.get("line_index") or payload.get("index") or 0)
+        except Exception:
+            line_index = 0
+        take_id = str(payload.get("take_id") or "").strip()
+        if line_index <= 0 or not take_id:
+            raise ValueError("line_index and take_id are required.")
+        selected_take: dict[str, Any] | None = None
+        selected_line: dict[str, Any] | None = None
+        for item in manifest:
+            try:
+                if int(item.get("index") or 0) != line_index:
+                    continue
+            except Exception:
+                continue
+            selected_line = item
+            for take in item.get("takes") or []:
+                if isinstance(take, dict) and str(take.get("take_id") or "") == take_id:
+                    if not take.get("ok") or not str(take.get("output") or "").strip():
+                        raise ValueError("Only successful takes with audio output can be selected.")
+                    selected_take = take
+                    break
+            if not selected_take:
+                raise ValueError(f"Take not found for line {line_index}: {take_id}")
+            item["selected_take_id"] = take_id
+            item["selected_output"] = str(selected_take.get("output") or "")
+            item["output"] = str(selected_take.get("output") or item.get("output") or "")
+            item["audio_url"] = str(selected_take.get("audio_url") or item.get("audio_url") or "")
+            item["preview_url"] = str(selected_take.get("preview_url") or item.get("preview_url") or "")
+            item["wav_url"] = str(selected_take.get("wav_url") or item.get("wav_url") or "")
+            for take in item.get("takes") or []:
+                if isinstance(take, dict):
+                    take["selected"] = str(take.get("take_id") or "") == take_id
+            break
+        if not selected_take or not selected_line:
+            raise ValueError(f"Line {line_index} was not found in the manifest.")
+        tagged_manifest_write(manifest_path, manifest)
+        self._sync_tagged_batch_jobs_from_manifest(manifest_path, manifest)
+        return {
+            "ok": True,
+            "manifest": str(manifest_path),
+            "line_index": line_index,
+            "take_id": take_id,
+            "selected_take": selected_take,
+            "line": selected_line,
+        }
+
     def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.lock:
             jobs = sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True)[:limit]
@@ -3548,6 +3748,8 @@ class JobManager:
                     self._run_single(job, payload)
                 elif job.kind == "batch":
                     self._run_batch(job, payload)
+                elif job.kind == "batch-take":
+                    self._run_batch_take(job, payload)
                 elif job.kind == "batch-mixdown":
                     self._run_batch_mixdown(job, payload)
                 elif job.kind == "stt":
@@ -3779,7 +3981,7 @@ class JobManager:
         for item in manifest:
             if not isinstance(item, dict):
                 continue
-            raw_output = str(item.get("output") or "").strip()
+            raw_output = tagged_manifest_selected_output(item)
             if not raw_output or not bool(item.get("ok")):
                 skipped.append({"index": item.get("index"), "role": item.get("role"), "reason": "not marked ok or missing output"})
                 continue
@@ -5017,6 +5219,141 @@ class JobManager:
             self._archive_uploaded_video_source(job, payload)
 
 
+
+    def _run_batch_take(self, job: Job, payload: dict[str, Any]) -> None:
+        manifest_path = tagged_manifest_path_from_payload(payload)
+        manifest = tagged_manifest_normalize_takes(tagged_manifest_read(manifest_path))
+        try:
+            line_index = int(payload.get("line_index") or payload.get("index") or 0)
+        except Exception:
+            line_index = 0
+        if line_index <= 0:
+            raise ValueError("line_index is required for Tagged Script line regeneration.")
+        item: dict[str, Any] | None = None
+        for row in manifest:
+            try:
+                if int(row.get("index") or 0) == line_index:
+                    item = row
+                    break
+            except Exception:
+                continue
+        if not item:
+            raise ValueError(f"Line {line_index} was not found in the manifest.")
+
+        role = str(payload.get("role") or item.get("role") or "LINE").strip() or "LINE"
+        text_value = str(payload.get("text") if payload.get("text") is not None else item.get("text") or "").strip()
+        if not text_value:
+            raise ValueError("Line text is required for Tagged Script take regeneration.")
+        engine = str(payload.get("engine") or item.get("engine") or "chatterbox").strip().lower()
+        if engine not in ENGINE_META:
+            raise ValueError(f"Unknown engine for regenerated take: {engine}")
+        requested_profile_slug = str(payload.get("profile") or "").strip()
+        profile_slug = requested_profile_slug or str(item.get("profile") or "").strip()
+        profile = None
+        if profile_slug:
+            profile = profile_manifest(PROFILE_DIR / profile_slug)
+            if not profile:
+                raise ValueError(f"Unknown voice profile for regenerated take: {profile_slug}")
+
+        ref = str(payload.get("ref") or (profile or {}).get("audio_path") or item.get("ref") or DEFAULT_REF)
+        ref_text = str(payload.get("ref_text") or (profile or {}).get("transcript") or item.get("ref_text") or "")
+        x_vector_only = bool(payload.get("x_vector_only", item.get("x_vector_only", engine == "qwen3")))
+        take_id = tagged_take_id("take")
+        take_dir = manifest_path.parent / "takes"
+        take_dir.mkdir(parents=True, exist_ok=True)
+        output = take_dir / f"{line_index:03d}_{safe_slug(role)}_{engine}_{take_id}.wav"
+        line_payload = {
+            "engine": engine,
+            "role": role,
+            "text": text_value,
+            "ref": ref,
+            "ref_text": ref_text,
+            "x_vector_only": x_vector_only,
+            "profile": profile_slug,
+            "engine_options": {},
+            "tagged_script_take": {
+                "manifest": str(manifest_path),
+                "line_index": line_index,
+                "take_id": take_id,
+                "auto_select": bool(payload.get("auto_select", False)),
+            },
+        }
+        self._set(
+            job,
+            status="running",
+            started_at=now(),
+            engine=engine,
+            role=f"{role} take",
+            text=f"Line {line_index}: {text_value}",
+            output=str(output),
+            source_path=str(manifest_path),
+            manifest=str(manifest_path),
+        )
+        self._append_log(job, f"Tagged Script line take regeneration v0.95\nManifest: {manifest_path}\nLine: {line_index} Role: {role}\nEngine: {engine}\nProfile: {profile_slug or '<keep/default>'}\nAuto-select: {bool(payload.get('auto_select', False))}\n\n")
+        chunks = split_synthesis_text(text_value)
+        if engine == "chatterbox" and bool(payload.get("split_on_sentences", True)) and len(chunks) > 1:
+            rc = self._run_chunked(job, line_payload, output, chunks)
+        else:
+            cmd = self._build_command(line_payload, output)
+            rc = self._run_subprocess(job, cmd)
+        if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
+            try:
+                output.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._mark_canceled(job)
+            return
+
+        ok = rc == 0 and output.exists()
+        if ok:
+            self._normalize_wav_for_browser(job, output)
+            write_output_sidecar(output, line_payload, job, role=role)
+        take = {
+            "take_id": take_id,
+            "index": line_index,
+            "role": role,
+            "text": text_value,
+            "engine": engine,
+            "profile": profile_slug,
+            "ref": ref,
+            "ref_text": ref_text,
+            "x_vector_only": x_vector_only,
+            "engine_options": {},
+            "output": str(output),
+            "audio_url": preview_url_for(output) if output.exists() else "",
+            "preview_url": preview_url_for(output) if output.exists() else "",
+            "wav_url": audio_url_for(output) if output.exists() else "",
+            "duration_seconds": audio_duration_seconds(output) if output.exists() else None,
+            "returncode": rc,
+            "ok": ok,
+            "selected": False,
+            "created_at": iso_time(),
+            "source": "line-regeneration",
+        }
+        takes = item.get("takes") if isinstance(item.get("takes"), list) else []
+        takes.append(take)
+        item["takes"] = takes
+        item["take_count"] = len(takes)
+        if ok and bool(payload.get("auto_select", False)):
+            item["selected_take_id"] = take_id
+            item["selected_output"] = str(output)
+            item["output"] = str(output)
+            item["audio_url"] = take["audio_url"]
+            item["preview_url"] = take["preview_url"]
+            item["wav_url"] = take["wav_url"]
+            for t in takes:
+                if isinstance(t, dict):
+                    t["selected"] = str(t.get("take_id") or "") == take_id
+        else:
+            tagged_manifest_normalize_takes(manifest)
+        tagged_manifest_write(manifest_path, manifest)
+        self._sync_tagged_batch_jobs_from_manifest(manifest_path, manifest)
+        if ok:
+            self._append_log(job, f"Regenerated take ready: {output}\nThis take was saved as an alternate and was not auto-selected for mixdown.\n")
+            self._set(job, status="done", result={"kind": "tagged-script-line-take", "manifest": str(manifest_path), "line_index": line_index, "take": take, "auto_selected": bool(payload.get("auto_select", False))}, finished_at=now())
+        else:
+            self._set(job, status="error", error=oom_message(rc), result={"kind": "tagged-script-line-take", "manifest": str(manifest_path), "line_index": line_index, "take": take}, finished_at=now())
+
     def _run_batch_mixdown(self, job: Job, payload: dict[str, Any]) -> None:
         # Post-run Tagged Script mixdown v0.93.3 backend override.
         source_job_id = str(payload.get("job_id") or payload.get("source_job_id") or "").strip()
@@ -5435,8 +5772,39 @@ class JobManager:
                 "audio_url": preview_url_for(output) if output.exists() else "",
                 "preview_url": preview_url_for(output) if output.exists() else "",
                 "wav_url": audio_url_for(output) if output.exists() else "",
+                "duration_seconds": audio_duration_seconds(output) if output.exists() else None,
                 "returncode": rc,
                 "ok": ok,
+                "ref": ref,
+                "ref_text": ref_text,
+                "x_vector_only": x_vector_only,
+                "engine_options": {},
+                "take_id": "take-1",
+                "selected_take_id": "take-1" if ok else "",
+                "selected_output": str(output) if ok else "",
+                "takes": [{
+                    "take_id": "take-1",
+                    "index": idx,
+                    "role": role,
+                    "text": text,
+                    "engine": engine,
+                    "profile": profile_slug,
+                    "ref": ref,
+                    "ref_text": ref_text,
+                    "x_vector_only": x_vector_only,
+                    "engine_options": {},
+                    "output": str(output),
+                    "audio_url": preview_url_for(output) if output.exists() else "",
+                    "preview_url": preview_url_for(output) if output.exists() else "",
+                    "wav_url": audio_url_for(output) if output.exists() else "",
+                    "duration_seconds": audio_duration_seconds(output) if output.exists() else None,
+                    "returncode": rc,
+                    "ok": ok,
+                    "selected": ok,
+                    "created_at": iso_time(),
+                    "source": "initial-batch-render",
+                }],
+                "take_count": 1,
             }
             manifest.append(item)
             self._set(
@@ -5480,7 +5848,7 @@ class JobManager:
                 line_gap = 0.0
             self._set(job, result={**result, "progress": progress_payload(len(manifest), "assembling", extra={"mixdown_format": mix_fmt, "line_gap_seconds": line_gap})})
             self._append_log(job, f"\nAssembling tagged script mixdown: format={mix_fmt}, line gap={line_gap:g}s.\n")
-            rendered = [Path(str(item.get("output") or "")) for item in manifest if item.get("ok")]
+            rendered = tagged_manifest_selected_audio_paths(manifest)
             mix_pieces: list[Path] = []
             silence_files: list[str] = []
             for i, piece in enumerate(rendered, start=1):
@@ -5551,6 +5919,12 @@ body.layout-stack .right-panel { flex: 1 1 320px; }
 body.jobs-as-tab .right-panel { display:none; }
 body.jobs-as-tab main { grid-template-columns: 1fr; }
 body.jobs-as-tab.layout-stack .left-panel { flex: 1 1 auto; }
+html.boot-jobs-as-tab body .right-panel { display:none; }
+html.boot-jobs-as-tab body main { grid-template-columns: 1fr; }
+html.boot-layout-stack body main { display:flex; flex-direction:column; }
+html.boot-layout-stack body .left-panel { flex: 0 0 min(62vh, 680px); }
+html.boot-layout-stack body .right-panel { flex: 1 1 320px; }
+html.boot-jobs-as-tab.boot-layout-stack body .left-panel { flex: 1 1 auto; }
 .jobs-tab-button.hidden { display:none; }
 .layout-status { margin-top:6px; min-height:1.2em; }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; box-shadow: 0 8px 22px rgba(0,0,0,.18); overflow-y:auto; min-height:0; }
@@ -5629,6 +6003,19 @@ audio { width: 100%; margin: 6px 0; }
 hr { border:0; border-top:1px solid #303747; margin:12px 0; }
 @media (max-width: 950px) { body { overflow:auto; } main { grid-template-columns:1fr; height:auto; overflow:visible; } body.layout-stack main { display:block; } body.layout-stack .left-panel, body.layout-stack .right-panel { flex:auto; } section { overflow:visible; } }
 </style>
+<script>
+(function(){
+  try{
+    const raw = localStorage.getItem('ttsLabUiBootPrefs') || '{}';
+    const prefs = JSON.parse(raw);
+    const root = document.documentElement;
+    if(prefs && prefs.jobs_as_tab) root.classList.add('boot-jobs-as-tab');
+    if(prefs && prefs.panel_orientation === 'stack') root.classList.add('boot-layout-stack');
+    const w = Number(prefs && prefs.operations_panel_width);
+    if(Number.isFinite(w) && w >= 320 && w <= 900) root.style.setProperty('--ops-width', Math.round(w) + 'px');
+  }catch(e){}
+})();
+</script>
 </head>
 <body>
 <header>
@@ -5640,6 +6027,7 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
     <div class="tabs">
       <button id="tab-single" class="active" onclick="showTab('single')">Synthesize</button>
       <button id="tab-batch" onclick="showTab('batch')">Tagged script</button>
+      <button id="tab-takes" onclick="showTab('takes')">Take Manager</button>
       <button id="tab-profiles" onclick="showTab('profiles')">Profiles</button>
       <button id="tab-refs" onclick="showTab('refs')">Loose files</button>
       <button id="tab-options" onclick="showTab('options')">Options</button>
@@ -5757,6 +6145,18 @@ EXEC: Pick one.</textarea>
         </div>
       </div>
       <div class="sticky-actions"><button id="batchGenerateButton" onclick="generateBatch()">Generate tagged script</button><div id="batchActionStatus" class="small inline-status"></div></div>
+    </div>
+
+
+    <div id="pane-takes" class="hidden">
+      <h2>Take Manager</h2>
+      <p class="small">Repair completed Tagged Script batches without digging through the Jobs panel. Select a batch, regenerate individual lines as alternate takes, audition them, choose the take for mixdown, then rebuild the final file from selected takes.</p>
+      <div class="row3">
+        <div><label>Completed Tagged Script batch</label><select id="takeManagerBatchSelect" onchange="selectTakeManagerBatch()"></select></div>
+        <div><label>&nbsp;</label><button class="secondary" type="button" onclick="loadTakeManagerData(takeManagerSelectedJobId)">Refresh Take Manager</button></div>
+        <div><label>&nbsp;</label><div id="takeManagerStatus" class="small inline-status">Choose a completed Tagged Script batch.</div></div>
+      </div>
+      <div id="takeManagerContent" class="small">No batch selected yet. Use “Send to Take Manager” on a completed batch job, or choose one from the dropdown above.</div>
     </div>
 
     <div id="pane-profiles" class="hidden">
@@ -6324,6 +6724,7 @@ let profiles = [];
 let poll = null;
 let lastJobsSig = '';
 let lastOutputsSig = '';
+let lastJobsData = null;
 let activeLogId = null;
 let activeLogTitle = "";
 let formStateLoaded = false;
@@ -6334,7 +6735,7 @@ let currentMetadataJobId = null;
 let currentSingleJobId = null;
 let currentBatchJobId = null;
 let lastSttSelectedPath = null;
-const TAB_NAMES = ['single','batch','profiles','refs','options','stt','video','audio','metadata','resemble','maintenance','jobs'];
+const TAB_NAMES = ['single','batch','takes','profiles','refs','options','stt','video','audio','metadata','resemble','maintenance','jobs'];
 let uiDiagEvents = [];
 let currentTabName = '';
 let lastStackStatus = null;
@@ -6412,6 +6813,8 @@ function showTab(name, updateHash=true){
     pane.classList.toggle('hidden', p!==name); tab.classList.toggle('active', p===name);
   }
   currentTabName = name;
+  if(name === 'jobs' && previous !== 'jobs' && typeof refreshJobs === 'function') { lastJobsSig=''; setTimeout(()=>refreshJobs(), 0); }
+  if(name === 'takes' && previous !== 'takes' && typeof maybeRefreshTakeManagerOnOpen === 'function') setTimeout(()=>maybeRefreshTakeManagerOnOpen(), 0);
   if(previous && previous !== name) logUiEvent('tab switch', {from:previous, to:name});
   if(updateHash && location.hash !== '#'+name) history.replaceState(null, '', '#'+name);
 }
@@ -6508,12 +6911,12 @@ function batchMixdownControls(j){
   const currentMix = result.mixdown && result.mixdown.output_audio ? '<div class="small"><span class="ok">Existing launch-time mixdown:</span> <code>'+esc(result.mixdown.output_audio)+'</code></div>' : '';
   return `<div class="meta-panel">
     <b>Post-run Tagged Script mixdown</b>
-    <div class="small">Use the ${esc(okCount)} successful rendered line file(s) from this batch. This does not re-run TTS.</div>
+    <div class="small">Use the selected take for each successful line in this batch. This does not re-run TTS.</div>
     ${currentMix}
     <div class="inline-tools">
       <select id="batch-mixdown-format-${esc(id)}" style="width:auto;min-width:120px"><option value="mp3" selected>MP3</option><option value="wav">WAV</option></select>
       <label class="small" style="display:inline-block;margin:2px 6px 2px 0">gap seconds <input id="batch-mixdown-gap-${esc(id)}" type="number" min="0" step="0.05" value="0.35" style="width:90px;display:inline-block;margin-left:4px" /></label>
-      <button class="mini secondary" type="button" onclick="queueCompletedBatchMixdown(${jsStr(id)}, ${jsStr(manifest)})">Mix down this completed batch</button>
+      <button class="mini secondary" type="button" onclick="queueCompletedBatchMixdown(${jsAttr(id)}, ${jsAttr(manifest)})">Rebuild mixdown from selected takes</button>
     </div>
     <div id="batch-mixdown-status-${esc(id)}" class="small inline-status"></div>
   </div>`;
@@ -6792,6 +7195,8 @@ function updateCurrentGenerationFromJobs(data){
 }
 function statusClass(s){ return s==='done'?'ok':(s==='error'?'bad':((s==='running'||s==='queued'||s==='canceling')?'warn':(s==='canceled'?'bad':''))); }
 function jsStr(s){ return JSON.stringify(String(s ?? '')); }
+function jsAttr(s){ return esc(jsStr(s)); }
+
 function fmtDur(sec){ if(sec === null || sec === undefined || Number.isNaN(Number(sec))) return ''; const n=Number(sec); return n < 60 ? `${n.toFixed(1)}s` : `${Math.floor(n/60)}:${String(Math.round(n%60)).padStart(2,'0')}`; }
 function fmtDuration(sec){ sec=Number(sec||0); if(!isFinite(sec)||sec<=0) return 'unknown'; if(sec<60) return sec.toFixed(1)+'s'; return Math.floor(sec/60)+':'+String(Math.round(sec%60)).padStart(2,'0'); }
 function durationBadge(sec, warn){ const d=fmtDur(sec); if(!d) return ''; return `<span class="pill ${warn?'bad':''}">${d}${warn?' - short ref':''}</span>`; }
@@ -6886,6 +7291,8 @@ document.addEventListener('click', function(ev){
   if(sttUseRef){ ev.preventDefault(); logUiEvent('clicked STT use as reference', {path:sttUseRef.dataset.path || '', text_chars:(sttUseRef.dataset.text || '').length}); useSttAsSynthesizeReference(sttUseRef.dataset.path || '', sttUseRef.dataset.text || ''); return; }
   const sttSave = ev.target.closest ? ev.target.closest('.stt-save-btn') : null;
   if(sttSave){ ev.preventDefault(); logUiEvent('clicked STT save transcript', {path:sttSave.dataset.path || '', jobid:sttSave.dataset.jobid || ''}); saveSttJobTranscript(sttSave.dataset.path || '', sttSave.dataset.text || '', sttSave.dataset.jobid || ''); return; }
+  const takeMgrBtn = ev.target.closest ? ev.target.closest('.send-take-manager-btn') : null;
+  if(takeMgrBtn){ ev.preventDefault(); logUiEvent('clicked send batch to Take Manager', {jobid:takeMgrBtn.dataset.jobid || ''}); sendBatchToTakeManager(takeMgrBtn.dataset.jobid || ''); return; }
   const cancelBtn = ev.target.closest ? ev.target.closest('.cancel-job-btn') : null;
   if(cancelBtn){ ev.preventDefault(); logUiEvent('clicked abort job', {jobid:cancelBtn.dataset.jobid || ''}, 'warn'); cancelJob(cancelBtn.dataset.jobid || ''); return; }
 });
@@ -7130,6 +7537,11 @@ function applyLayoutPrefs(){
   const orientation = readFieldValue('optPanelOrientation', 'side') === 'stack' ? 'stack' : 'side';
   const jobsAsTab = readFieldChecked('optJobsAsTab', false);
   const opsWidth = clampNumber(readFieldValue('optOpsWidth', 560), 320, 900, 560);
+  try{
+    localStorage.setItem('ttsLabUiBootPrefs', JSON.stringify({jobs_as_tab:jobsAsTab, panel_orientation:orientation, operations_panel_width:opsWidth}));
+    document.documentElement.classList.toggle('boot-jobs-as-tab', jobsAsTab);
+    document.documentElement.classList.toggle('boot-layout-stack', orientation === 'stack');
+  }catch(e){}
   document.documentElement.style.setProperty('--ops-width', opsWidth + 'px');
   const label=$('opsWidthLabel'); if(label) label.textContent = opsWidth + 'px';
   document.body.classList.toggle('layout-stack', orientation === 'stack');
@@ -7704,6 +8116,189 @@ function audioLabJobBlock(j){
   const details = Object.keys(result).length ? `<div class="small">Output format: <code>${esc(fmt)}</code>${rate}${chans}${br}${result.normalize_dynaudnorm?' · normalized with dynaudnorm':''}</div>` : '';
   return `${details}${waves}`;
 }
+
+function takeListForLine(c){
+  const takes = Array.isArray(c.takes) ? c.takes.slice() : [];
+  if(!takes.length && c.output){
+    takes.push({take_id:c.take_id || 'take-1', index:c.index, role:c.role, text:c.text, engine:c.engine, profile:c.profile, output:c.output, audio_url:c.audio_url, preview_url:c.preview_url, wav_url:c.wav_url, duration_seconds:c.duration_seconds, ok:c.ok, selected:true, source:'initial-batch-render'});
+  }
+  const selectedId = c.selected_take_id || (takes.find(t=>t.selected) || takes[0] || {}).take_id || '';
+  return takes.map(t=>Object.assign({}, t, {selected:String(t.take_id||'') === String(selectedId)}));
+}
+function takeSelectProfileOptions(selected=''){
+  let out = '<option value="">keep line profile/default</option>';
+  for(const p of profiles || []){
+    const slug = p.slug || '';
+    out += `<option value="${esc(slug)}"${slug===selected?' selected':''}>${esc(profileDisplayName(p))}</option>`;
+  }
+  return out;
+}
+function takeLineControlId(jobId, idx, suffix){ return 'take-line-' + String(jobId||'batch').replace(/[^A-Za-z0-9_-]/g,'') + '-' + String(idx||'0').replace(/[^A-Za-z0-9_-]/g,'') + '-' + suffix; }
+function batchLineTakesBlock(j, c){
+  const manifest = (j && (j.manifest || (j.result && j.result.manifest))) || '';
+  if(!manifest || !c || !c.index) return '';
+  const takes = takeListForLine(c);
+  const selected = takes.find(t=>t.selected) || takes[0] || {};
+  const idText = takeLineControlId(j.id, c.index, 'text');
+  const idEngine = takeLineControlId(j.id, c.index, 'engine');
+  const idProfile = takeLineControlId(j.id, c.index, 'profile');
+  const idXvec = takeLineControlId(j.id, c.index, 'xvec');
+  const idStatus = takeLineControlId(j.id, c.index, 'status');
+  const takeRows = takes.map((t, n)=>{
+    const ok = t.ok ? 'ok' : 'bad';
+    const sel = t.selected ? '<span class="pill ok">selected for mixdown</span>' : '';
+    const audio = t.audio_url ? `<audio controls preload="none" src="${esc(t.preview_url || t.audio_url)}"></audio>${durationBadge(t.duration_seconds, false)}` : '<span class="bad">no audio</span>';
+    const choose = (t.ok && !t.selected) ? `<button class="mini secondary" type="button" onclick="selectBatchLineTake(${jsAttr(manifest)}, ${Number(c.index)||0}, ${jsAttr(t.take_id || '')}, ${jsAttr(idStatus)})">Use this take in mixdown</button>` : '';
+    return `<div class="card">
+      <b>Take ${esc(n+1)}</b> ${sel} <span class="${ok}">${t.ok?'ready':'failed'}</span>
+      <div class="small">Engine: <code>${esc(t.engine || '')}</code>${t.profile?` · Profile: <code>${esc(t.profile)}</code>`:''}${t.source?` · ${esc(t.source)}`:''}</div>
+      <div class="small">${esc((t.text || '').slice(0, 220))}</div>
+      ${audio}
+      <div class="inline-tools">${choose}${t.output?outputActions(t.output, t.text || c.text, (j.id || 'batch') + '-' + c.index + '-' + (t.take_id || n)):''}</div>
+    </div>`;
+  }).join('');
+  return `<details class="meta-panel take-manager">
+    <summary>Take manager — ${esc(takes.length)} take${takes.length===1?'':'s'}; selected ${esc(selected.take_id || 'none')}</summary>
+    <div class="small">Regenerated takes are saved as alternates. They do not replace the selected mixdown take until you choose one.</div>
+    <label>Edit text for a new take</label>
+    <textarea id="${esc(idText)}" style="min-height:80px">${esc(c.text || '')}</textarea>
+    <div class="row3">
+      <div><label>Engine for new take</label><select id="${esc(idEngine)}">${engineOptionsHtml(c.engine || '')}</select></div>
+      <div><label>Profile for new take</label><select id="${esc(idProfile)}">${takeSelectProfileOptions(c.profile || '')}</select></div>
+      <div><label>&nbsp;</label><label class="small"><input id="${esc(idXvec)}" type="checkbox"${c.x_vector_only?' checked':''} /> Qwen x-vector</label></div>
+    </div>
+    <div class="inline-tools">
+      <button class="mini secondary" type="button" onclick="queueBatchLineTake(${jsAttr(manifest)}, ${Number(c.index)||0}, ${jsAttr(idText)}, ${jsAttr(idEngine)}, ${jsAttr(idProfile)}, ${jsAttr(idXvec)}, ${jsAttr(idStatus)})">Generate alternate take</button>
+      <span id="${esc(idStatus)}" class="small inline-status"></span>
+    </div>
+    ${takeRows}
+  </details>`;
+}
+function batchLineBlock(j, c){
+  const selectedPath = c.selected_output || c.output || '';
+  const audio = c.audio_url ? `<audio controls preload="none" src="${c.preview_url || c.audio_url}"></audio>${durationBadge(c.duration_seconds, false)} ${outputActions(selectedPath, c.text, (j.id || 'batch') + '-' + c.index)} <a download href="${c.wav_url || c.audio_url}">download wav</a>` : '';
+  return `<div class="card">${c.ok?'✅':'❌'} ${esc(c.index)} ${esc(c.role)} <span class="small">${esc((c.text||'').slice(0,180))}</span>${audio}<br>${batchLineTakesBlock(j, c)}</div>`;
+}
+function queueBatchLineTake(manifest, lineIndex, textId, engineId, profileId, xvecId, statusId){
+  logUiEvent('take manager: generate alternate take clicked', {manifest, lineIndex, textId, engineId, profileId, xvecId, statusId});
+  setInlineStatus(statusId, '<span class="warn">Preparing alternate take...</span>');
+  const text = readFieldValue(textId, '').trim();
+  if(!manifest || !lineIndex){ setInlineStatus(statusId, '<span class="bad">Missing manifest or line index.</span>'); return; }
+  if(!text){ setInlineStatus(statusId, '<span class="bad">Line text is empty.</span>'); return; }
+  const body = {
+    manifest,
+    line_index: Number(lineIndex),
+    text,
+    engine: readFieldValue(engineId, 'chatterbox'),
+    profile: readFieldValue(profileId, ''),
+    x_vector_only: readFieldChecked(xvecId, true),
+    auto_select: false
+  };
+  setInlineStatus(statusId, '<span class="warn">Queueing alternate take...</span>');
+  api('/api/batch/take', {method:'POST', body:JSON.stringify(body)})
+    .then(r=>{ setInlineStatus(statusId, queuedJobStatus('alternate take', r.job || r)); if(typeof takeManagerSetStatus==='function') takeManagerSetStatus('Queued alternate take for line '+Number(lineIndex)+'. This tab will refresh as Jobs update.', 'ok'); lastJobsSig=''; refreshJobs(); startPoll(); })
+    .catch(err=>{ setInlineStatus(statusId, '<span class="bad">Could not queue take: '+esc(err)+'</span>'); });
+}
+function selectBatchLineTake(manifest, lineIndex, takeId, statusId){
+  logUiEvent('take manager: select take clicked', {manifest, lineIndex, takeId, statusId});
+  if(!manifest || !lineIndex || !takeId){ setInlineStatus(statusId, '<span class="bad">Missing manifest, line, or take.</span>'); return; }
+  setInlineStatus(statusId, '<span class="warn">Selecting take for mixdown...</span>');
+  api('/api/batch/take/select', {method:'POST', body:JSON.stringify({manifest, line_index:Number(lineIndex), take_id:takeId})})
+    .then(()=>{ setInlineStatus(statusId, '<span class="ok">Selected take for mixdown. Rebuild mixdown when ready.</span>'); if(typeof takeManagerSetStatus==='function') takeManagerSetStatus('Selected take for line '+Number(lineIndex)+'. Rebuild mixdown when ready.', 'ok'); lastJobsSig=''; refreshJobs(); })
+    .catch(err=>{ setInlineStatus(statusId, '<span class="bad">Could not select take: '+esc(err)+'</span>'); });
+}
+
+
+let takeManagerSelectedJobId = '';
+let takeManagerLastSig = '';
+function takeManagerSetStatus(message='', kind=''){
+  const el = $('takeManagerStatus');
+  if(!el) return;
+  const cls = kind === 'ok' ? 'ok' : (kind === 'bad' ? 'bad' : (kind === 'warn' ? 'warn' : ''));
+  el.innerHTML = cls ? `<span class="${cls}">${esc(message || '')}</span>` : esc(message || '');
+}
+function takeManagerEligibleBatches(data){
+  return (data.jobs || []).filter(j => j && j.kind === 'batch' && Array.isArray(j.children) && j.children.length && ['done','error','canceled'].includes(String(j.status || '')));
+}
+function takeManagerBatchLabel(j){
+  const result = j.result || {};
+  const progress = result.progress || {};
+  const count = (j.children || []).length || result.line_count || progress.total_lines || '?';
+  const mix = result.mixdown && result.mixdown.output_audio ? ' · mixdown' : '';
+  const created = j.created_at ? new Date(Number(j.created_at)*1000).toLocaleString() : '';
+  const sample = ((j.children || [])[0] || {}).text || j.text || '';
+  return `${created ? created + ' · ' : ''}${count} lines${mix}${sample ? ' · ' + sample.slice(0,60) : ''}`;
+}
+function renderTakeManagerBatchSelect(batches, preferredId=''){
+  const sel = $('takeManagerBatchSelect');
+  if(!sel) return '';
+  const previous = preferredId || takeManagerSelectedJobId || sel.value || localStorage.getItem('ttsLabTakeManagerJobId') || '';
+  sel.innerHTML = batches.length ? batches.map(j=>`<option value="${esc(j.id || '')}">${esc(takeManagerBatchLabel(j))}</option>`).join('') : '<option value="">No completed Tagged Script batches found</option>';
+  let selected = '';
+  if(previous && Array.from(sel.options).some(o=>o.value===previous)) selected = previous;
+  else if(batches.length) selected = batches[0].id || '';
+  if(selected) sel.value = selected;
+  takeManagerSelectedJobId = selected;
+  try{ if(selected) localStorage.setItem('ttsLabTakeManagerJobId', selected); }catch(e){}
+  return selected;
+}
+function selectedTakeManagerJobFromData(data, preferredId=''){
+  const batches = takeManagerEligibleBatches(data);
+  const selectedId = renderTakeManagerBatchSelect(batches, preferredId);
+  return batches.find(j => String(j.id || '') === String(selectedId || '')) || null;
+}
+function renderTakeManagerJob(j){
+  const box = $('takeManagerContent');
+  if(!box) return;
+  if(!j){
+    box.innerHTML = '<div class="warning-box">No completed Tagged Script batch is selected yet. Generate a Tagged Script batch first, then return here.</div>';
+    takeManagerLastSig = '';
+    return;
+  }
+  takeManagerSelectedJobId = String(j.id || '');
+  const manifest = j.manifest || (j.result && j.result.manifest) || '';
+  const children = Array.isArray(j.children) ? j.children : [];
+  const sig = JSON.stringify([j.id, j.status, j.output, manifest, children.map(c=>[c.index,c.selected_take_id,c.output,c.selected_output,(c.takes||[]).map(t=>[t.take_id,t.output,t.selected,t.ok,t.returncode]).join(':')]).join('|')]);
+  if(sig === takeManagerLastSig && box.innerHTML.trim()) return;
+  takeManagerLastSig = sig;
+  const selectedCount = children.filter(c => c && (c.selected_take_id || c.selected_output || c.output)).length;
+  const header = `<div class="meta-panel"><b>Selected batch</b><br><span class="small">Job: <code>${esc(j.id || '')}</code><br>Manifest: <code>${esc(manifest || 'missing')}</code><br>Lines: ${esc(children.length)} · Selected lines: ${esc(selectedCount)}</span></div>`;
+  const rebuild = (typeof batchMixdownControls === 'function') ? batchMixdownControls(j) : '';
+  const lines = children.length ? children.map(c=>batchLineBlock(j,c)).join('') : '<div class="warning-box">This batch has no line records available.</div>';
+  box.innerHTML = header + rebuild + `<h3>Lines and takes</h3>${lines}`;
+  if(typeof applyTakeManagerVisibilityPrefs === 'function') applyTakeManagerVisibilityPrefs(); else applyUiPrefs();
+}
+function updateTakeManagerFromJobs(data){
+  if(!$('takeManagerContent')) return;
+  const preferred = takeManagerSelectedJobId || (($('takeManagerBatchSelect') && $('takeManagerBatchSelect').value) || '');
+  const job = selectedTakeManagerJobFromData(data, preferred);
+  renderTakeManagerJob(job);
+}
+function loadTakeManagerData(preferredId=''){
+  takeManagerSetStatus('Refreshing Take Manager...', 'warn');
+  return api('/api/jobs').then(data=>{
+    lastJobsData = data;
+    if(preferredId) takeManagerSelectedJobId = preferredId;
+    updateTakeManagerFromJobs(data);
+    const count = takeManagerEligibleBatches(data).length;
+    takeManagerSetStatus(count ? `Take Manager refreshed. ${count} completed batch${count===1?'':'es'} available.` : 'No completed Tagged Script batches found yet.', count ? 'ok' : 'warn');
+    return data;
+  }).catch(err=>{ takeManagerSetStatus('Could not refresh Take Manager: '+err, 'bad'); });
+}
+function selectTakeManagerBatch(){
+  const sel = $('takeManagerBatchSelect');
+  takeManagerSelectedJobId = sel ? (sel.value || '') : '';
+  try{ if(takeManagerSelectedJobId) localStorage.setItem('ttsLabTakeManagerJobId', takeManagerSelectedJobId); }catch(e){}
+  takeManagerLastSig = '';
+  loadTakeManagerData(takeManagerSelectedJobId);
+}
+function sendBatchToTakeManager(jobId){
+  takeManagerSelectedJobId = String(jobId || '');
+  try{ if(takeManagerSelectedJobId) localStorage.setItem('ttsLabTakeManagerJobId', takeManagerSelectedJobId); }catch(e){}
+  showTab('takes');
+  takeManagerSetStatus('Opening selected batch in Take Manager...', 'warn');
+  loadTakeManagerData(takeManagerSelectedJobId);
+}
 function cancelJob(id){
   if(!id) return;
   const status = $('cancel-status-'+id);
@@ -7715,8 +8310,48 @@ function cancelJob(id){
     })
     .catch(err=>{ if(status) status.innerHTML='<span class="bad">Could not abort job: '+esc(err)+'</span>'; else console.warn('Could not abort job', err); });
 }
+let jobsRenderLimit = Number(localStorage.getItem('ttsLabJobsRenderLimit') || 12);
+if(!Number.isFinite(jobsRenderLimit) || jobsRenderLimit < 1) jobsRenderLimit = 12;
+function setJobsRenderLimit(n){
+  jobsRenderLimit = Math.max(1, Math.min(200, Number(n) || 12));
+  try{ localStorage.setItem('ttsLabJobsRenderLimit', String(jobsRenderLimit)); }catch(e){}
+}
+function showMoreJobs(){
+  setJobsRenderLimit(jobsRenderLimit + 12);
+  if(lastJobsData){ lastJobsSig=''; renderJobs(lastJobsData); }
+}
+function showFewerJobs(){
+  setJobsRenderLimit(12);
+  if(lastJobsData){ lastJobsSig=''; renderJobs(lastJobsData); }
+}
+function batchLinesLazyDetails(j){
+  const count = (j.children || []).length;
+  const id = String(j.id || '');
+  return `<details class="batch-lines-lazy" data-jobid="${esc(id)}" ontoggle="renderBatchLinesIntoDetails(this)"><summary>${esc(count)} batch lines / takes — open when needed</summary><div class="small" data-batch-lines-body="1">Batch lines are lazy-loaded to keep startup responsive.</div></details>`;
+}
+function renderBatchLinesIntoDetails(el){
+  if(!el || !el.open) return;
+  const body = el.querySelector ? el.querySelector('[data-batch-lines-body]') : null;
+  if(!body || body.dataset.rendered === '1') return;
+  const id = (el.dataset && el.dataset.jobid) || '';
+  const jobs = (lastJobsData && Array.isArray(lastJobsData.jobs)) ? lastJobsData.jobs : [];
+  const j = jobs.find(x => String(x.id || '') === String(id || '')) || null;
+  if(!j || !Array.isArray(j.children) || !j.children.length){
+    body.innerHTML = '<span class="warn">Batch lines are not available in the current Jobs cache. Refresh Jobs or open this batch in Take Manager.</span>';
+    return;
+  }
+  const t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+  body.innerHTML = j.children.map(c=>batchLineBlock(j,c)).join('');
+  body.dataset.rendered = '1';
+  const dt = ((window.performance && performance.now) ? performance.now() : Date.now()) - t0;
+  if(dt > 350) logUiEvent('lazy-rendered batch lines slowly', {jobid:id, lines:j.children.length, ms:Math.round(dt)}, 'warn');
+  applyUiPrefs();
+}
 function renderJobs(data){
-  $('jobs').innerHTML = data.jobs.map(j=>{
+  const renderStart = (window.performance && performance.now) ? performance.now() : Date.now();
+  const allJobs = Array.isArray(data && data.jobs) ? data.jobs : [];
+  const visibleJobs = allJobs.slice(0, Math.max(1, jobsRenderLimit || 12));
+  let jobsHtml = visibleJobs.map(j=>{
     const title = `${j.kind}${j.engine?' / '+j.engine:''}${j.role?' / '+j.role:''}`;
     const isStt = j.kind === 'stt';
     return `<div class="job"><b>${esc(j.kind)} ${j.engine?'/ '+esc(j.engine):''}</b> <span class="${statusClass(j.status)}">${esc(j.status)}</span> ${j.kind==='historical-output'?'<span class="pill">recovered from output</span>':''}<br>
@@ -7729,13 +8364,23 @@ function renderJobs(data){
     ${j.kind==='resemble' ? resembleJobBlock(j) : ''}
     ${(!isStt && j.kind!=='video' && j.kind!=='metadata' && j.kind!=='resemble' && j.audio_url)?`<audio controls preload="none" src="${j.preview_url || j.audio_url}"></audio>${durationBadge(j.duration_seconds, false)}<br>${outputActions(j.output_path || j.output, j.text, j.id || '')} <a download href="${j.wav_url || j.audio_url}">download ${esc(((j.output_path||j.output||'').split('.').pop()||'audio').toLowerCase())}</a><br>${metadataBlock(j)}`:''}
     ${j.manifest_url?`<a download href="${j.manifest_url}">manifest</a><br>`:''}
-    ${j.children&&j.children.length?`<details><summary>${j.children.length} batch lines</summary>${j.children.map(c=>`${c.ok?'✅':'❌'} ${esc(c.index)} ${esc(c.role)} ${c.audio_url?`<audio controls preload="none" src="${c.preview_url || c.audio_url}"></audio>${durationBadge(c.duration_seconds, false)} ${outputActions(c.output, c.text)} <a download href="${c.wav_url || c.audio_url}">download wav</a>`:''}<br>`).join('')}</details>`:''}
+    ${j.children&&j.children.length?batchLinesLazyDetails(j):''}
     ${j.error?`<div class="bad">${esc(j.error)}</div>`:''}
     ${(j.status==='queued'||j.status==='running'||j.status==='canceling')?`<button class="mini danger cancel-job-btn" data-jobid="${esc(j.id)}">abort job</button> <span id="cancel-status-${esc(j.id)}" class="small inline-status"></span>`:''}
     ${j.status==='canceled'?`<div class="small warn">${esc(j.warning || 'Canceled by user.')}</div>`:''}
+    ${j.kind==='batch'&&j.children&&j.children.length?`<button class="mini secondary send-take-manager-btn" data-jobid="${esc(j.id || '')}">Send to Take Manager</button>`:''}
     <button class="mini secondary view-log-btn pref-logs" data-jobid="${esc(j.id)}" data-title="${esc(title)}">view log</button></div>`;
-  }).join('') || '<p class="small">No jobs yet.</p>';
+  }).join('');
+  if(!jobsHtml) jobsHtml = '<p class="small">No jobs yet.</p>';
+  if(allJobs.length > visibleJobs.length){
+    jobsHtml += `<div class="job"><span class="small">Showing ${esc(visibleJobs.length)} of ${esc(allJobs.length)} recent jobs to keep startup responsive.</span><br><button class="mini secondary" type="button" onclick="showMoreJobs()">show 12 more jobs</button> <button class="mini secondary" type="button" onclick="showFewerJobs()">show fewer</button></div>`;
+  } else if(allJobs.length > 12 && jobsRenderLimit > 12){
+    jobsHtml += `<div class="job"><button class="mini secondary" type="button" onclick="showFewerJobs()">show fewer jobs</button></div>`;
+  }
+  $('jobs').innerHTML = jobsHtml;
   applyUiPrefs();
+  const renderMs = ((window.performance && performance.now) ? performance.now() : Date.now()) - renderStart;
+  if(renderMs > 500) logUiEvent('Jobs render took longer than expected', {visible_jobs:visibleJobs.length, total_jobs:allJobs.length, render_limit:jobsRenderLimit, ms:Math.round(renderMs)}, 'warn');
 }
 function detectHfAuthNoticeFromJobs(data){
   const hit = (data.jobs || []).find(j => j && j.kind === 'stt' && j.status === 'error' && /Hugging Face|HF_TOKEN|HF Hub|authentication/i.test(String(j.error || '') + ' ' + String(j.warning || '')));
@@ -7746,19 +8391,85 @@ function detectHfAuthNoticeFromJobs(data){
     renderMaintenance();
   }
 }
+
+function bootJobsAsTabPreference(){
+  try{
+    const prefs = JSON.parse(localStorage.getItem('ttsLabUiBootPrefs') || '{}');
+    return !!(prefs && prefs.jobs_as_tab);
+  }catch(e){ return false; }
+}
+function jobsAreConfiguredAsTab(){
+  const opt = $('optJobsAsTab');
+  const stateKnown = (typeof formStateLoaded !== 'undefined' && !!formStateLoaded);
+  if(opt && stateKnown) return !!opt.checked;
+  if(opt && opt.checked) return true;
+  // During initial page load, /api/state has not populated the Options form yet.
+  // Trust the same boot preference that CSS uses, otherwise refreshJobs() may
+  // render the full hidden Jobs pane before the layout preference is applied.
+  return bootJobsAsTabPreference();
+}
+function jobsPanelIsActuallyVisible(){
+  const jobsAsTab = jobsAreConfiguredAsTab();
+  return !jobsAsTab || currentTabName === 'jobs';
+}
+function takeManagerIsActuallyVisible(){
+  return currentTabName === 'takes' && !!$('takeManagerContent');
+}
+function takeManagerShouldAutoRender(){
+  return takeManagerIsActuallyVisible();
+}
+function maybeRefreshTakeManagerOnOpen(){
+  const preferred = takeManagerSelectedJobId || localStorage.getItem('ttsLabTakeManagerJobId') || '';
+  takeManagerSelectedJobId = preferred || takeManagerSelectedJobId || '';
+  if(lastJobsData && typeof updateTakeManagerFromJobs === 'function'){
+    updateTakeManagerFromJobs(lastJobsData);
+    takeManagerSetStatus('Take Manager opened from cached job data. Use Refresh Take Manager for a forced reload.', 'ok');
+    return Promise.resolve(lastJobsData);
+  }
+  if(typeof loadTakeManagerData === 'function') return loadTakeManagerData(preferred);
+  return Promise.resolve(null);
+}
+function applyTakeManagerVisibilityPrefs(){
+  const adv=$('optAdvanced')?.checked !== false;
+  const prof=$('optProfileTools')?.checked !== false;
+  const exp=$('optExperimental')?.checked === true;
+  const meta=$('optMetadata')?.checked !== false;
+  const logs=$('optLogs')?.checked !== false;
+  const del=$('optDelete')?.checked !== false;
+  setPrefVisible('pref-advanced', adv);
+  setPrefVisible('pref-profile-tools', prof);
+  setPrefVisible('pref-experimental', exp);
+  setPrefVisible('pref-metadata', meta);
+  setPrefVisible('pref-logs', logs);
+  setPrefVisible('pref-delete', del);
+}
 function refreshJobs(){
   return api('/api/jobs').then(data=>{
+    lastJobsData = data;
+    if(typeof updateTakeManagerFromJobs === 'function' && takeManagerShouldAutoRender()) updateTakeManagerFromJobs(data);
     detectHfAuthNoticeFromJobs(data);
     updateCurrentGenerationFromJobs(data);
     updateCurrentSttFromJobs(data);
     updateCurrentSpeechAnalysisFromJobs(data);
     updateCurrentMetadataFromJobs(data);
     const active = data.jobs.some(j => j.status === 'queued' || j.status === 'running' || j.status === 'canceling');
-    const sig = JSON.stringify(data.jobs.map(j => [j.id, j.kind, j.status, j.returncode, j.error, j.warning, j.output, (j.children||[]).length, j.transcript||"", (j.result&&j.result.proposed_cuts?j.result.proposed_cuts.length:0)]));
+    const sig = JSON.stringify(data.jobs.map(j => {
+      const childCount = Array.isArray(j.children) ? j.children.length : 0;
+      const takeCount = Array.isArray(j.children) ? j.children.reduce((n,c)=>n+(((c||{}).takes||[]).length||0),0) : 0;
+      const mix = j.result && j.result.mixdown ? (j.result.mixdown.output_audio || '') : '';
+      return [j.id, j.kind, j.status, j.returncode, j.error, j.warning, j.output, childCount, takeCount, mix, j.transcript||"", (j.result&&j.result.proposed_cuts?j.result.proposed_cuts.length:0)];
+    }));
     // Avoid destroying/recreating <audio> elements while the user is listening.
     // Re-render only when something actually changed, and defer non-critical
     // visual refreshes if audio is playing.
-    if(sig !== lastJobsSig && !anyAudioPlaying()){
+    const jobsVisible = jobsPanelIsActuallyVisible();
+    if(sig !== lastJobsSig && !jobsVisible){
+      lastJobsSig = sig;
+      if(!window.__ttsLabHiddenJobsRenderSkippedLogged){
+        window.__ttsLabHiddenJobsRenderSkippedLogged = true;
+        logUiEvent('skipped hidden Jobs render during startup/poll', {jobs_as_tab:jobsAreConfiguredAsTab(), current_tab:currentTabName || ''});
+      }
+    } else if(sig !== lastJobsSig && !anyAudioPlaying()){
       renderJobs(data);
       lastJobsSig = sig;
     } else if(sig !== lastJobsSig && active) {
@@ -9295,6 +10006,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(tagged_workspace_save_payload(body))
             elif path == "/api/tagged-workspace/load":
                 self.send_json(tagged_workspace_load_payload(body))
+            elif path == "/api/batch/take":
+                job = Job(id=uuid.uuid4().hex, kind="batch-take")
+                JOBS.add(job, body)
+                self.send_json({"job": job.public()})
+            elif path == "/api/batch/take/select":
+                self.send_json(JOBS.select_batch_take(body))
             elif path == "/api/batch":
                 job = Job(id=uuid.uuid4().hex, kind="batch")
                 JOBS.add(job, body)
