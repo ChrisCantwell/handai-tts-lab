@@ -87,7 +87,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.95.5"
+VERSION = "0.96"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -6074,6 +6074,10 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
       <label class="pref-advanced"><input id="splitLong" type="checkbox" checked /> Split Chatterbox multi-sentence text into chunks and concatenate</label>
       <label>Text to synthesize</label>
       <textarea id="text" placeholder="Your line here."></textarea>
+      <label>Queue takes
+        <input id="queueTakes" type="number" min="1" max="20" step="1" value="1" style="max-width:120px" />
+      </label>
+      <div class="small">Each Generate click snapshots the current text, engine, profile, reference, and option values. Additional clicks can queue different snapshots while earlier takes are still waiting or running.</div>
       <div class="sticky-actions"><button id="generateSingleButton" onclick="generateSingle()">Generate</button><div id="synthActionStatus" class="small inline-status"></div></div>
     </div>
 
@@ -9774,6 +9778,211 @@ if(typeof refreshJobs === 'function' && !window.__v0932LegacyBatchMixdownWrapped
 }
 
 api('/api/meta').then(setupEngines).then(loadAll).then(restoreFormState).then(restoreTabFromHash).then(()=>{ initTaggedScriptPreflightHooks(); updateTaggedScriptPreflight(); }).catch(alert);
+</script>
+<script>
+// HandAI TTS Lab v0.96 — Synthesize Alternate Takes Queue
+(() => {
+  const previousCollectFormState = collectFormState;
+  const previousAttachFormStateHandlers = attachFormStateHandlers;
+  const previousUpdateCurrentGenerationFromJobs = updateCurrentGenerationFromJobs;
+
+  const currentSingleJobs = new Map();
+  let requestedCount = 0;
+  let pendingRequests = 0;
+  let requestFailures = 0;
+  let completionLogged = false;
+  let queueSequence = 0;
+
+  function takeCount() {
+    const el = $('queueTakes');
+    const parsed = Number.parseInt(el ? el.value : '1', 10);
+    const count = Number.isFinite(parsed) ? Math.max(1, Math.min(20, parsed)) : 1;
+    if (el) el.value = String(count);
+    return count;
+  }
+
+  function snapshot() {
+    return Object.freeze({
+      engine: $('engine').value,
+      role: $('role').value,
+      profile: $('profileSelect').value,
+      ref: $('ref').value,
+      ref_text: $('refText').value,
+      x_vector_only: $('xVector').checked,
+      split_on_sentences: $('splitLong').checked,
+      text: $('text').value,
+      engine_options: Object.freeze({}),
+    });
+  }
+
+  function counts() {
+    const result = {queued: 0, running: 0, canceling: 0, done: 0, error: 0, canceled: 0, unknown: 0};
+    for (const meta of currentSingleJobs.values()) {
+      const status = String((meta && meta.status) || 'queued');
+      if (Object.prototype.hasOwnProperty.call(result, status)) result[status] += 1;
+      else result.unknown += 1;
+    }
+    return result;
+  }
+
+  function activeCount(result = counts()) {
+    return result.queued + result.running + result.canceling + result.unknown;
+  }
+
+  function renderStatus() {
+    const result = counts();
+    const accepted = currentSingleJobs.size;
+    const active = activeCount(result);
+    const finished = result.done;
+    const failed = result.error + result.canceled + requestFailures;
+    const parts = [];
+    if (result.running) parts.push(result.running + ' running');
+    if (result.queued) parts.push(result.queued + ' waiting');
+    if (result.canceling) parts.push(result.canceling + ' canceling');
+    if (finished) parts.push(finished + ' finished');
+    if (failed) parts.push(failed + ' failed/canceled');
+
+    if (pendingRequests) {
+      parts.unshift(pendingRequests + ' request' + (pendingRequests === 1 ? '' : 's') + ' submitting');
+      setGenerateStatus('synthActionStatus', '<span class="warn">Queueing synthesis takes.</span> ' + parts.join(' · ') + ' ' + openJobsButtonHtml());
+      return;
+    }
+    if (active) {
+      setGenerateStatus('synthActionStatus', '<span class="warn">' + accepted + ' synthesis take' + (accepted === 1 ? '' : 's') + ' tracked.</span> ' + parts.join(' · ') + ' ' + openJobsButtonHtml());
+      return;
+    }
+    if (accepted && !failed) {
+      setGenerateStatus('synthActionStatus', '<span class="ok">' + finished + ' synthesis take' + (finished === 1 ? '' : 's') + ' finished.</span> ' + openJobsButtonHtml(), 'ok');
+      return;
+    }
+    if (accepted || failed) {
+      setGenerateStatus('synthActionStatus', '<span class="' + (finished ? 'warn' : 'bad') + '">' + finished + ' finished · ' + failed + ' failed/canceled.</span> ' + openJobsButtonHtml(), finished ? 'warn' : 'bad');
+    }
+  }
+
+  window.generateSingle = function generateSingleV096() {
+    const requestSnapshot = snapshot();
+    if (!String(requestSnapshot.text || '').trim()) {
+      setGenerateStatus('synthActionStatus', 'Enter text to synthesize first.', 'bad');
+      return;
+    }
+
+    const existing = counts();
+    if (pendingRequests === 0 && activeCount(existing) === 0) {
+      currentSingleJobs.clear();
+      requestedCount = 0;
+      requestFailures = 0;
+    }
+
+    const count = takeCount();
+    const groupId = 'single-' + Date.now() + '-' + (++queueSequence);
+    requestedCount += count;
+    pendingRequests += count;
+    completionLogged = false;
+    saveFormStateNow();
+
+    logUiEvent('single synthesis queue clicked', {
+      group_id: groupId,
+      take_count: count,
+      engine: requestSnapshot.engine,
+      profile: requestSnapshot.profile || '',
+      role: requestSnapshot.role || '',
+      text_chars: String(requestSnapshot.text || '').length,
+      text_preview: String(requestSnapshot.text || '').trim().slice(0, 120),
+      x_vector_only: !!requestSnapshot.x_vector_only,
+      split_on_sentences: !!requestSnapshot.split_on_sentences,
+    });
+    renderStatus();
+
+    const requests = [];
+    for (let takeNumber = 1; takeNumber <= count; takeNumber += 1) {
+      const requestBody = JSON.stringify(requestSnapshot);
+      requests.push(
+        api('/api/generate', {method: 'POST', body: requestBody})
+          .then(response => {
+            const job = response && (response.job || response);
+            if (!job || !job.id) throw new Error('Queue response did not include a job id.');
+            currentSingleJobs.set(job.id, {status: job.status || 'queued', group_id: groupId, take_number: takeNumber});
+            logUiEvent('single synthesis job accepted', {group_id: groupId, take_number: takeNumber, job_id: job.id, status: job.status || 'queued'});
+          })
+          .catch(error => {
+            requestFailures += 1;
+            logUiEvent('single synthesis queue request failed', {group_id: groupId, take_number: takeNumber, error: String(error)}, 'error');
+          })
+          .finally(() => {
+            pendingRequests = Math.max(0, pendingRequests - 1);
+            renderStatus();
+          })
+      );
+    }
+
+    Promise.allSettled(requests).then(() => {
+      lastJobsSig = '';
+      refreshJobs();
+      startPoll();
+      renderStatus();
+    });
+  };
+
+  window.updateCurrentGenerationFromJobs = function updateCurrentGenerationFromJobsV096(data) {
+    previousUpdateCurrentGenerationFromJobs(data);
+    if (!currentSingleJobs.size) return;
+
+    const jobsById = new Map((data.jobs || []).map(job => [job.id, job]));
+    for (const [jobId, meta] of currentSingleJobs.entries()) {
+      const job = jobsById.get(jobId);
+      if (!job) continue;
+      const nextStatus = String(job.status || meta.status || 'queued');
+      if (nextStatus !== meta.status) {
+        currentSingleJobs.set(jobId, Object.assign({}, meta, {status: nextStatus}));
+        if (nextStatus === 'done' || nextStatus === 'error' || nextStatus === 'canceled') {
+          logUiEvent('single synthesis job settled', {job_id: jobId, status: nextStatus, group_id: meta.group_id || '', take_number: meta.take_number || null});
+        }
+      }
+    }
+
+    renderStatus();
+    const result = counts();
+    if (pendingRequests === 0 && activeCount(result) === 0 && !completionLogged) {
+      completionLogged = true;
+      logUiEvent('single synthesis queue settled', {
+        requested: requestedCount,
+        accepted: currentSingleJobs.size,
+        finished: result.done,
+        job_failures: result.error + result.canceled,
+        request_failures: requestFailures,
+      }, (result.error || result.canceled || requestFailures) ? 'warn' : 'info');
+    }
+  };
+
+  window.collectFormState = function collectFormStateV096() {
+    const state = previousCollectFormState();
+    state.queue_takes = takeCount();
+    return state;
+  };
+
+  function attachQueueStateHandler() {
+    const el = $('queueTakes');
+    if (!el || el.dataset.stateHooked) return;
+    el.dataset.stateHooked = '1';
+    el.addEventListener('input', scheduleFormStateSave);
+    el.addEventListener('change', scheduleFormStateSave);
+  }
+
+  window.attachFormStateHandlers = function attachFormStateHandlersV096() {
+    previousAttachFormStateHandlers();
+    attachQueueStateHandler();
+  };
+
+  api('/api/state').then(data => {
+    const state = data.state || {};
+    if (state.queue_takes !== undefined && $('queueTakes')) {
+      $('queueTakes').value = String(clampNumber(state.queue_takes, 1, 20, 1));
+    }
+  }).catch(error => {
+    logUiEvent('could not restore Synthesize queue count', {error: String(error)}, 'warn');
+  }).finally(attachQueueStateHandler);
+})();
 </script>
 </body>
 </html>
