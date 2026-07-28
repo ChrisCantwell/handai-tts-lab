@@ -311,7 +311,7 @@ activate_env() {
 
 cmd_synth() {
   local engine="$1"; shift
-  local text="" ref="$REF" ref_text="" out="" xvector="" language="English"
+  local text="" ref="$REF" ref_text="" out="" xvector="" language="English" temperature="" repetition_penalty="" top_p="" top_k="" seed="" norm_loudness="1"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -320,6 +320,12 @@ cmd_synth() {
       --ref-text) ref_text="$2"; shift 2 ;;
       --out) out="$2"; shift 2 ;;
       --language) language="$2"; shift 2 ;;
+      --temperature) temperature="$2"; shift 2 ;;
+      --repetition-penalty) repetition_penalty="$2"; shift 2 ;;
+      --top-p) top_p="$2"; shift 2 ;;
+      --top-k) top_k="$2"; shift 2 ;;
+      --seed) seed="$2"; shift 2 ;;
+      --no-norm-loudness) norm_loudness="0"; shift ;;
       --x-vector-only) xvector="1"; shift ;;
       *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -337,7 +343,14 @@ cmd_synth() {
 
   case "$engine" in
     chatterbox)
-      python "$SCRIPTS/synth_chatterbox.py" --text "$text" --ref "$ref" --out "$out"
+      args=(--text "$text" --ref "$ref" --out "$out")
+      [[ -n "$temperature" ]] && args+=(--temperature "$temperature")
+      [[ -n "$repetition_penalty" ]] && args+=(--repetition-penalty "$repetition_penalty")
+      [[ -n "$top_p" ]] && args+=(--top-p "$top_p")
+      [[ -n "$top_k" ]] && args+=(--top-k "$top_k")
+      [[ -n "$seed" ]] && args+=(--seed "$seed")
+      [[ "$norm_loudness" == "0" ]] && args+=(--no-norm-loudness)
+      python "$SCRIPTS/synth_chatterbox.py" "${args[@]}"
       ;;
     qwen3)
       args=(--text "$text" --ref "$ref" --out "$out" --language "$language")
@@ -476,11 +489,15 @@ BASH_LAUNCHER
 
   cat > "${TTS_LAB}/scripts/synth_chatterbox.py" <<'PY'
 #!/usr/bin/env python3
-"""Generate speech with Chatterbox-Turbo."""
+"""Generate speech with Chatterbox-Turbo using explicit sampling controls."""
 import argparse
+import json
+import random
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
+import torch
 from chatterbox.tts_turbo import ChatterboxTurboTTS
 
 
@@ -490,10 +507,24 @@ def main() -> None:
     p.add_argument("--ref", required=True, help="Reference WAV for voice cloning")
     p.add_argument("--out", required=True, help="Output WAV path")
     p.add_argument("--device", default="cuda", help="cuda or cpu")
+    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--repetition-penalty", type=float, default=1.2)
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--top-k", type=int, default=1000)
+    p.add_argument("--seed", type=int, default=None, help="Optional reproducible sampling seed")
+    p.add_argument("--no-norm-loudness", dest="norm_loudness", action="store_false")
+    p.set_defaults(norm_loudness=True)
     args = p.parse_args()
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed % (2**32))
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
     model = ChatterboxTurboTTS.from_pretrained(device=args.device)
 
@@ -505,7 +536,24 @@ def main() -> None:
 
     model.watermarker = _NoWatermark()
 
-    wav = model.generate(args.text, audio_prompt_path=args.ref)
+    options = {
+        "temperature": max(0.05, min(2.0, args.temperature)),
+        "repetition_penalty": max(0.5, min(3.0, args.repetition_penalty)),
+        "top_p": max(0.05, min(1.0, args.top_p)),
+        "top_k": max(1, min(5000, args.top_k)),
+        "seed": args.seed,
+        "norm_loudness": bool(args.norm_loudness),
+    }
+    print("Chatterbox-Turbo options: " + json.dumps(options, sort_keys=True), flush=True)
+    wav = model.generate(
+        args.text,
+        audio_prompt_path=args.ref,
+        temperature=options["temperature"],
+        repetition_penalty=options["repetition_penalty"],
+        top_p=options["top_p"],
+        top_k=options["top_k"],
+        norm_loudness=options["norm_loudness"],
+    )
     sf.write(str(out), wav.squeeze().cpu().numpy(), model.sr)
     print(f"Wrote {out}")
 

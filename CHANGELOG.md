@@ -1,3 +1,21 @@
+## v0.97 - Chatterbox-Turbo controls and performance tags
+
+- Hotfix: restores a per-line `text = spoken_text` compatibility alias so legacy batch-renderer references no longer raise `NameError` after successful parsing.
+
+- Hotfix: corrects a Tagged Script batch `NameError` caused by a stale `text` progress-field reference after the parser moved to `spoken_text`.
+- Hotfix: corrects over-escaped Python whitespace and word-boundary regexes that produced zero Tagged Script word counts despite successful line detection.
+- Adds an isolated parser regression test covering inline styles, multi-line style blocks, and positional vocal events.
+
+- Adds real Chatterbox-Turbo sampling controls: temperature, repetition penalty, top-p, top-k, reference loudness normalization, and optional seed.
+- Leaves blank seed behavior random; queued takes may increment an entered seed for reproducible alternatives.
+- Adds supported Turbo performance-style and vocal-event insertion tools.
+- Parses standalone performance blocks and leading inline performance tags in Tagged Scripts while preserving positional vocal events.
+- Validates unsupported, nested, mismatched, and unclosed performance tags before generation.
+- Saves performance style and exact engine options in batch manifests, take metadata, output sidecars, and diagnostics.
+- Adds lazy Take Manager overrides for style and Turbo sampling controls.
+- Updates the generated machine-local launcher/helper so the Web UI controls reach the confirmed ChatterboxTurboTTS 0.1.7 API.
+- Intentionally omits CFG, min-p, and exaggeration because Chatterbox-Turbo accepts but ignores them.
+
 ## v0.94.2 - Tagged Script Workspace refresh polish
 
 ## v0.95.5 - Jobs startup render budget
