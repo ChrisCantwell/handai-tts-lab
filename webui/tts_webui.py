@@ -10885,7 +10885,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         try:
             if path == "/" or path == "/index.html":
-                self.send_text(INDEX_HTML)
+                self.send_text(INDEX_HTML.replace("v0.94", f"v{VERSION}"))
             elif path == "/api/meta":
                 self.send_json({"version": VERSION, "lab": str(LAB), "launcher": str(LAUNCHER), "default_ref": str(DEFAULT_REF), "engines": ENGINE_META})
             elif path == "/api/stack-status":
