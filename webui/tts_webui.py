@@ -6403,7 +6403,8 @@ html.boot-layout-stack body main { display:flex; flex-direction:column; }
 html.boot-layout-stack body .left-panel { flex: 0 0 min(62vh, 680px); }
 html.boot-layout-stack body .right-panel { flex: 1 1 320px; }
 html.boot-jobs-as-tab.boot-layout-stack body .left-panel { flex: 1 1 auto; }
-.jobs-tab-button.hidden { display:none; }
+.jobs-tab-button { display:none; }
+body.jobs-as-tab .jobs-tab-button, html.boot-jobs-as-tab .jobs-tab-button { display:inline-block; }
 .layout-status { margin-top:6px; min-height:1.2em; }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; box-shadow: 0 8px 22px rgba(0,0,0,.18); overflow-y:auto; min-height:0; }
 .sticky-actions { position: sticky; bottom: -16px; background: linear-gradient(180deg, rgba(24,28,37,0.75), var(--panel) 35%); padding: 12px 0 2px; z-index: 5; }
@@ -6489,6 +6490,7 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
     const root = document.documentElement;
     if(prefs && prefs.jobs_as_tab) root.classList.add('boot-jobs-as-tab');
     if(prefs && prefs.panel_orientation === 'stack') root.classList.add('boot-layout-stack');
+    if(prefs && prefs.jobs_as_tab) document.body.classList.add('jobs-as-tab');
     const w = Number(prefs && prefs.operations_panel_width);
     if(Number.isFinite(w) && w >= 320 && w <= 900) root.style.setProperty('--ops-width', Math.round(w) + 'px');
   }catch(e){}
