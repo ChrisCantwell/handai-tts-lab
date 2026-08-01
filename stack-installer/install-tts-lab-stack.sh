@@ -903,10 +903,13 @@ download_chatterbox_model() {
   [[ "$INSTALL_CHATTERBOX" == "1" && "$DOWNLOAD_MODELS" == "1" ]] || return 0
   log "Pre-downloading Chatterbox-Turbo model"
   HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
-    python_in_env tts-chatterbox - <<'PY'
+    python_in_env tts-chatterbox - <<'PY' || warn "Chatterbox model pre-download failed; will download on first use."
 from chatterbox.tts_turbo import ChatterboxTurboTTS
-m = ChatterboxTurboTTS.from_pretrained()
-print("chatterbox model cached")
+try:
+    m = ChatterboxTurboTTS.from_pretrained(device="cuda")
+    print("chatterbox model cached")
+except Exception as e:
+    print(f"chatterbox model pre-download skipped: {e}")
 PY
 }
 
@@ -941,13 +944,18 @@ install_qwen3() {
   create_env tts-qwen3 3.12
   install_pytorch_in_env tts-qwen3 "$PYTORCH_CUDA_INDEX"
   pip_in_env tts-qwen3 install -U qwen-tts soundfile
+  # qwen-tts pulls transformers 4.x which requires huggingface-hub<1.0, but
+  # huggingface_hub[cli] -U would re-upgrade it. Pin it <1.0 before the CLI.
+  pip_in_env tts-qwen3 install --no-deps "huggingface-hub<1.0"
   if [[ "$DOWNLOAD_MODELS" == "1" ]]; then
-    pip_in_env tts-qwen3 install -U "huggingface_hub[cli]"
+    pip_in_env tts-qwen3 install -U "huggingface_hub[cli]<1.0"
     HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
       "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-Tokenizer-12Hz || true
     HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
       "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-0.6B-Base || true
   fi
+  # Final safety: any -U install above may have bumped huggingface-hub back to 1.x
+  pip_in_env tts-qwen3 install --no-deps "huggingface-hub<1.0"
   if [[ "$RUN_IMPORT_CHECKS" == "1" ]]; then
     python_in_env tts-qwen3 - <<'PY'
 from qwen_tts import Qwen3TTSModel
@@ -978,7 +986,7 @@ install_cosyvoice() {
     grep -v -E 'deepspeed|tensorrt|openai-whisper' "$req" > "$filtered"
     pip_in_env tts-cosyvoice install -r "$filtered" || warn "CosyVoice filtered requirements had failures; installing known inference dependencies next."
   fi
-  pip_in_env tts-cosyvoice install pyarrow pyworld lightning fastapi uvicorn modelscope "huggingface_hub[cli]" soundfile librosa
+  pip_in_env tts-cosyvoice install pyarrow pyworld lightning fastapi uvicorn modelscope "huggingface_hub[cli]" soundfile librosa openai-whisper
 
   if [[ "$DOWNLOAD_MODELS" == "1" ]]; then
     (cd "${TTS_LAB}/engines/cosyvoice/CosyVoice" && \
