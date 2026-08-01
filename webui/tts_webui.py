@@ -7257,7 +7257,7 @@ let currentSttJobId = null;
 let currentSpeechAnalysisResult = null;
 let currentMetadataJobId = null;
 let currentSingleJobId = null;
-let currentBatchJobId = null;
+let activeBatchJobIds = new Set();
 let lastSttSelectedPath = null;
 const TAB_NAMES = ['single','batch','takes','profiles','refs','options','stt','video','audio','metadata','resemble','maintenance','jobs'];
 let uiDiagEvents = [];
@@ -7675,8 +7675,16 @@ function generateBatch(){
   setGenerateStatus('batchActionStatus', '<span class="warn">Queueing tagged script job...</span>'+openJobsButtonHtml());
   saveFormStateNow();
   api('/api/batch', {method:'POST', body:JSON.stringify(body)})
-    .then(r=>{ currentBatchJobId = r.job && r.job.id; setGenerateStatus('batchActionStatus', queuedJobStatus('tagged script', r.job || r)); lastJobsSig=''; refreshJobs(); startPoll(); })
-    .catch(err=>{ currentBatchJobId=null; setButtonBusy('batchGenerateButton', false); setGenerateStatus('batchActionStatus', 'Could not queue tagged script job: '+err, 'bad'); });
+    .then(r=>{
+      const id = r.job && r.job.id;
+      if (id) activeBatchJobIds.add(id);
+      setGenerateStatus('batchActionStatus', queuedJobStatus('tagged script', r.job || r));
+      setButtonBusy('batchGenerateButton', false);
+      lastJobsSig='';
+      refreshJobs();
+      startPoll();
+    })
+    .catch(err=>{ setButtonBusy('batchGenerateButton', false); setGenerateStatus('batchActionStatus', 'Could not queue tagged script job: '+err, 'bad'); });
 }
 function updateCurrentGenerationFromJobs(data){
   if(currentSingleJobId){
@@ -7695,26 +7703,39 @@ function updateCurrentGenerationFromJobs(data){
       }
     }
   }
-  if(currentBatchJobId){
-    const j=(data.jobs||[]).find(x=>x.id===currentBatchJobId);
-    if(j){
+  if(activeBatchJobIds.size){
+    const jobs=(data.jobs||[]).filter(x=>activeBatchJobIds.has(x.id));
+    let stillActive = 0, doneCount=0, errorMsg='';
+    for(const j of jobs){
       if(j.status === 'done'){
-        const result = j.result || {};
+        doneCount++;
+        activeBatchJobIds.delete(j.id);
+      } else if(j.status === 'error' || j.status === 'canceled'){
+        activeBatchJobIds.delete(j.id);
+        errorMsg = j.status === 'canceled' ? 'Tagged script canceled.' : 'Tagged script failed. Open Jobs for the log. '+(j.error||'');
+      } else {
+        stillActive++;
+      }
+    }
+    if(activeBatchJobIds.size === 0){
+      if(errorMsg){
+        setGenerateStatus('batchActionStatus', errorMsg, 'bad');
+      } else {
+        const last = jobs[jobs.length-1];
+        const result = last && last.result ? last.result : {};
         const mix = result.mixdown || {};
-        const path = mix.output_audio || j.output_path || j.output || '';
+        const path = mix.output_audio || (last && (last.output_path || last.output)) || '';
         const msg = path ? '<span class="ok">Tagged script done. Final mixdown:</span> <code>'+esc(path)+'</code> ' : '<span class="ok">Tagged script done.</span> ';
         setGenerateStatus('batchActionStatus', msg+openJobsButtonHtml(), 'ok');
-        setButtonBusy('batchGenerateButton', false);
-        currentBatchJobId=null;
-      } else if(j.status === 'error' || j.status === 'canceled'){
-        setGenerateStatus('batchActionStatus', j.status === 'canceled' ? 'Tagged script canceled.' : 'Tagged script failed. Open Jobs for the log. '+(j.error||''), 'bad');
-        setButtonBusy('batchGenerateButton', false);
-        currentBatchJobId=null;
-      } else {
-        const p = j.result && j.result.progress ? j.result.progress : null;
-        const detail = p ? ' · '+esc(p.completed_lines||0)+'/'+esc(p.total_lines||'?')+' lines · ETA '+esc(etaText(p.estimated_remaining_seconds)) : '';
-        setGenerateStatus('batchActionStatus', '<span class="warn">Tagged script '+esc(j.status)+detail+'...</span>'+openJobsButtonHtml());
       }
+      setButtonBusy('batchGenerateButton', false);
+    } else if(jobs.length){
+      const j = jobs[jobs.length-1];
+      const p = j.result && j.result.progress ? j.result.progress : null;
+      const detail = p ? ' · '+esc(p.completed_lines||0)+'/'+esc(p.total_lines||'?')+' lines · ETA '+esc(etaText(p.estimated_remaining_seconds)) : '';
+      const queuedCount = activeBatchJobIds.size - stillActive;
+      const queueInfo = queuedCount > 0 ? ' ('+queuedCount+' queued)' : '';
+      setGenerateStatus('batchActionStatus', '<span class="warn">Tagged script '+esc(j.status)+detail+queueInfo+'</span>'+openJobsButtonHtml());
     }
   }
 }
@@ -10686,8 +10707,16 @@ api('/api/meta').then(setupEngines).then(loadAll).then(restoreFormState).then(re
     setGenerateStatus('batchActionStatus','<span class="warn">Queueing tagged script job...</span>'+openJobsButtonHtml());
     saveFormStateNow();
     api('/api/batch',{method:'POST',body:JSON.stringify(body)})
-      .then(r=>{ currentBatchJobId=r.job&&r.job.id; setGenerateStatus('batchActionStatus',queuedJobStatus('tagged script',r.job||r)); lastJobsSig=''; refreshJobs(); startPoll(); })
-      .catch(err=>{ currentBatchJobId=null; setButtonBusy('batchGenerateButton',false); setGenerateStatus('batchActionStatus','Could not queue tagged script job: '+err,'bad'); });
+      .then(r=>{
+        const id = r.job && r.job.id;
+        if (id) activeBatchJobIds.add(id);
+        setGenerateStatus('batchActionStatus',queuedJobStatus('tagged script',r.job||r));
+        setButtonBusy('batchGenerateButton',false);
+        lastJobsSig='';
+        refreshJobs();
+        startPoll();
+      })
+      .catch(err=>{ setButtonBusy('batchGenerateButton',false); setGenerateStatus('batchActionStatus','Could not queue tagged script job: '+err,'bad'); });
   };
 
   window.taggedScriptPreflightInfo=function taggedScriptPreflightInfoV097(scriptOverride=null){
