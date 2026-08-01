@@ -1,3 +1,11 @@
+### v0.97.1 - Audio finalization and log refresh cleanup
+
+- Finalizes chunked generated audio once instead of rewriting the same WAV and recreating its MP3 preview twice.
+- Serves existing MP3 outputs directly as browser audio rather than creating `.mp3.preview.mp3`.
+- Preserves live log streaming while adding visible manual-refresh acknowledgment and result text.
+- Adds an **Options → Synthesis pacing** setting for pauses between chunks / between Tagged Script lines. Default `0` seconds; saved in `webui_state.json`. `TTS_WEBUI_COOLDOWN_SECONDS` still overrides as an emergency escape hatch.
+- ETA text now reads **estimating time remaining...** while no estimate is available.
+
 ### v0.94.2 - Tagged Script Workspace refresh polish
 
 - The manual workspace refresh button now reports `Refreshed projects, scripts, casts.` instead of leaving the previous save/load status message in place.
@@ -7,7 +15,7 @@
 - Independent names for scripts, casts, and projects.
 - Historical-output recovery skips internal helper WAVs and improves recovered mixdown labeling.
 
-# TTS Lab Unified Web UI v0.94.3
+# TTS Lab Unified Web UI v0.97.1
 
 Local web UI for `/home/user/tts-lab` voice/TTS/STT/audio-production workflows. v0.93.2 adds a visual Tagged Script role-map builder for assigning script roles to saved voice profiles, while preserving the local speech API, WhisperX Maintenance, Metadata, Speech Repair Analysis, AI Studio Bridge, stack diagnostics, and Actions dropdown/external launch work.
 

@@ -78,6 +78,11 @@ Thumbs.db
 *.swp
 *~
 
+# Version / hotfix materializer artifacts
+*.bak-*
+v0*-*.txt
+apply_v0*.py
+
 # Keep documented environment examples while ignoring real secrets.
 !.env*.example
 !**/.env*.example
