@@ -1,8 +1,8 @@
 # HandAI TTS Lab Installer Contract
 
-Version: 0.1.0  
+Version: 0.2.0  
 Date: 2026-08-01  
-Status: Draft — pending review by Chris
+Status: Approved — v1 scope locked
 
 ## 1. Purpose
 
@@ -14,7 +14,7 @@ This document defines what the HandAI TTS Lab installer must do, what it must pr
 - Produce a self-contained application directory at `~/handai-tts-lab/` by default.
 - Separate replaceable application code from precious user data.
 - Support GPU detection and install engines conditionally based on available VRAM.
-- Provide a working Chatterbox smoke test at the end of installation.
+- Provide working Chatterbox and Whisper smoke tests at the end of installation.
 - Allow backup/restore of workspace data and model caches.
 
 ## 3. Non-Goals
@@ -23,7 +23,7 @@ This document defines what the HandAI TTS Lab installer must do, what it must pr
 - Engine redesigns or swaps.
 - Direct writes to the repository's `main` branch by the installer.
 - Automatic cloud deployment templates (Runpod, AWS, etc.) in v1 — manual Runpod setup is acceptable.
-- Full upgrade/repair/uninstall paths in v1; fresh install is the first pass.
+- Full XDG Base Directory support. The contract documents the override, but v1 targets the self-contained `~/handai-tts-lab/` layout only.
 
 ## 4. Target Environment
 
@@ -125,11 +125,23 @@ If `conda` is not found at `CONDA_ROOT` or on `PATH`, the installer downloads an
 | `tts-crisperwhisper` | CrisperWhisper | No | 8 GB+ | Optional speech analysis. |
 | `tts-ai-studio-bridge` | Bridge sidecar | Yes | Minimal | Required if using HandAISpoke integration. |
 
-The installer detects VRAM and skips default installation of engines that cannot reasonably run. The user may override with flags such as `--with-f5-experimental`.
+The installer detects available VRAM and **warns + prompts for confirmation** before skipping engines that may not fit. It does not silently skip engines. The user may override with flags such as `--with-f5-experimental` or `--skip-qwen3`.
 
-### 6.4 Repository code
+### One-line install entrypoint
 
-The installer clones or copies the `handai-tts-lab` repository into `TTS_APP_DIR`. It then runs the web UI installer (`app/webui/install.sh`) to copy Python files and write start scripts into `TTS_LAB`.
+For convenience, a top-level `stack-installer/install.sh` script is provided. It can be run directly from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ChrisCantwell/handai-tts-lab/main/stack-installer/install.sh | bash
+```
+
+This script:
+1. Clones or updates the `handai-tts-lab` repo into `TTS_APP_DIR`.
+2. Runs `stack-installer/install-tts-lab-stack.sh` to create conda envs, install engines, and download models.
+3. Runs `webui/install.sh` to copy Python files and write start scripts.
+4. Runs smoke tests and prints a summary.
+
+Advanced users may skip the one-liner and clone the repo first, then run `stack-installer/install-tts-lab-stack.sh` directly.
 
 ### 6.5 Helper tools
 
@@ -138,7 +150,13 @@ The installer clones or copies the `handai-tts-lab` repository into `TTS_APP_DIR
 
 ### 6.6 Models and caches
 
-The installer pre-downloads required models for enabled engines, storing them under `TTS_MODEL_DIR/huggingface/` and `TTS_MODEL_DIR/torch/`. Hugging Face token is prompted if needed.
+The installer eagerly downloads required models for enabled engines, storing them under `TTS_MODEL_DIR/huggingface/` and `TTS_MODEL_DIR/torch/`:
+
+- **Chatterbox:** eagerly downloaded so the TTS smoke test passes.
+- **Faster-Whisper:** eagerly downloads at least one Whisper model so STT works out of the box.
+- Other engines: models downloaded if the engine is installed and `--no-model-downloads` is not set.
+
+A Hugging Face token is prompted if needed.
 
 ## 7. Secrets and Credentials
 
@@ -176,14 +194,9 @@ At minimum, a successful install must:
 1. Start the web UI without errors on `http://127.0.0.1:7870`.
 2. Report all default-installed engines as available in the UI status panel.
 3. Run a Chatterbox synthesis test and produce a valid WAV file.
-4. Allow creating/importing a tagged script and rendering at least one line.
-5. Write job history and output files to `TTS_DATA_DIR/output/`.
-
-Optional smoke tests (run if `--run-smoke-tests`):
-
-- Qwen3 x-vector-only synthesis.
-- CosyVoice synthesis.
-- Faster-Whisper transcription of a short WAV.
+4. Run a Faster-Whisper transcription test on a short generated WAV and produce a transcript.
+5. Allow creating/importing a tagged script and rendering at least one line.
+6. Write job history and output files to `TTS_DATA_DIR/output/`.
 
 ## 11. Boundaries
 
@@ -192,12 +205,18 @@ Optional smoke tests (run if `--run-smoke-tests`):
 - The installer does not configure reverse proxies, SSL, or public exposure.
 - The installer does not set up continuous backup jobs; it only provides the backup tool.
 
-## 12. Open Decisions
+## 12. Roadmap (post-v1)
 
-1. Should the installer clone the repo fresh each time, or support installing from a local checkout?
-2. Should model downloads happen during install or lazily on first use?
-3. Should the installer set up a systemd user service for auto-starting the web UI?
-4. How should the installer validate CUDA/driver compatibility before installing GPU packages?
+- Full XDG Base Directory support (`TTS_LAB_USE_XDG=1`).
+- Upgrade, repair, and uninstall modes.
+- systemd user service for auto-start.
+- Optional lazy model downloads with on-demand UI installation.
+
+## 13. Open Decisions
+
+1. Should the installer set up a systemd user service for auto-starting the web UI?
+2. How should the installer validate CUDA/driver compatibility before installing GPU packages?
+3. Should the web UI itself grow on-demand model downloads, or remain eager-only for v1?
 
 ## 13. Related Files
 
