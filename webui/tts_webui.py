@@ -4394,6 +4394,21 @@ class JobManager:
             return -15
         return 0 if self._concat_wavs(job, pieces, output) else 1
 
+    def _run_chatterbox_batch(self, job: Job, manifest_path: Path, batch_dir: Path, entries: list[dict[str, Any]]) -> int:
+        """Render multiple Chatterbox-Turbo utterances in one subprocess.
+
+        `entries` is a list of dicts with keys: text, ref, ref_text, output,
+        temperature, repetition_penalty, top_p, top_k, seed, norm_loudness.
+        Returns the subprocess exit code. Writes each output file to disk.
+        """
+        if not entries:
+            return 0
+        cb_manifest_path = batch_dir / "chatterbox_batch_manifest.json"
+        cb_manifest_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        cmd = [str(LAB / "tts-lab.sh"), "synth-chatterbox-batch", "--manifest", str(cb_manifest_path)]
+        self._append_log(job, f"\nRendering {len(entries)} Chatterbox utterance(s) in a single model load.\n")
+        return self._run_subprocess(job, cmd)
+
     def _run_setup(self, job: Job, payload: dict[str, Any]) -> None:
         action = str(payload.get("action") or "").strip()
         if action == "whisper-gpu-test":
@@ -6013,6 +6028,56 @@ class JobManager:
         started_ts = now()
         manifest: list[dict[str, Any]] = []
 
+        # --- Chatterbox batch pre-phase ---
+        # Pre-build line payloads so we can render all Chatterbox lines in one
+        # model load. This avoids the ~2 minute per-line model initialization
+        # cost on GPUs like the Runpod A5000.
+        chatterbox_batch_entries: list[dict[str, Any]] = []
+        chatterbox_outputs: set[str] = set()
+        for idx_pre, item_meta_pre in enumerate(lines, start=1):
+            role_pre = str(item_meta_pre["role"])
+            spoken_text_pre = str(item_meta_pre.get("spoken_text") or item_meta_pre["text"])
+            cfg_pre = role_map.get(role_pre) or role_map.get(role_pre.upper()) or role_map.get(role_pre.lower()) or {}
+            if not isinstance(cfg_pre, dict):
+                cfg_pre = {}
+            profile_slug_pre = str(cfg_pre.get("profile", "")).strip()
+            profile_pre = profile_manifest(PROFILE_DIR / profile_slug_pre) if profile_slug_pre else None
+            engine_pre = str(cfg_pre.get("engine", default_engine)).lower()
+            if engine_pre != "chatterbox":
+                continue
+            ref_pre = str(cfg_pre.get("ref") or (profile_pre or {}).get("audio_path") or default_ref)
+            ref_text_pre = str(cfg_pre.get("ref_text") or (profile_pre or {}).get("transcript") or default_ref_text)
+            raw_engine_options_pre = dict(default_engine_options)
+            if isinstance(cfg_pre.get("engine_options"), dict):
+                raw_engine_options_pre.update(cfg_pre.get("engine_options") or {})
+            engine_options_pre = normalize_chatterbox_turbo_options(raw_engine_options_pre)
+            absolute_idx_pre = base_index_offset + idx_pre
+            output_pre = batch_dir / f"{absolute_idx_pre:03d}_{safe_slug(role_pre)}_chatterbox.wav"
+            if output_pre.exists() and existing_manifest:
+                continue
+            chatterbox_outputs.add(str(output_pre))
+            chatterbox_batch_entries.append({
+                "text": spoken_text_pre,
+                "ref": ref_pre,
+                "out": str(output_pre),
+                "ref_text": ref_text_pre,
+                "temperature": engine_options_pre.get("temperature", 0.8),
+                "repetition_penalty": engine_options_pre.get("repetition_penalty", 1.2),
+                "top_p": engine_options_pre.get("top_p", 0.95),
+                "top_k": engine_options_pre.get("top_k", 1000),
+                "seed": engine_options_pre.get("seed"),
+                "norm_loudness": bool(engine_options_pre.get("norm_loudness", True)),
+            })
+        if chatterbox_batch_entries:
+            rc_batch = self._run_chatterbox_batch(job, manifest_path, batch_dir, chatterbox_batch_entries)
+            if rc_batch != 0:
+                self._set(job, status="error", error=f"Chatterbox batch render failed with exit code {rc_batch}", finished_at=now())
+                manifest.extend(existing_manifest)
+                manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                return
+        # --- end Chatterbox batch pre-phase ---
+
+
         def progress_payload(completed: int, status_note: str, current: dict[str, Any] | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
             completed = max(0, min(completed, display_total))
             completed_words = sum(int(item["words"]) for item in lines[:max(0, completed - base_index_offset)])
@@ -6129,12 +6194,20 @@ class JobManager:
             }
             self._set(job, result={"kind": "tagged-script-batch", "progress": progress_payload(absolute_idx - 1, "rendering", current)})
             self._append_log(job, f"\n=== {absolute_idx:03d}/{total_lines + base_index_offset:03d} {role} via {engine} ({item_meta['words']} words) ===\n")
-            chunks = split_synthesis_text(text)
-            if engine == "chatterbox" and bool(line_payload.get("split_on_sentences", True)) and len(chunks) > 1:
-                rc = self._run_chunked(job, line_payload, output, chunks)
+            if engine == "chatterbox" and str(output) in chatterbox_outputs:
+                # Already rendered in the Chatterbox batch pre-phase.
+                rc = 0 if output.exists() else 1
+                if rc == 0:
+                    self._append_log(job, f"Using batch-rendered {output.name}\n")
+                else:
+                    self._append_log(job, f"Batch-rendered output missing: {output.name}\n")
             else:
-                cmd = self._build_command(line_payload, output)
-                rc = self._run_subprocess(job, cmd)
+                chunks = split_synthesis_text(text)
+                if engine == "chatterbox" and bool(line_payload.get("split_on_sentences", True)) and len(chunks) > 1:
+                    rc = self._run_chunked(job, line_payload, output, chunks)
+                else:
+                    cmd = self._build_command(line_payload, output)
+                    rc = self._run_subprocess(job, cmd)
             ok = rc == 0 and output.exists()
             if ok:
                 self._normalize_wav_for_browser(job, output)

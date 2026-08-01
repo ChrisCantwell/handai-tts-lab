@@ -417,6 +417,10 @@ Commands:
       Engines: chatterbox | qwen3 | cosyvoice | f5
       Qwen3 supports --x-vector-only.
 
+  synth-chatterbox-batch --manifest PATH
+      Render many Chatterbox-Turbo utterances from a JSON manifest.
+      Loads the model once and writes each output file separately.
+
   ui <engine>
       Launch a web UI where available.
       Engines: chatterbox | qwen3 | f5
@@ -542,6 +546,20 @@ cmd_synth() {
   esac
 }
 
+cmd_synth_chatterbox_batch() {
+  local manifest=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --manifest) manifest="$2"; shift 2 ;;
+      *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+  done
+  [[ -n "$manifest" ]] || { echo "--manifest is required" >&2; exit 1; }
+  [[ -f "$manifest" ]] || { echo "Manifest not found: $manifest" >&2; exit 1; }
+  activate_env chatterbox
+  python "${SCRIPTS}/synth_chatterbox_batch.py" --manifest "$manifest" --device cuda
+}
+
 cmd_ui() {
   local engine="$1"
   activate_env "$engine"
@@ -625,6 +643,7 @@ main() {
   [[ $# -ge 1 ]] || { usage; exit 1; }
   case "$1" in
     synth) shift; [[ $# -ge 1 ]] || { usage; exit 1; }; cmd_synth "$@" ;;
+    synth-chatterbox-batch) shift; cmd_synth_chatterbox_batch "$@" ;;
     ui) shift; [[ $# -eq 1 ]] || { usage; exit 1; }; cmd_ui "$1" ;;
     video-dl) shift; [[ $# -eq 2 ]] || { usage; exit 1; }; cmd_video_dl "$1" "$2" ;;
     status) shift; cmd_status ;;
@@ -726,6 +745,135 @@ if __name__ == "__main__":
     main()
 PY
   chmod +x "${TTS_DATA_DIR}/scripts/synth_chatterbox.py"
+
+
+  cat > "${TTS_DATA_DIR}/scripts/synth_chatterbox_batch.py" <<'PY'
+#!/usr/bin/env python3
+"""Batch Chatterbox-Turbo renderer.
+
+Loads the model once and renders many utterances from a JSON manifest.
+Manifest format (stdin or --manifest path):
+[
+  {
+    "text": "...",
+    "ref": "/path/to/ref.wav",
+    "out": "/path/to/out.wav",
+    "ref_text": "...",
+    "temperature": 0.8,
+    "repetition_penalty": 1.2,
+    "top_p": 0.95,
+    "top_k": 1000,
+    "seed": null,
+    "norm_loudness": true
+  },
+  ...
+]
+"""
+import argparse
+import json
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+import torch
+from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+
+class _DummyImplicitWatermarker:
+    def apply_watermark(self, wav, sample_rate=None):
+        return wav
+
+
+# On some platforms resemble-perth exposes PerthImplicitWatermarker as None.
+import chatterbox.tts_turbo as _cb_mod
+if getattr(_cb_mod, "perth", None) is not None:
+    _cb_mod.perth.PerthImplicitWatermarker = _DummyImplicitWatermarker
+
+
+def set_seed(seed: int | None) -> None:
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Batch Chatterbox-Turbo voice renderer")
+    p.add_argument("--manifest", required=True, help="Path to JSON manifest file")
+    p.add_argument("--device", default="cuda", help="cuda or cpu")
+    p.add_argument("--progress-every", type=int, default=1, help="Print progress every N items")
+    args = p.parse_args()
+
+    manifest_path = Path(args.manifest)
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    if not isinstance(manifest, list) or not manifest:
+        print("Manifest must be a non-empty JSON array.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Batch Chatterbox-Turbo: {len(manifest)} items on {args.device}", flush=True)
+
+    print("Loading Chatterbox-Turbo model...", flush=True)
+    model = ChatterboxTurboTTS.from_pretrained(device=args.device)
+    model.watermarker = _DummyImplicitWatermarker()
+    print("Model loaded.", flush=True)
+
+    ok = 0
+    failed = 0
+    for i, item in enumerate(manifest, start=1):
+        text = str(item.get("text") or "").strip()
+        ref = item.get("ref")
+        out = item.get("out")
+        if not text or not ref or not out:
+            print(f"[{i}/{len(manifest)}] SKIP missing text/ref/out", flush=True)
+            failed += 1
+            continue
+
+        out_path = Path(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        options = {
+            "temperature": max(0.05, min(2.0, float(item.get("temperature", 0.8)))),
+            "repetition_penalty": max(0.5, min(3.0, float(item.get("repetition_penalty", 1.2)))),
+            "top_p": max(0.05, min(1.0, float(item.get("top_p", 0.95)))),
+            "top_k": max(1, min(5000, int(item.get("top_k", 1000)))),
+            "seed": item.get("seed"),
+            "norm_loudness": bool(item.get("norm_loudness", True)),
+        }
+
+        set_seed(options["seed"])
+
+        try:
+            wav = model.generate(
+                text,
+                audio_prompt_path=ref,
+                temperature=options["temperature"],
+                repetition_penalty=options["repetition_penalty"],
+                top_p=options["top_p"],
+                top_k=options["top_k"],
+                norm_loudness=options["norm_loudness"],
+            )
+            sf.write(str(out_path), wav.squeeze().cpu().numpy(), model.sr)
+            ok += 1
+            if i % max(1, args.progress_every) == 0 or i == len(manifest):
+                print(f"[{i}/{len(manifest)}] Wrote {out_path}", flush=True)
+        except Exception as exc:
+            failed += 1
+            print(f"[{i}/{len(manifest)}] ERROR {out}: {exc}", file=sys.stderr, flush=True)
+
+    print(f"Batch done: {ok} ok, {failed} failed, {len(manifest)} total", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+PY
+  chmod +x "${TTS_DATA_DIR}/scripts/synth_chatterbox_batch.py"
 
   cat > "${TTS_DATA_DIR}/scripts/synth_qwen3.py" <<'PY'
 #!/usr/bin/env python3
