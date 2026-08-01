@@ -1059,15 +1059,11 @@ install_crisperwhisper() {
   log "Installing CrisperWhisper"
   create_env tts-crisperwhisper 3.11
   pip_in_env tts-crisperwhisper install --upgrade pip setuptools wheel
-  pip_in_env tts-crisperwhisper install -U faster-whisper
-  if [[ -d "${TTS_LAB}/engines/crisperwhisper/.git" ]]; then
-    git -C "${TTS_LAB}/engines/crisperwhisper" pull --ff-only || true
-  else
-    git clone https://github.com/Revontuli2030/crisperwhisper.git "${TTS_LAB}/engines/crisperwhisper" || true
-  fi
+  pip_in_env tts-crisperwhisper install -U faster-whisper crisperwhisper
   if [[ "$RUN_IMPORT_CHECKS" == "1" ]]; then
     python_in_env tts-crisperwhisper - <<'PY'
 import faster_whisper
+import crisperwhisper
 print("crisperwhisper import ok")
 PY
   fi
