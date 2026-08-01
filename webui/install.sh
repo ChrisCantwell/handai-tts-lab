@@ -3,9 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-LAB="${TTS_LAB:-/home/user/tts-lab}"
-WEBUI="$LAB/webui"
-LAUNCHER="$LAB/tts-lab.sh"
+LAB="${TTS_LAB:-${HOME}/handai-tts-lab}"
+APP_DIR="${TTS_APP_DIR:-${LAB}/app}"
+DATA_DIR="${TTS_DATA_DIR:-${LAB}/data}"
+MODEL_DIR="${TTS_MODEL_DIR:-${LAB}/models}"
+CONFIG_DIR="${TTS_CONFIG_DIR:-${DATA_DIR}/config}"
+WEBUI="${LAB}/webui"
+LAUNCHER="${LAB}/tts-lab.sh"
 APP_VERSION="$(awk -F'\"' '/^VERSION =/ {print $2; exit}' "$SCRIPT_DIR/tts_webui.py" 2>/dev/null || true)"
 if [[ -z "$APP_VERSION" ]]; then
   APP_VERSION="unknown"
@@ -13,12 +17,26 @@ fi
 echo "Installing TTS Lab Unified Web UI v${APP_VERSION}"
 
 if [[ ! -f "$LAUNCHER" ]]; then
-  echo "ERROR: expected launcher not found: $LAUNCHER" >&2
-  echo "Run this on the machine where Grok created /home/user/tts-lab." >&2
-  exit 1
+  echo "WARNING: expected launcher not found: $LAUNCHER" &&2
+  echo "Run stack-installer/install-tts-lab-stack.sh first, or set TTS_LAB." &&2
 fi
 
-mkdir -p "$WEBUI" "$LAB/output" "$LAB/output/job_history" "$LAB/output/audio_lab" "$LAB/output/video_intake/source_media/uploads" "$LAB/output/video_intake/source_media/url_imports" "$LAB/output/video_intake/extracted_audio" "$LAB/output/resemble_enhance" "$LAB/resemble_uploads" "$LAB/engines/resemble-enhance" "$LAB/references" "$LAB/references/profiles" "$LAB/stt_uploads" "$LAB/config"
+mkdir -p \
+  "$WEBUI" \
+  "${DATA_DIR}/output" \
+  "${DATA_DIR}/output/job_history" \
+  "${DATA_DIR}/output/audio_lab" \
+  "${DATA_DIR}/output/video_intake/source_media/uploads" \
+  "${DATA_DIR}/output/video_intake/source_media/url_imports" \
+  "${DATA_DIR}/output/video_intake/extracted_audio" \
+  "${DATA_DIR}/output/resemble_enhance" \
+  "${DATA_DIR}/resemble_uploads" \
+  "${DATA_DIR}/references" \
+  "${DATA_DIR}/references/profiles" \
+  "${DATA_DIR}/stt_uploads" \
+  "${CONFIG_DIR}" \
+  "${LAB}/engines/resemble-enhance"
+
 cp "$SCRIPT_DIR/tts_webui.py" "$WEBUI/tts_webui.py"
 cp "$SCRIPT_DIR/stt_faster_whisper.py" "$WEBUI/stt_faster_whisper.py"
 if [[ -f "$SCRIPT_DIR/tts_ai_studio_bridge.py" ]]; then
@@ -38,10 +56,14 @@ cat > "$LAB/start-tts-webui.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export TTS_LAB="${LAB}"
+export TTS_APP_DIR="${APP_DIR}"
+export TTS_DATA_DIR="${DATA_DIR}"
+export TTS_MODEL_DIR="${MODEL_DIR}"
+export TTS_CONFIG_DIR="${CONFIG_DIR}"
 export TTS_WEBUI_HOST="\${TTS_WEBUI_HOST:-127.0.0.1}"
 export TTS_WEBUI_PORT="\${TTS_WEBUI_PORT:-7870}"
 # If optional CUDA runtime wheels were installed into tts-whisper, expose their lib dirs.
-WHISPER_SITE="\$HOME/miniconda3/envs/tts-whisper/lib/python3.11/site-packages"
+WHISPER_SITE="${CONDA_ROOT:-${HOME}/miniconda3}/envs/tts-whisper/lib/python3.11/site-packages"
 if [[ -d "\$WHISPER_SITE/nvidia" ]]; then
   CUDA_LIBS="\$(find "\$WHISPER_SITE/nvidia" -type d -name lib 2>/dev/null | paste -sd: -)"
   if [[ -n "\$CUDA_LIBS" ]]; then
@@ -56,12 +78,19 @@ cat > "$LAB/start-ai-studio-bridge.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export TTS_LAB="${LAB}"
+export TTS_APP_DIR="${APP_DIR}"
+export TTS_DATA_DIR="${DATA_DIR}"
+export TTS_MODEL_DIR="${MODEL_DIR}"
+export TTS_CONFIG_DIR="${CONFIG_DIR}"
 export TTS_WEBUI_BASE="\${TTS_WEBUI_BASE:-http://127.0.0.1:7870}"
 export TTS_AI_STUDIO_BRIDGE_HOST="\${TTS_AI_STUDIO_BRIDGE_HOST:-127.0.0.1}"
 export TTS_AI_STUDIO_BRIDGE_PORT="\${TTS_AI_STUDIO_BRIDGE_PORT:-7871}"
 export TTS_AI_STUDIO_BRIDGE_ALLOWED_ORIGINS="\${TTS_AI_STUDIO_BRIDGE_ALLOWED_ORIGINS:-*}"
 export TTS_AI_STUDIO_BRIDGE_ALLOWED_ENGINES="\${TTS_AI_STUDIO_BRIDGE_ALLOWED_ENGINES:-chatterbox,qwen3,cosyvoice}"
-: "\${TTS_AI_STUDIO_BRIDGE_TOKEN:?Set TTS_AI_STUDIO_BRIDGE_TOKEN before starting the bridge}"
+if [[ -z "\${TTS_AI_STUDIO_BRIDGE_TOKEN:-}" && -f "${CONFIG_DIR}/ai_studio_bridge_token" ]]; then
+  export TTS_AI_STUDIO_BRIDGE_TOKEN="\$(cat ${CONFIG_DIR}/ai_studio_bridge_token)"
+fi
+: "\${TTS_AI_STUDIO_BRIDGE_TOKEN:?Set TTS_AI_STUDIO_BRIDGE_TOKEN or ensure ${CONFIG_DIR}/ai_studio_bridge_token exists}"
 exec /usr/bin/env python3 "${WEBUI}/tts_ai_studio_bridge.py"
 EOF
 chmod +x "$LAB/start-ai-studio-bridge.sh"
@@ -80,10 +109,9 @@ Override host/port if needed:
   TTS_WEBUI_HOST=0.0.0.0 TTS_WEBUI_PORT=7870 $LAB/start-tts-webui.sh
 
 Profile library:
-  $LAB/references/profiles
+  ${DATA_DIR}/references/profiles
 
 Optional AI Studio bridge sidecar:
-  export TTS_AI_STUDIO_BRIDGE_TOKEN=your-long-random-token
   $LAB/start-ai-studio-bridge.sh
   http://127.0.0.1:7871
 
@@ -93,8 +121,8 @@ EOF
 cat > "$LAB/install-whisper.sh" <<'WHISPERINSTALL'
 #!/usr/bin/env bash
 set -euo pipefail
-LAB="${TTS_LAB:-/home/user/tts-lab}"
-CONDA="${CONDA_EXE:-/home/user/miniconda3/bin/conda}"
+LAB="${TTS_LAB:-${HOME}/handai-tts-lab}"
+CONDA="${CONDA_EXE:-${HOME}/miniconda3/bin/conda}"
 if [[ ! -x "$CONDA" ]]; then
   echo "ERROR: conda not found at $CONDA" >&2
   echo "Install Miniconda first or set CONDA_EXE=/path/to/conda" >&2
@@ -118,19 +146,23 @@ chmod +x "$LAB/install-whisper.sh"
 cat > "$LAB/login-hf-token.sh" <<'HFLOGIN'
 #!/usr/bin/env bash
 set -euo pipefail
-CONDA="${CONDA_EXE:-/home/user/miniconda3/bin/conda}"
+LAB="${TTS_LAB:-${HOME}/handai-tts-lab}"
+CONFIG_DIR="${TTS_CONFIG_DIR:-${LAB}/data/config}"
+TOKEN_FILE="${CONFIG_DIR}/huggingface_token"
+CONDA="${CONDA_EXE:-${HOME}/miniconda3/bin/conda}"
 if [[ ! -x "$CONDA" ]]; then
   echo "ERROR: conda not found at $CONDA" >&2
   exit 1
 fi
 source "$(dirname "$CONDA")/../etc/profile.d/conda.sh"
 conda activate tts-whisper
-if command -v hf >/dev/null 2>&1; then
-  echo "Paste a READ-ONLY Hugging Face token. Do not paste tokens into chat or public logs."
-  hf auth login
-else
-  echo "Paste a READ-ONLY Hugging Face token. Do not paste tokens into chat or public logs."
-  huggingface-cli login
+echo "Paste a READ-ONLY Hugging Face token. Do not paste tokens into chat or public logs."
+read -r token
+if [[ -n "$token" ]]; then
+  mkdir -p "$CONFIG_DIR"
+  printf '%s\n' "$token" > "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+  echo "Token saved to $TOKEN_FILE"
 fi
 HFLOGIN
 chmod +x "$LAB/login-hf-token.sh"
@@ -138,7 +170,7 @@ chmod +x "$LAB/login-hf-token.sh"
 cat > "$LAB/install-whisper-cuda-libs.sh" <<'CUDALIBS'
 #!/usr/bin/env bash
 set -euo pipefail
-CONDA="${CONDA_EXE:-/home/user/miniconda3/bin/conda}"
+CONDA="${CONDA_EXE:-${HOME}/miniconda3/bin/conda}"
 if [[ ! -x "$CONDA" ]]; then
   echo "ERROR: conda not found at $CONDA" >&2
   exit 1
@@ -163,15 +195,17 @@ cat > "$LAB/install-resemble-enhance.sh" <<'RESEMBLEINSTALL'
 #!/usr/bin/env bash
 set -euo pipefail
 
-LAB="${TTS_LAB:-/home/user/tts-lab}"
-ROOT="${TTS_RESEMBLE_ROOT:-$LAB/engines/resemble-enhance}"
-OUT="${TTS_RESEMBLE_OUTPUT_DIR:-$LAB/output/resemble_enhance}"
+LAB="${TTS_LAB:-${HOME}/handai-tts-lab}"
+DATA_DIR="${TTS_DATA_DIR:-${LAB}/data}"
+ROOT="${TTS_RESEMBLE_ROOT:-${LAB}/engines/resemble-enhance}"
+OUT="${TTS_RESEMBLE_OUTPUT_DIR:-${DATA_DIR}/output/resemble_enhance}"
+CONFIG_DIR="${TTS_CONFIG_DIR:-${DATA_DIR}/config}"
 MODE="${TTS_RESEMBLE_INSTALL_MODE:-auto}"
 ENV_NAME="${TTS_RESEMBLE_CONDA_ENV:-tts-resemble-enhance}"
 PY_VERSION="${TTS_RESEMBLE_PYTHON_VERSION:-3.10}"
 PRE_FLAG="${TTS_RESEMBLE_PRE:-0}"
 
-mkdir -p "$ROOT" "$OUT" "$LAB/config"
+mkdir -p "$ROOT" "$OUT" "$CONFIG_DIR"
 
 echo "Resemble Enhance isolated installer"
 echo "LAB: $LAB"
@@ -290,16 +324,9 @@ exit 1
 RESEMBLEINSTALL
 chmod +x "$LAB/install-resemble-enhance.sh"
 
-
 cat > "$LAB/engines/resemble-enhance/resemble_enhance_webui_wrapper.py" <<'RESEMBLEWRAPPER'
 #!/usr/bin/env python3
-"""Direct Resemble Enhance runner for TTS Lab Web UI.
-
-This keeps the installed package unmodified while avoiding fragile behavior in
-some packaged CLI builds. It processes .wav files from an input directory,
-coerces pathlib paths to strings for torchaudio, prints step-by-step diagnostics,
-and exits non-zero if no output file is written.
-"""
+"""Direct Resemble Enhance runner for TTS Lab Web UI."""
 from __future__ import annotations
 
 import argparse
@@ -415,10 +442,11 @@ chmod +x "$LAB/engines/resemble-enhance/resemble_enhance_webui_wrapper.py"
 cat > "$LAB/engines/resemble-enhance/resemble-enhance-webui" <<'RESEMBLELAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
-LAB="${TTS_LAB:-/home/user/tts-lab}"
-ROOT="${TTS_RESEMBLE_ROOT:-$LAB/engines/resemble-enhance}"
+LAB="${TTS_LAB:-${HOME}/handai-tts-lab}"
+DATA_DIR="${TTS_DATA_DIR:-${LAB}/data}"
+ROOT="${TTS_RESEMBLE_ROOT:-${LAB}/engines/resemble-enhance}"
 ENV_NAME="${TTS_RESEMBLE_CONDA_ENV:-tts-resemble-enhance}"
-WRAPPER="${TTS_RESEMBLE_COMPAT_WRAPPER:-$ROOT/resemble_enhance_webui_wrapper.py}"
+WRAPPER="${TTS_RESEMBLE_COMPAT_WRAPPER:-${ROOT}/resemble_enhance_webui_wrapper.py}"
 
 if [[ -n "${TTS_RESEMBLE_PYTHON:-}" && -x "${TTS_RESEMBLE_PYTHON:-}" ]]; then
   PY="$TTS_RESEMBLE_PYTHON"
