@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
-# TTS Lab Stack Installer v0.1.1
-# Creates the local /home/user/tts-lab contract expected by the Audio/TTS/STT Web UI.
+# HandAI TTS Lab Stack Installer v1.0.0
+# Creates the engine stack and runtime layout for the HandAI TTS Lab Web UI.
+#
+# Default layout (self-contained application directory):
+#   ~/handai-tts-lab/
+#     app/         cloned handai-tts-lab repo (replaceable on upgrade)
+#     data/        user data: output/, projects/, references/, config/
+#     models/      downloaded weights and caches
+#     backups/     backup archives
+#     engines/     engine-specific non-conda artifacts
+#     logs/        installer and runtime logs
+#     tmp/         ephemeral working files
+#
+# For the previous flat layout, set TTS_LAB=/home/user/tts-lab.
 set -Eeuo pipefail
 
-VERSION="0.1.2"
-DEFAULT_TTS_LAB="${HOME}/tts-lab"
+VERSION="1.0.0"
+DEFAULT_TTS_LAB="${HOME}/handai-tts-lab"
 DEFAULT_CONDA_ROOT="${HOME}/miniconda3"
 DEFAULT_VIDEO_DL_DIR="${HOME}/video-dl"
 DEFAULT_VIDEO_DL_REPO="https://github.com/ChrisCantwell/handai-videodownloader.git"
@@ -16,26 +28,45 @@ VIDEO_DL_REPO="${VIDEO_DL_REPO:-$DEFAULT_VIDEO_DL_REPO}"
 PYTORCH_CUDA_INDEX="${PYTORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu124}"
 COSY_TORCH_INDEX="${COSY_TORCH_INDEX:-https://download.pytorch.org/whl/cu121}"
 
+# Layout subdirectories
+TTS_APP_DIR="${TTS_APP_DIR:-${TTS_LAB}/app}"
+TTS_DATA_DIR="${TTS_DATA_DIR:-${TTS_LAB}/data}"
+TTS_MODEL_DIR="${TTS_MODEL_DIR:-${TTS_LAB}/models}"
+TTS_OUT="${TTS_OUT:-${TTS_DATA_DIR}/output}"
+TTS_REF="${TTS_REF:-${TTS_DATA_DIR}/references}"
+TTS_JOB_DIR="${TTS_JOB_DIR:-${TTS_OUT}/job_history}"
+TTS_TAGGED_WORKSPACE_DIR="${TTS_TAGGED_WORKSPACE_DIR:-${TTS_DATA_DIR}/projects/tagged-script}"
+TTS_CONFIG_DIR="${TTS_CONFIG_DIR:-${TTS_DATA_DIR}/config}"
+TTS_BACKUP_DIR="${TTS_BACKUP_DIR:-${TTS_LAB}/backups}"
+TTS_LOGS_DIR="${TTS_LOGS_DIR:-${TTS_LAB}/logs}"
+TTS_TMP_DIR="${TTS_TMP_DIR:-${TTS_LAB}/tmp}"
+
+# Engine selection flags
 INSTALL_SYSTEM_DEPS=1
 INSTALL_VIDEO_DL=1
 INSTALL_ENGINES=1
 INSTALL_CHATTERBOX=1
 INSTALL_QWEN3=1
 INSTALL_COSYVOICE=1
+INSTALL_WHISPER=1
+INSTALL_RESEMBLE=0
 INSTALL_F5=0
+INSTALL_WHISPERX=0
+INSTALL_CRISPERWHISPER=0
+
 RUN_IMPORT_CHECKS=1
 RUN_SMOKE_TESTS=0
 DOWNLOAD_MODELS=1
 ASSUME_YES=0
 
-LOG_ROOT="${TTS_LAB}/logs/stack-installer"
+LOG_ROOT="${TTS_LOGS_DIR}/stack-installer"
 LOG_FILE=""
 
 usage() {
   cat <<EOF
-TTS Lab Stack Installer v${VERSION}
+HandAI TTS Lab Stack Installer v${VERSION}
 
-Creates the engine stack expected by the Audio/TTS/STT Web UI:
+Creates the engine stack expected by the HandAI TTS Lab Web UI:
   ${TTS_LAB}/tts-lab.sh synth chatterbox --text "..."
   ${TTS_LAB}/tts-lab.sh synth qwen3 --text "..." --x-vector-only
   ${TTS_LAB}/tts-lab.sh synth cosyvoice --text "..."
@@ -52,9 +83,15 @@ Options:
   --only-launchers              Only rewrite tts-lab.sh and wrapper scripts.
   --no-model-downloads          Install packages but do not pre-download Hugging Face models.
   --no-import-checks            Skip import checks after package installation.
-  --run-smoke-tests             Generate short WAVs after install. Requires a reference WAV.
-  --with-f5-experimental        Install F5-TTS too. Known experimental/segfault risk on this stack.
-  --lab PATH                    TTS lab directory. Default: ${DEFAULT_TTS_LAB}
+  --run-smoke-tests             Generate short WAVs and run Whisper transcription after install.
+  --with-resemble               Install Resemble Enhance.
+  --with-f5-experimental        Install F5-TTS too. Known experimental/segfault risk on low VRAM.
+  --with-whisperx               Install WhisperX.
+  --with-crisperwhisper         Install CrisperWhisper.
+  --skip-qwen3                  Do not install Qwen3-TTS.
+  --skip-cosyvoice              Do not install CosyVoice.
+  --skip-whisper                Do not install Faster-Whisper STT.
+  --lab PATH                    Application root. Default: ${DEFAULT_TTS_LAB}
   --conda-root PATH             Conda install root. Default: ${DEFAULT_CONDA_ROOT}
   --video-dl-dir PATH           Video downloader directory. Default: ${DEFAULT_VIDEO_DL_DIR}
   --video-dl-repo URL           Video downloader repo. Default: ${DEFAULT_VIDEO_DL_REPO}
@@ -62,14 +99,16 @@ Options:
 
 Environment overrides:
   TTS_LAB, CONDA_ROOT, VIDEO_DL_DIR, VIDEO_DL_REPO
+  TTS_APP_DIR, TTS_DATA_DIR, TTS_MODEL_DIR, TTS_OUT, TTS_REF
+  TTS_JOB_DIR, TTS_TAGGED_WORKSPACE_DIR, TTS_CONFIG_DIR
   PYTORCH_CUDA_INDEX, COSY_TORCH_INDEX
   VIDEO_DL_SKIP_SYSTEM_DEPS=1   Passed through to the video downloader installer.
 
 Notes:
   - This installer is designed for Ubuntu/Linux + NVIDIA GPU + Conda.
-  - It installs Chatterbox, Qwen3-TTS 0.6B, and CosyVoice by default.
-  - F5 is available only with --with-f5-experimental because the original session hit SIGSEGV.
-  - Qwen3 defaults to x-vector-only mode if no --ref-text is provided.
+  - Default engines: Chatterbox, Qwen3-TTS, CosyVoice, Faster-Whisper.
+  - VRAM detection warns and prompts before skipping engines that may not fit.
+  - Model caches are stored under ${TTS_MODEL_DIR}/.
 EOF
 }
 
@@ -78,13 +117,19 @@ while [[ $# -gt 0 ]]; do
     --yes|-y) ASSUME_YES=1; shift ;;
     --skip-system-deps) INSTALL_SYSTEM_DEPS=0; shift ;;
     --no-video-dl) INSTALL_VIDEO_DL=0; shift ;;
-    --no-engines) INSTALL_ENGINES=0; INSTALL_CHATTERBOX=0; INSTALL_QWEN3=0; INSTALL_COSYVOICE=0; INSTALL_F5=0; shift ;;
-    --only-video-dl) INSTALL_SYSTEM_DEPS=1; INSTALL_VIDEO_DL=1; INSTALL_ENGINES=0; INSTALL_CHATTERBOX=0; INSTALL_QWEN3=0; INSTALL_COSYVOICE=0; INSTALL_F5=0; shift ;;
-    --only-launchers) INSTALL_SYSTEM_DEPS=0; INSTALL_VIDEO_DL=0; INSTALL_ENGINES=0; INSTALL_CHATTERBOX=0; INSTALL_QWEN3=0; INSTALL_COSYVOICE=0; INSTALL_F5=0; RUN_IMPORT_CHECKS=0; DOWNLOAD_MODELS=0; shift ;;
+    --no-engines) INSTALL_ENGINES=0; INSTALL_CHATTERBOX=0; INSTALL_QWEN3=0; INSTALL_COSYVOICE=0; INSTALL_WHISPER=0; shift ;;
+    --only-video-dl) INSTALL_SYSTEM_DEPS=1; INSTALL_VIDEO_DL=1; INSTALL_ENGINES=0; INSTALL_CHATTERBOX=0; INSTALL_QWEN3=0; INSTALL_COSYVOICE=0; INSTALL_WHISPER=0; shift ;;
+    --only-launchers) INSTALL_SYSTEM_DEPS=0; INSTALL_VIDEO_DL=0; INSTALL_ENGINES=0; RUN_IMPORT_CHECKS=0; DOWNLOAD_MODELS=0; shift ;;
     --no-model-downloads) DOWNLOAD_MODELS=0; shift ;;
     --no-import-checks) RUN_IMPORT_CHECKS=0; shift ;;
     --run-smoke-tests) RUN_SMOKE_TESTS=1; shift ;;
+    --with-resemble) INSTALL_RESEMBLE=1; shift ;;
     --with-f5-experimental) INSTALL_F5=1; shift ;;
+    --with-whisperx) INSTALL_WHISPERX=1; shift ;;
+    --with-crisperwhisper) INSTALL_CRISPERWHISPER=1; shift ;;
+    --skip-qwen3) INSTALL_QWEN3=0; shift ;;
+    --skip-cosyvoice) INSTALL_COSYVOICE=0; shift ;;
+    --skip-whisper) INSTALL_WHISPER=0; shift ;;
     --lab) TTS_LAB="$2"; shift 2 ;;
     --conda-root) CONDA_ROOT="$2"; shift 2 ;;
     --video-dl-dir) VIDEO_DL_DIR="$2"; shift 2 ;;
@@ -94,7 +139,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-LOG_ROOT="${TTS_LAB}/logs/stack-installer"
+# Re-derive layout after --lab may have changed
+TTS_APP_DIR="${TTS_APP_DIR:-${TTS_LAB}/app}"
+TTS_DATA_DIR="${TTS_DATA_DIR:-${TTS_LAB}/data}"
+TTS_MODEL_DIR="${TTS_MODEL_DIR:-${TTS_LAB}/models}"
+TTS_OUT="${TTS_OUT:-${TTS_DATA_DIR}/output}"
+TTS_REF="${TTS_REF:-${TTS_DATA_DIR}/references}"
+TTS_JOB_DIR="${TTS_JOB_DIR:-${TTS_OUT}/job_history}"
+TTS_TAGGED_WORKSPACE_DIR="${TTS_TAGGED_WORKSPACE_DIR:-${TTS_DATA_DIR}/projects/tagged-script}"
+TTS_CONFIG_DIR="${TTS_CONFIG_DIR:-${TTS_DATA_DIR}/config}"
+TTS_BACKUP_DIR="${TTS_BACKUP_DIR:-${TTS_LAB}/backups}"
+TTS_LOGS_DIR="${TTS_LOGS_DIR:-${TTS_LAB}/logs}"
+TTS_TMP_DIR="${TTS_TMP_DIR:-${TTS_LAB}/tmp}"
+
+LOG_ROOT="${TTS_LOGS_DIR}/stack-installer"
 mkdir -p "$LOG_ROOT"
 LOG_FILE="${LOG_ROOT}/install-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -125,6 +183,9 @@ preflight() {
   log "Preflight"
   echo "Version: ${VERSION}"
   echo "TTS_LAB: ${TTS_LAB}"
+  echo "TTS_APP_DIR: ${TTS_APP_DIR}"
+  echo "TTS_DATA_DIR: ${TTS_DATA_DIR}"
+  echo "TTS_MODEL_DIR: ${TTS_MODEL_DIR}"
   echo "CONDA_ROOT: ${CONDA_ROOT}"
   echo "VIDEO_DL_DIR: ${VIDEO_DL_DIR}"
   echo "Log: ${LOG_FILE}"
@@ -143,6 +204,75 @@ preflight() {
 
   df -h "$HOME" || true
   mkdir -p "$TTS_LAB" "$LOG_ROOT"
+}
+
+detect_vram_mb() {
+  if command -v nvidia-smi >/dev/null; then
+    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]' || true
+  fi
+}
+
+plan_engines() {
+  log "Planning engine installation based on hardware"
+  local vram_mb=""
+  vram_mb="$(detect_vram_mb)"
+  if [[ -z "$vram_mb" ]]; then
+    warn "Could not detect NVIDIA VRAM. Assuming minimum 6 GB for planning."
+    vram_mb=6144
+  fi
+  local vram_gb=$(( (vram_mb + 512) / 1024 ))
+  echo "Detected VRAM: ~${vram_gb} GB"
+
+  local proposed_chatterbox=1 proposed_qwen3=1 proposed_cosy=1 proposed_whisper=1
+  local notes=""
+
+  if [[ "$vram_gb" -lt 8 ]]; then
+    notes="${notes}
+- Less than 8 GB VRAM detected. Qwen3 and CosyVoice may be slow or fail."
+    if [[ "$ASSUME_YES" != "1" ]]; then
+      proposed_qwen3=0
+      proposed_cosy=0
+    fi
+  fi
+
+  if [[ "$vram_gb" -lt 6 ]]; then
+    notes="${notes}
+- Less than 6 GB VRAM detected. Only CPU fallback or very small models are realistic."
+    proposed_chatterbox=0
+    proposed_whisper=0
+  fi
+
+  if [[ -n "$notes" ]]; then
+    echo "$notes"
+  fi
+
+  echo "Default plan for ${vram_gb} GB VRAM:"
+  echo "  Chatterbox: $([[ "$proposed_chatterbox" == "1" ]] && echo yes || echo no)"
+  echo "  Qwen3:      $([[ "$proposed_qwen3" == "1" ]] && echo yes || echo no)"
+  echo "  CosyVoice:  $([[ "$proposed_cosy" == "1" ]] && echo yes || echo no)"
+  echo "  Whisper:    $([[ "$proposed_whisper" == "1" ]] && echo yes || echo no)"
+
+  if [[ "$ASSUME_YES" != "1" ]]; then
+    echo
+    read -r -p "Accept this plan? [Y/n] " ans
+    if [[ "${ans:-}" == "n" || "${ans:-}" == "N" ]]; then
+      read -r -p "Install Chatterbox? [Y/n] " ans; [[ "${ans:-}" == "n" || "${ans:-}" == "N" ]] && INSTALL_CHATTERBOX=0 || INSTALL_CHATTERBOX=1
+      read -r -p "Install Qwen3? [Y/n] " ans; [[ "${ans:-}" == "n" || "${ans:-}" == "N" ]] && INSTALL_QWEN3=0 || INSTALL_QWEN3=1
+      read -r -p "Install CosyVoice? [Y/n] " ans; [[ "${ans:-}" == "n" || "${ans:-}" == "N" ]] && INSTALL_COSYVOICE=0 || INSTALL_COSYVOICE=1
+      read -r -p "Install Faster-Whisper? [Y/n] " ans; [[ "${ans:-}" == "n" || "${ans:-}" == "N" ]] && INSTALL_WHISPER=0 || INSTALL_WHISPER=1
+    else
+      INSTALL_CHATTERBOX="$proposed_chatterbox"
+      INSTALL_QWEN3="$proposed_qwen3"
+      INSTALL_COSYVOICE="$proposed_cosy"
+      INSTALL_WHISPER="$proposed_whisper"
+    fi
+  fi
+
+  echo "Final engine plan:"
+  echo "  Chatterbox: $([[ "$INSTALL_CHATTERBOX" == "1" ]] && echo yes || echo no)"
+  echo "  Qwen3:      $([[ "$INSTALL_QWEN3" == "1" ]] && echo yes || echo no)"
+  echo "  CosyVoice:  $([[ "$INSTALL_COSYVOICE" == "1" ]] && echo yes || echo no)"
+  echo "  Whisper:    $([[ "$INSTALL_WHISPER" == "1" ]] && echo yes || echo no)"
 }
 
 install_system_deps() {
@@ -224,17 +354,33 @@ install_pytorch_in_env() {
 create_lab_folders() {
   log "Creating TTS lab folders"
   mkdir -p \
-    "${TTS_LAB}/scripts" \
-    "${TTS_LAB}/references" \
-    "${TTS_LAB}/output" \
-    "${TTS_LAB}/tmp" \
-    "${TTS_LAB}/logs" \
-    "${TTS_LAB}/.cache/huggingface" \
-    "${TTS_LAB}/.cache/torch" \
-    "${TTS_LAB}/engines"
+    "${TTS_DATA_DIR}/scripts" \
+    "${TTS_REF}" \
+    "${TTS_REF}/profiles" \
+    "${TTS_OUT}" \
+    "${TTS_JOB_DIR}" \
+    "${TTS_OUT}/audio_lab" \
+    "${TTS_OUT}/video_intake/source_media/uploads" \
+    "${TTS_OUT}/video_intake/source_media/url_imports" \
+    "${TTS_OUT}/video_intake/extracted_audio" \
+    "${TTS_OUT}/resemble_enhance" \
+    "${TTS_DATA_DIR}/resemble_uploads" \
+    "${TTS_DATA_DIR}/stt_uploads" \
+    "${TTS_CONFIG_DIR}" \
+    "${TTS_TAGGED_WORKSPACE_DIR}/scripts" \
+    "${TTS_TAGGED_WORKSPACE_DIR}/casts" \
+    "${TTS_TAGGED_WORKSPACE_DIR}/projects" \
+    "${TTS_MODEL_DIR}/huggingface" \
+    "${TTS_MODEL_DIR}/torch" \
+    "${TTS_LAB}/engines" \
+    "${TTS_TMP_DIR}" \
+    "${TTS_BACKUP_DIR}" \
+    "${TTS_LOGS_DIR}/ui-diagnostics" \
+    "${TTS_LOGS_DIR}/model-installs" \
+    "${TTS_LOGS_DIR}/stack-installer"
 
-  if [[ ! -f "${TTS_LAB}/references/ref_text.txt" ]]; then
-    cat > "${TTS_LAB}/references/ref_text.txt" <<'EOF'
+  if [[ ! -f "${TTS_REF}/ref_text.txt" ]]; then
+    cat > "${TTS_REF}/ref_text.txt" <<'EOF'
 This is my reference voice sample for cloning.
 EOF
   fi
@@ -242,20 +388,23 @@ EOF
 
 write_launcher_scripts() {
   log "Writing launcher and wrapper scripts"
-  mkdir -p "${TTS_LAB}/scripts"
+  mkdir -p "${TTS_DATA_DIR}/scripts"
 
   cat > "${TTS_LAB}/tts-lab.sh" <<'BASH_LAUNCHER'
 #!/usr/bin/env bash
 # Unified launcher for local TTS voice-cloning engines.
 set -euo pipefail
 
-LAB="${TTS_LAB:-$HOME/tts-lab}"
+LAB="${TTS_LAB:-$HOME/handai-tts-lab}"
+APP_DIR="${TTS_APP_DIR:-${LAB}/app}"
+DATA_DIR="${TTS_DATA_DIR:-${LAB}/data}"
+MODEL_DIR="${TTS_MODEL_DIR:-${LAB}/models}"
 CONDA_ROOT="${CONDA_ROOT:-$HOME/miniconda3}"
 CONDA="${CONDA_ROOT}/etc/profile.d/conda.sh"
-REF="${TTS_REF:-${LAB}/references/voice_ref.wav}"
-REF_TEXT="${TTS_REF_TEXT:-${LAB}/references/ref_text.txt}"
-OUT="${TTS_OUT:-${LAB}/output}"
-SCRIPTS="${LAB}/scripts"
+REF="${TTS_REF:-${DATA_DIR}/references/voice_ref.wav}"
+REF_TEXT="${TTS_REF_TEXT:-${DATA_DIR}/references/ref_text.txt}"
+OUT="${TTS_OUT:-${DATA_DIR}/output}"
+SCRIPTS="${DATA_DIR}/scripts"
 VIDEO_DL_DIR="${VIDEO_DL_DIR:-$HOME/video-dl}"
 VIDEO_DL_BIN="${VIDEO_DL_BIN:-${VIDEO_DL_DIR}/video-dl}"
 
@@ -301,11 +450,14 @@ activate_env() {
     qwen3)      conda activate tts-qwen3 ;;
     cosyvoice)  conda activate tts-cosyvoice ;;
     f5)         conda activate tts-f5 ;;
+    whisper)    conda activate tts-whisper ;;
+    whisperx)   conda activate tts-whisperx ;;
+    crisperwhisper) conda activate tts-crisperwhisper ;;
     *) echo "Unknown engine: $1" >&2; exit 1 ;;
   esac
   export TMPDIR="${LAB}/tmp"
-  export HF_HOME="${LAB}/.cache/huggingface"
-  export TORCH_HOME="${LAB}/.cache/torch"
+  export HF_HOME="${MODEL_DIR}/huggingface"
+  export TORCH_HOME="${MODEL_DIR}/torch"
   mkdir -p "$TMPDIR" "$HF_HOME" "$TORCH_HOME" "$OUT"
 }
 
@@ -357,9 +509,6 @@ cmd_synth() {
       if [[ -n "$ref_text" ]]; then
         args+=(--ref-text "$ref_text")
       else
-        # Qwen3 voice clone ICL mode requires an exact reference transcript.
-        # For simple launcher/UI calls, default to x-vector-only mode so synthesis
-        # works without asking the user to transcribe the reference sample first.
         xvector="1"
       fi
       [[ -n "$xvector" ]] && args+=(--x-vector-only)
@@ -370,7 +519,7 @@ cmd_synth() {
         ref_text="$(tr -d '\n' < "$REF_TEXT")"
       fi
       prompt="You are a helpful assistant.<|endofprompt|>${ref_text:-This is my reference voice sample for cloning.}"
-      PYTHONPATH="${LAB}/cosyvoice/CosyVoice:${LAB}/cosyvoice/CosyVoice/third_party/Matcha-TTS:${PYTHONPATH:-}"
+      PYTHONPATH="${APP_DIR}/engines/cosyvoice/CosyVoice:${APP_DIR}/engines/cosyvoice/CosyVoice/third_party/Matcha-TTS:${PYTHONPATH:-}"
       export PYTHONPATH
       if ! python "$SCRIPTS/synth_cosyvoice.py" --text "$text" --ref "$ref" --prompt "$prompt" --out "$out"; then
         rc=$?
@@ -428,12 +577,15 @@ cmd_video_dl() {
 cmd_status() {
   echo "TTS Lab launcher status"
   echo "LAB=$LAB"
+  echo "APP_DIR=$APP_DIR"
+  echo "DATA_DIR=$DATA_DIR"
+  echo "MODEL_DIR=$MODEL_DIR"
   echo "CONDA_ROOT=$CONDA_ROOT"
   echo "REF=$REF"
   echo "OUT=$OUT"
   echo "VIDEO_DL_BIN=$VIDEO_DL_BIN"
   [[ -x "$VIDEO_DL_BIN" ]] && echo "video-dl: OK" || echo "video-dl: missing/not executable"
-  for e in chatterbox qwen3 cosyvoice f5; do
+  for e in chatterbox qwen3 cosyvoice f5 whisper whisperx crisperwhisper; do
     if [[ -d "${CONDA_ROOT}/envs/tts-${e}" ]]; then
       echo "env tts-${e}: present"
     else
@@ -487,7 +639,7 @@ main "$@"
 BASH_LAUNCHER
   chmod +x "${TTS_LAB}/tts-lab.sh"
 
-  cat > "${TTS_LAB}/scripts/synth_chatterbox.py" <<'PY'
+  cat > "${TTS_DATA_DIR}/scripts/synth_chatterbox.py" <<'PY'
 #!/usr/bin/env python3
 """Generate speech with Chatterbox-Turbo using explicit sampling controls."""
 import argparse
@@ -528,8 +680,6 @@ def main() -> None:
 
     model = ChatterboxTurboTTS.from_pretrained(device=args.device)
 
-    # PerTh watermarker has crashed on some local Linux/Torch stacks. For the
-    # local lab workflow, prefer a usable render over losing the whole job.
     class _NoWatermark:
         def apply_watermark(self, wav, sample_rate=None):
             return wav
@@ -561,9 +711,9 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 PY
-  chmod +x "${TTS_LAB}/scripts/synth_chatterbox.py"
+  chmod +x "${TTS_DATA_DIR}/scripts/synth_chatterbox.py"
 
-  cat > "${TTS_LAB}/scripts/synth_qwen3.py" <<'PY'
+  cat > "${TTS_DATA_DIR}/scripts/synth_qwen3.py" <<'PY'
 #!/usr/bin/env python3
 """Generate speech with Qwen3-TTS 0.6B Base voice clone."""
 import argparse
@@ -614,13 +764,13 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 PY
-  chmod +x "${TTS_LAB}/scripts/synth_qwen3.py"
+  chmod +x "${TTS_DATA_DIR}/scripts/synth_qwen3.py"
 
-  cat > "${TTS_LAB}/scripts/synth_cosyvoice.py" <<'PY'
+  cat > "${TTS_DATA_DIR}/scripts/synth_cosyvoice.py" <<'PY'
 #!/usr/bin/env python3
 """Generate speech with CosyVoice 3 zero-shot cloning.
 
-This wrapper deliberately avoids torchaudio.save because this local stack has
+This wrapper deliberately avoids torchaudio.save because some local stacks have
 shown native-library segfaults around Torch/Torchaudio/ONNXRuntime teardown.
 """
 import argparse
@@ -631,8 +781,9 @@ from pathlib import Path
 
 import numpy as np
 
-LAB = Path(os.environ.get("TTS_LAB", str(Path.home() / "tts-lab")))
-COSY_ROOT = Path(os.environ.get("COSYVOICE_ROOT", str(LAB / "cosyvoice" / "CosyVoice")))
+LAB = Path(os.environ.get("TTS_LAB", str(Path.home() / "handai-tts-lab")))
+APP_DIR = Path(os.environ.get("TTS_APP_DIR", str(LAB / "app")))
+COSY_ROOT = Path(os.environ.get("COSYVOICE_ROOT", str(APP_DIR / "engines" / "cosyvoice" / "CosyVoice")))
 sys.path.insert(0, str(COSY_ROOT))
 sys.path.insert(0, str(COSY_ROOT / "third_party" / "Matcha-TTS"))
 
@@ -652,7 +803,6 @@ def write_pcm16_wav(path: Path, audio, sample_rate: int) -> None:
     if arr.ndim == 1:
         channels = 1
     elif arr.ndim == 2:
-        # Accept [channels, samples] or [samples, channels].
         if arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
             arr = arr.T
         channels = arr.shape[1]
@@ -695,9 +845,9 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 PY
-  chmod +x "${TTS_LAB}/scripts/synth_cosyvoice.py"
+  chmod +x "${TTS_DATA_DIR}/scripts/synth_cosyvoice.py"
 
-  cat > "${TTS_LAB}/scripts/synth_f5.py" <<'PY'
+  cat > "${TTS_DATA_DIR}/scripts/synth_f5.py" <<'PY'
 #!/usr/bin/env python3
 """Generate speech with F5-TTS zero-shot cloning. Experimental."""
 import argparse
@@ -732,7 +882,7 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 PY
-  chmod +x "${TTS_LAB}/scripts/synth_f5.py"
+  chmod +x "${TTS_DATA_DIR}/scripts/synth_f5.py"
 }
 
 install_chatterbox() {
@@ -749,6 +899,42 @@ PY
   fi
 }
 
+download_chatterbox_model() {
+  [[ "$INSTALL_CHATTERBOX" == "1" && "$DOWNLOAD_MODELS" == "1" ]] || return 0
+  log "Pre-downloading Chatterbox-Turbo model"
+  HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+    python_in_env tts-chatterbox - <<'PY'
+from chatterbox.tts_turbo import ChatterboxTurboTTS
+m = ChatterboxTurboTTS.from_pretrained()
+print("chatterbox model cached")
+PY
+}
+
+install_whisper() {
+  [[ "$INSTALL_ENGINES" == "1" && "$INSTALL_WHISPER" == "1" ]] || return 0
+  log "Installing Faster-Whisper STT"
+  create_env tts-whisper 3.11
+  pip_in_env tts-whisper install --upgrade pip setuptools wheel
+  pip_in_env tts-whisper install -U faster-whisper "huggingface_hub[cli]"
+  if [[ "$RUN_IMPORT_CHECKS" == "1" ]]; then
+    python_in_env tts-whisper - <<'PY'
+import faster_whisper
+print("faster-whisper import ok")
+PY
+  fi
+}
+
+download_whisper_model() {
+  [[ "$INSTALL_WHISPER" == "1" && "$DOWNLOAD_MODELS" == "1" ]] || return 0
+  log "Pre-downloading Faster-Whisper base model"
+  HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+    python_in_env tts-whisper - <<'PY'
+from faster_whisper import WhisperModel
+m = WhisperModel("base", device="cuda", compute_type="float16")
+print("faster-whisper base model cached")
+PY
+}
+
 install_qwen3() {
   [[ "$INSTALL_ENGINES" == "1" && "$INSTALL_QWEN3" == "1" ]] || return 0
   log "Installing Qwen3-TTS 0.6B"
@@ -757,8 +943,10 @@ install_qwen3() {
   pip_in_env tts-qwen3 install -U qwen-tts soundfile
   if [[ "$DOWNLOAD_MODELS" == "1" ]]; then
     pip_in_env tts-qwen3 install -U "huggingface_hub[cli]"
-    HF_HOME="${TTS_LAB}/.cache/huggingface" "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-Tokenizer-12Hz || true
-    HF_HOME="${TTS_LAB}/.cache/huggingface" "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-0.6B-Base || true
+    HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+      "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-Tokenizer-12Hz || true
+    HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+      "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-0.6B-Base || true
   fi
   if [[ "$RUN_IMPORT_CHECKS" == "1" ]]; then
     python_in_env tts-qwen3 - <<'PY'
@@ -775,17 +963,17 @@ install_cosyvoice() {
   pip_in_env tts-cosyvoice install --upgrade pip setuptools wheel
   pip_in_env tts-cosyvoice install "torch==2.3.1" "torchaudio==2.3.1" --index-url "$COSY_TORCH_INDEX"
 
-  mkdir -p "${TTS_LAB}/cosyvoice"
-  if [[ -d "${TTS_LAB}/cosyvoice/CosyVoice/.git" ]]; then
-    git -C "${TTS_LAB}/cosyvoice/CosyVoice" pull --ff-only || warn "CosyVoice git pull failed; continuing with existing checkout."
-    git -C "${TTS_LAB}/cosyvoice/CosyVoice" submodule update --init --recursive || true
+  mkdir -p "${TTS_LAB}/engines/cosyvoice"
+  if [[ -d "${TTS_LAB}/engines/cosyvoice/CosyVoice/.git" ]]; then
+    git -C "${TTS_LAB}/engines/cosyvoice/CosyVoice" pull --ff-only || warn "CosyVoice git pull failed; continuing with existing checkout."
+    git -C "${TTS_LAB}/engines/cosyvoice/CosyVoice" submodule update --init --recursive || true
   else
-    rm -rf "${TTS_LAB}/cosyvoice/CosyVoice"
-    git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git "${TTS_LAB}/cosyvoice/CosyVoice"
+    rm -rf "${TTS_LAB}/engines/cosyvoice/CosyVoice"
+    git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git "${TTS_LAB}/engines/cosyvoice/CosyVoice"
   fi
 
-  local req="${TTS_LAB}/cosyvoice/CosyVoice/requirements.txt"
-  local filtered="${TTS_LAB}/cosyvoice/requirements-inference-filtered.txt"
+  local req="${TTS_LAB}/engines/cosyvoice/CosyVoice/requirements.txt"
+  local filtered="${TTS_LAB}/engines/cosyvoice/requirements-inference-filtered.txt"
   if [[ -f "$req" ]]; then
     grep -v -E 'deepspeed|tensorrt|openai-whisper' "$req" > "$filtered"
     pip_in_env tts-cosyvoice install -r "$filtered" || warn "CosyVoice filtered requirements had failures; installing known inference dependencies next."
@@ -793,15 +981,16 @@ install_cosyvoice() {
   pip_in_env tts-cosyvoice install pyarrow pyworld lightning fastapi uvicorn modelscope "huggingface_hub[cli]" soundfile librosa
 
   if [[ "$DOWNLOAD_MODELS" == "1" ]]; then
-    (cd "${TTS_LAB}/cosyvoice/CosyVoice" && \
-      HF_HOME="${TTS_LAB}/.cache/huggingface" "${CONDA_ROOT}/envs/tts-cosyvoice/bin/python" - <<'PY'
+    (cd "${TTS_LAB}/engines/cosyvoice/CosyVoice" && \
+      HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+      "${CONDA_ROOT}/envs/tts-cosyvoice/bin/python" - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='pretrained_models/Fun-CosyVoice3-0.5B')
 PY
     )
   fi
   if [[ "$RUN_IMPORT_CHECKS" == "1" ]]; then
-    PYTHONPATH="${TTS_LAB}/cosyvoice/CosyVoice:${TTS_LAB}/cosyvoice/CosyVoice/third_party/Matcha-TTS" \
+    PYTHONPATH="${TTS_LAB}/engines/cosyvoice/CosyVoice:${TTS_LAB}/engines/cosyvoice/CosyVoice/third_party/Matcha-TTS" \
       python_in_env tts-cosyvoice - <<'PY'
 from cosyvoice.cli.cosyvoice import AutoModel
 print("cosyvoice import ok")
@@ -822,6 +1011,44 @@ print("f5 torch", torch.__version__, torch.cuda.is_available())
 PY
   fi
   warn "F5 installed as experimental. The original RTX 2060 session hit SIGSEGV during generation."
+}
+
+install_resemble_enhance() {
+  [[ "$INSTALL_ENGINES" == "1" && "$INSTALL_RESEMBLE" == "1" ]] || return 0
+  log "Resemble Enhance selected; installer script will be created by webui/install.sh."
+}
+
+install_whisperx() {
+  [[ "$INSTALL_ENGINES" == "1" && "$INSTALL_WHISPERX" == "1" ]] || return 0
+  log "Installing WhisperX"
+  create_env tts-whisperx 3.11
+  pip_in_env tts-whisperx install --upgrade pip setuptools wheel
+  pip_in_env tts-whisperx install -U faster-whisper whisperx
+  if [[ "$RUN_IMPORT_CHECKS" == "1" ]]; then
+    python_in_env tts-whisperx - <<'PY'
+import whisperx
+print("whisperx import ok")
+PY
+  fi
+}
+
+install_crisperwhisper() {
+  [[ "$INSTALL_ENGINES" == "1" && "$INSTALL_CRISPERWHISPER" == "1" ]] || return 0
+  log "Installing CrisperWhisper"
+  create_env tts-crisperwhisper 3.11
+  pip_in_env tts-crisperwhisper install --upgrade pip setuptools wheel
+  pip_in_env tts-crisperwhisper install -U faster-whisper
+  if [[ -d "${TTS_LAB}/engines/crisperwhisper/.git" ]]; then
+    git -C "${TTS_LAB}/engines/crisperwhisper" pull --ff-only || true
+  else
+    git clone https://github.com/Revontuli2030/crisperwhisper.git "${TTS_LAB}/engines/crisperwhisper" || true
+  fi
+  if [[ "$RUN_IMPORT_CHECKS" == "1" ]]; then
+    python_in_env tts-crisperwhisper - <<'PY'
+import faster_whisper
+print("crisperwhisper import ok")
+PY
+  fi
 }
 
 install_video_downloader() {
@@ -851,11 +1078,45 @@ install_video_downloader() {
   fi
 }
 
+ensure_huggingface_token() {
+  local token_file="${TTS_CONFIG_DIR}/huggingface_token"
+  if [[ -s "$token_file" ]]; then
+    echo "Hugging Face token already stored: ${token_file}"
+    return 0
+  fi
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    echo "Using HF_TOKEN from environment."
+    printf '%s\n' "$HF_TOKEN" > "$token_file"
+    chmod 600 "$token_file"
+    return 0
+  fi
+  if [[ "$ASSUME_YES" == "1" ]]; then
+    warn "No Hugging Face token provided. Some model downloads may fail. Set HF_TOKEN or run login-hf-token.sh later."
+    return 0
+  fi
+  echo
+  echo "Some models require a Hugging Face token. Leave blank to skip (you can add one later via login-hf-token.sh)."
+  read -r -p "Paste Hugging Face token: " token
+  if [[ -n "$token" ]]; then
+    printf '%s\n' "$token" > "$token_file"
+    chmod 600 "$token_file"
+    echo "Token saved to ${token_file}"
+  fi
+}
+
 write_env_example() {
   log "Writing environment example"
   cat > "${TTS_LAB}/stack-env.example" <<EOF
 # Optional overrides for TTS Lab / Web UI integration
 export TTS_LAB="${TTS_LAB}"
+export TTS_APP_DIR="${TTS_APP_DIR}"
+export TTS_DATA_DIR="${TTS_DATA_DIR}"
+export TTS_MODEL_DIR="${TTS_MODEL_DIR}"
+export TTS_OUT="${TTS_OUT}"
+export TTS_REF="${TTS_REF}"
+export TTS_JOB_DIR="${TTS_JOB_DIR}"
+export TTS_TAGGED_WORKSPACE_DIR="${TTS_TAGGED_WORKSPACE_DIR}"
+export TTS_CONFIG_DIR="${TTS_CONFIG_DIR}"
 export CONDA_ROOT="${CONDA_ROOT}"
 export VIDEO_DL_DIR="${VIDEO_DL_DIR}"
 export TTS_VIDEO_DL_CMD='${VIDEO_DL_DIR}/video-dl {url} {out}'
@@ -863,19 +1124,79 @@ export TTS_VIDEO_DL_CMD='${VIDEO_DL_DIR}/video-dl {url} {out}'
 EOF
 }
 
+generate_bridge_token() {
+  local token_file="${TTS_CONFIG_DIR}/ai_studio_bridge_token"
+  if [[ -s "$token_file" ]]; then
+    echo "AI Studio bridge token already exists: ${token_file}"
+    return 0
+  fi
+  log "Generating AI Studio bridge token"
+  local token
+  token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  printf '%s\n' "$token" > "$token_file"
+  chmod 600 "$token_file"
+  echo "Bridge token saved to ${token_file}"
+}
+
 run_smoke_tests() {
   [[ "$RUN_SMOKE_TESTS" == "1" ]] || { log "Skipping smoke tests. Use --run-smoke-tests to render test WAVs."; return 0; }
   log "Running smoke tests"
-  if [[ ! -f "${TTS_LAB}/references/voice_ref.wav" ]]; then
-    warn "No reference WAV at ${TTS_LAB}/references/voice_ref.wav. Skipping synthesis smoke tests."
-    return 0
+
+  local ref_wav="${TTS_REF}/voice_ref.wav"
+  if [[ ! -f "$ref_wav" ]]; then
+    log "Generating synthetic reference WAV for smoke tests"
+    python_in_env tts-whisper - <<'PY'
+import numpy as np, wave, os, pathlib
+ref = pathlib.Path(os.environ["TTS_REF"]) / "voice_ref.wav"
+ref.parent.mkdir(parents=True, exist_ok=True)
+sr = 16000
+duration = 5
+freq = 440
+samples = (np.sin(2 * np.pi * freq * np.arange(sr * duration) / sr) * 0.5 * 32767).astype(np.int16)
+with wave.open(str(ref), "wb") as wf:
+    wf.setnchannels(1)
+    wf.setsampwidth(2)
+    wf.setframerate(sr)
+    wf.writeframes(samples.tobytes())
+print(f"wrote {ref}")
+PY
   fi
-  "${TTS_LAB}/tts-lab.sh" test
+
+  if [[ "$INSTALL_CHATTERBOX" == "1" ]]; then
+    log "Smoke test: Chatterbox synthesis"
+    "${TTS_LAB}/tts-lab.sh" synth chatterbox --text "Hello from HandAI TTS Lab." --out "${TTS_OUT}/smoke_chatterbox.wav"
+  fi
+
+  if [[ "$INSTALL_QWEN3" == "1" ]]; then
+    log "Smoke test: Qwen3 synthesis"
+    "${TTS_LAB}/tts-lab.sh" synth qwen3 --text "Status update." --x-vector-only --out "${TTS_OUT}/smoke_qwen3.wav"
+  fi
+
+  if [[ "$INSTALL_WHISPER" == "1" ]]; then
+    log "Smoke test: Faster-Whisper transcription"
+    python_in_env tts-whisper - <<'PY'
+from faster_whisper import WhisperModel
+import os
+ref = os.path.join(os.environ["TTS_REF"], "voice_ref.wav")
+out = os.path.join(os.environ["TTS_OUT"], "smoke_whisper.txt")
+model = WhisperModel("base", device="cuda", compute_type="float16")
+segs, info = model.transcribe(ref)
+with open(out, "w") as f:
+    for seg in segs:
+        f.write(f"[{seg.start:.2f} -> {seg.end:.2f}] {seg.text}\n")
+print(f"wrote {out}")
+PY
+  fi
+
+  echo "Smoke test outputs in ${TTS_OUT}/smoke_*.wav and ${TTS_OUT}/smoke_whisper.txt"
 }
 
 summary() {
   log "Install summary"
   echo "TTS Lab: ${TTS_LAB}"
+  echo "App code: ${TTS_APP_DIR}"
+  echo "Data: ${TTS_DATA_DIR}"
+  echo "Models: ${TTS_MODEL_DIR}"
   echo "Launcher: ${TTS_LAB}/tts-lab.sh"
   echo "Logs: ${LOG_FILE}"
   [[ -x "${VIDEO_DL_DIR}/video-dl" ]] && echo "Video downloader: ${VIDEO_DL_DIR}/video-dl" || echo "Video downloader: missing/not executable"
@@ -884,12 +1205,17 @@ summary() {
   echo
   echo "Next useful commands:"
   echo "  ${TTS_LAB}/tts-lab.sh status"
+  echo "  ${TTS_LAB}/start-tts-webui.sh"
   echo "  ${TTS_LAB}/tts-lab.sh synth chatterbox --text 'Hello from the local TTS lab.'"
-  echo "  TTS_VIDEO_DL_CMD='${VIDEO_DL_DIR}/video-dl {url} {out}' ./start.sh"
 }
 
 main() {
   preflight
+  if [[ "$INSTALL_ENGINES" == "1" ]]; then
+    plan_engines
+  else
+    log "Skipping engine planning because engine installation is disabled"
+  fi
   install_system_deps
   if [[ "$INSTALL_ENGINES" == "1" || "$RUN_SMOKE_TESTS" == "1" ]]; then
     install_conda
@@ -899,10 +1225,18 @@ main() {
   create_lab_folders
   write_launcher_scripts
   install_video_downloader
+  ensure_huggingface_token
   install_chatterbox
+  download_chatterbox_model
+  install_whisper
+  download_whisper_model
   install_qwen3
   install_cosyvoice
   install_f5_experimental
+  install_resemble_enhance
+  install_whisperx
+  install_crisperwhisper
+  generate_bridge_token
   write_env_example
   run_smoke_tests
   summary

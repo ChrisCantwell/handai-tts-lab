@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-LAB = Path(os.environ.get("TTS_LAB", "/home/user/tts-lab"))
+LAB = Path(os.environ.get("TTS_LAB", str(Path.home() / "handai-tts-lab")))
 LAUNCHER = Path(os.environ.get("TTS_LAUNCHER", str(LAB / "tts-lab.sh")))
 OUT_DIR = Path(os.environ.get("TTS_OUT", str(LAB / "output")))
 REF_DIR = Path(os.environ.get("TTS_REF", str(LAB / "references")))
