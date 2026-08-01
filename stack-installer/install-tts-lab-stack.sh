@@ -637,6 +637,9 @@ main() {
 
 main "$@"
 BASH_LAUNCHER
+  # Bake the actual install paths into the launcher defaults so the generated
+  # tts-lab.sh works without manually exporting TTS_LAB/CONDA_ROOT on this machine.
+  sed -i "s|\${TTS_LAB:-\$HOME/handai-tts-lab}|\${TTS_LAB:-${TTS_LAB}}|g; s|\${CONDA_ROOT:-\$HOME/miniconda3}|\${CONDA_ROOT:-${CONDA_ROOT}}|g" "${TTS_LAB}/tts-lab.sh"
   chmod +x "${TTS_LAB}/tts-lab.sh"
 
   cat > "${TTS_DATA_DIR}/scripts/synth_chatterbox.py" <<'PY'
@@ -651,6 +654,17 @@ import numpy as np
 import soundfile as sf
 import torch
 from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+
+class _DummyImplicitWatermarker:
+    def apply_watermark(self, wav, sample_rate=None):
+        return wav
+
+
+# On some platforms resemble-perth exposes PerthImplicitWatermarker as None.
+import chatterbox.tts_turbo as _cb_mod
+if getattr(_cb_mod, "perth", None) is not None:
+    _cb_mod.perth.PerthImplicitWatermarker = _DummyImplicitWatermarker
 
 
 def main() -> None:
