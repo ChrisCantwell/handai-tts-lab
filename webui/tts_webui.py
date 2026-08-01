@@ -87,7 +87,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.97"
+VERSION = "0.97.1"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -412,6 +412,10 @@ def ensure_mp3_preview(path: Path, log_cb=None) -> Path | None:
         return None
     if path.suffix.lower() not in AUDIO_EXTS:
         return None
+    # MP3 is already the browser-preview format. Serve the authoritative file
+    # directly instead of transcoding it into file.mp3.preview.mp3.
+    if path.suffix.lower() == ".mp3":
+        return path
     preview = preview_path_for(path)
     try:
         if preview.exists() and preview.stat().st_mtime_ns >= path.stat().st_mtime_ns and preview.stat().st_size > 0:
@@ -871,6 +875,7 @@ def default_webui_state() -> dict[str, Any]:
         "global_version_mode": "collision",
         "global_filename_template": "[source][version][.ext]",
         "resemble_install_mode": "auto",
+        "cooldown_seconds": 0,
         "video_format": "wav",
         "video_mp3_bitrate": "128k",
         "video_sample_rate": "unchanged",
@@ -4093,7 +4098,10 @@ class JobManager:
         ]
         self._append_log(job, "\n$ " + shlex.join(cmd) + "\n")
         rc = subprocess.call(cmd, cwd=str(LAB))
-        return rc == 0 and output.exists() and self._normalize_wav_for_browser(job, output)
+        # Assembly and finalization are separate responsibilities. The caller
+        # performs the one browser-safe WAV rewrite and MP3 preview generation
+        # after a single or chunked render has completed.
+        return rc == 0 and output.exists() and output.stat().st_size > 0
 
     def _write_silence_wav(self, job: Job, output: Path, duration: float) -> bool:
         duration = max(0.0, float(duration or 0.0))
@@ -4232,7 +4240,7 @@ class JobManager:
         pieces: list[Path] = []
         chunk_dir = output.parent / (output.stem + "_parts")
         chunk_dir.mkdir(parents=True, exist_ok=True)
-        cooldown = float(os.environ.get("TTS_WEBUI_COOLDOWN_SECONDS", "2"))
+        cooldown = float(payload.get("cooldown_seconds") if payload.get("cooldown_seconds") is not None else os.environ.get("TTS_WEBUI_COOLDOWN_SECONDS", "0"))
         self._append_log(job, f"\nSplitting into {len(chunks)} short render chunks to avoid truncated output.\n")
         for i, chunk in enumerate(chunks, start=1):
             if self._is_cancel_requested(job):
@@ -5467,6 +5475,7 @@ class JobManager:
             "x_vector_only": x_vector_only,
             "profile": profile_slug,
             "engine_options": engine_options,
+            "cooldown_seconds": payload.get("cooldown_seconds") if payload.get("cooldown_seconds") is not None else float(os.environ.get("TTS_WEBUI_COOLDOWN_SECONDS", "0")),
             "tagged_script_take": {
                 "manifest": str(manifest_path),
                 "line_index": line_index,
@@ -5959,7 +5968,7 @@ class JobManager:
             if ok:
                 self._normalize_wav_for_browser(job, output)
                 write_output_sidecar(output, line_payload, job, role=role)
-                cooldown = float(os.environ.get("TTS_WEBUI_COOLDOWN_SECONDS", "2"))
+                cooldown = float(payload.get("cooldown_seconds") if payload.get("cooldown_seconds") is not None else os.environ.get("TTS_WEBUI_COOLDOWN_SECONDS", "0"))
                 if cooldown > 0 and idx < len(lines):
                     self._append_log(job, f"Cooling down {cooldown:g}s before next line.\n")
                     time.sleep(cooldown)
@@ -6844,6 +6853,14 @@ EXEC: Pick one.</textarea>
         <label><input id="optDelete" type="checkbox" checked onchange="syncPrefsToPreset(); applyUiPrefs(); scheduleFormStateSave();" /> Show delete buttons</label>
         <label><input id="optStickyTabs" type="checkbox" onchange="applyUiPrefs(); scheduleFormStateSave();" /> Keep tabs sticky while scrolling</label>
       </div>
+      <h3>Synthesis pacing</h3>
+      <div class="row">
+        <div>
+          <label for="optCooldown">Pause between chunks / lines, seconds</label>
+          <input id="optCooldown" type="number" min="0" max="60" step="0.1" value="0" oninput="scheduleFormStateSave();" />
+          <div class="small">Default is 0 (no pause). Use a small value if back-to-back renders overheat the GPU or fail intermittently. Can be overridden per job via the form payload; emergency override <code>TTS_WEBUI_COOLDOWN_SECONDS</code> still works.</div>
+        </div>
+      </div>
     </div>
 
     <div id="pane-stt" class="hidden">
@@ -6947,10 +6964,11 @@ EXEC: Pick one.</textarea>
       <h3>Job log <span id="activeLogTitle" class="pill"></span></h3>
       <div class="small">Logs open in this stable viewer so auto-refresh cannot collapse them or fight scrolling.</div>
       <div class="logtools">
-        <button class="mini secondary" onclick="refreshActiveLog(true)">refresh log</button>
+        <button class="mini secondary" onclick="refreshActiveLog(true, true, this)">refresh log</button>
         <button class="mini secondary" onclick="copyActiveLog(this)">copy log</button>
         <button class="mini secondary" onclick="scrollLogBottom()">bottom</button>
         <button class="mini danger" onclick="closeJobLog()">close log</button>
+        <span id="activeLogRefreshStatus" class="small" role="status" aria-live="polite"></span>
       </div>
       <textarea id="activeLogText" class="logbox" readonly spellcheck="false"></textarea>
     </div>
@@ -7175,7 +7193,7 @@ function setGenerateStatus(targetId, html, kind=''){
 function setButtonBusy(buttonId, busy){ const btn=$(buttonId); if(btn) btn.disabled=!!busy; }
 function generateSingle(){
   const profileSlug = $('profileSelect').value;
-  const body = {engine:$('engine').value, role:$('role').value, profile:profileSlug, ref:$('ref').value, ref_text:$('refText').value, x_vector_only:$('xVector').checked, split_on_sentences:$('splitLong').checked, text:$('text').value};
+  const body = {engine:$('engine').value, role:$('role').value, profile:profileSlug, ref:$('ref').value, ref_text:$('refText').value, x_vector_only:$('xVector').checked, split_on_sentences:$('splitLong').checked, cooldown_seconds:Number(readFieldValue('optCooldown','0')||0), text:$('text').value};
   if(!String(body.text || '').trim()){ setGenerateStatus('synthActionStatus', 'Enter text to synthesize first.', 'bad'); return; }
   setButtonBusy('generateSingleButton', true);
   setGenerateStatus('synthActionStatus', '<span class="warn">Queueing synthesis job...</span>'+openJobsButtonHtml());
@@ -7386,6 +7404,7 @@ function generateBatch(){
     default_ref:$('ref').value,
     default_ref_text:$('refText').value,
     default_x_vector_only:true,
+    cooldown_seconds:Number(readFieldValue('optCooldown','0')||0),
     assemble_mixdown:readFieldChecked('batchAssembleMixdown', true),
     mixdown_format:readFieldValue('batchMixdownFormat', 'mp3'),
     line_gap_seconds:readFieldValue('batchLineGap', '0.35')
@@ -7546,19 +7565,56 @@ function openJobLog(id, title){
   $('activeLogPanel').classList.remove('hidden');
   refreshActiveLog(true);
 }
-function closeJobLog(){ activeLogId=null; $('activeLogPanel').classList.add('hidden'); $('activeLogText').value=''; }
+function closeJobLog(){
+  activeLogId=null;
+  $('activeLogPanel').classList.add('hidden');
+  $('activeLogText').value='';
+  if($('activeLogRefreshStatus')) $('activeLogRefreshStatus').textContent='';
+}
 function scrollLogBottom(){ const box=$('activeLogText'); box.scrollTop = box.scrollHeight; }
-function refreshActiveLog(forceBottom=false){
+function refreshActiveLog(forceBottom=false, userInitiated=false, sourceButton=null){
   if(!activeLogId) return Promise.resolve();
   const box = $('activeLogText');
+  const status = $('activeLogRefreshStatus');
+  const oldText = box.value || '';
   const oldTop = box.scrollTop;
   const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 24;
+  const oldButtonText = sourceButton ? sourceButton.textContent : '';
+  if(userInitiated){
+    if(status) status.textContent='Refresh requested…';
+    if(sourceButton){
+      sourceButton.disabled=true;
+      sourceButton.textContent='refreshing…';
+    }
+  }
   return api('/api/jobs/'+activeLogId).then(d=>{
     const job = d.job || {};
     const text = job.log || '(no log saved for this job)';
-    if (box.value !== text) box.value = text;
+    const changed = oldText !== text;
+    if(changed) box.value = text;
     if(forceBottom || nearBottom) box.scrollTop = box.scrollHeight; else box.scrollTop = oldTop;
-  }).catch(err=>{ box.value = 'Could not load log: '+err; });
+    if(userInitiated && status){
+      const stamp = new Date().toLocaleTimeString();
+      let result = 'no new output';
+      if(changed){
+        const oldLines = oldText ? oldText.split(/\r?\n/).length : 0;
+        const newLines = text ? text.split(/\r?\n/).length : 0;
+        const added = Math.max(0, newLines - oldLines);
+        result = added > 0 ? `${added} new line${added === 1 ? '' : 's'}` : 'log changed';
+      }
+      status.textContent=`Refreshed at ${stamp} — ${result}`;
+    }
+    return d;
+  }).catch(err=>{
+    if(userInitiated && status) status.textContent='Refresh failed: '+err;
+    else box.value = 'Could not load log: '+err;
+    throw err;
+  }).finally(()=>{
+    if(sourceButton){
+      sourceButton.disabled=false;
+      sourceButton.textContent=oldButtonText || 'refresh log';
+    }
+  });
 }
 function copyActiveLog(btn){ const text=$('activeLogText').value || ''; copyText(text, 'Log copied to clipboard.', btn); }
 function showCopySuccess(sourceEl, message='Copied.'){
@@ -8216,6 +8272,7 @@ function collectFormState(){
     global_version_mode:readFieldValue('globalVersionMode', 'collision'),
     global_filename_template:readFieldValue('globalFilenameTemplate', '[source][version][.ext]'),
     resemble_install_mode:readFieldValue('resembleInstallMode', 'auto'),
+    cooldown_seconds:clampNumber(readFieldValue('optCooldown', '0'), 0, 60, 0),
     resemble_device:readFieldValue('resembleDevice', 'auto'),
     video_format:readFieldValue('videoFormat', 'wav'),
     video_mp3_bitrate:readFieldValue('videoMp3Bitrate', '128k'),
@@ -8266,6 +8323,7 @@ function restoreFormState(){
     setFieldValue('globalVersionMode', s.global_version_mode);
     setFieldValue('globalFilenameTemplate', s.global_filename_template);
     setFieldValue('resembleInstallMode', s.resemble_install_mode);
+    setFieldValue('optCooldown', clampNumber(s.cooldown_seconds, 0, 60, 0));
     setFieldValue('resembleDevice', s.resemble_device || 'auto');
     setFieldValue('videoFormat', s.video_format);
     setFieldValue('videoMp3Bitrate', s.video_mp3_bitrate);
@@ -8295,7 +8353,7 @@ function restoreFormState(){
   });
 }
 function attachFormStateHandlers(){
-  for(const id of ['engine','profileSelect','role','ref','refText','text','xVector','splitLong','rememberForm','uiMode','optAdvanced','optProfileTools','optExperimental','optMetadata','optLogs','optDelete','optStickyTabs','optPanelOrientation','optJobsAsTab','optOpsWidth','globalName','globalNameMode','globalFunctionMode','globalDateMode','globalVersionMode','globalFilenameTemplate','resembleInstallMode','resembleDevice','videoFormat','videoMp3Bitrate','videoSampleRate','videoChannels','videoNormalize','audioLabFormat','audioLabMp3Bitrate','audioLabSampleRate','audioLabChannels','audioLabNormalize','metadataDownloadWhenDone','roleMap','speechAnalysisEngine','speechDiarizationMode']){
+  for(const id of ['engine','profileSelect','role','ref','refText','text','xVector','splitLong','rememberForm','uiMode','optAdvanced','optProfileTools','optExperimental','optMetadata','optLogs','optDelete','optStickyTabs','optPanelOrientation','optJobsAsTab','optOpsWidth','globalName','globalNameMode','globalFunctionMode','globalDateMode','globalVersionMode','globalFilenameTemplate','resembleInstallMode','optCooldown','resembleDevice','videoFormat','videoMp3Bitrate','videoSampleRate','videoChannels','videoNormalize','audioLabFormat','audioLabMp3Bitrate','audioLabSampleRate','audioLabChannels','audioLabNormalize','metadataDownloadWhenDone','roleMap','speechAnalysisEngine','speechDiarizationMode']){
     const el=$(id); if(!el || el.dataset.stateHooked) continue;
     el.dataset.stateHooked='1'; el.addEventListener('input', ()=>{ updateNamingSummaries(); scheduleFormStateSave(); }); el.addEventListener('change', ()=>{ updateNamingSummaries(); scheduleFormStateSave(); });
   }
@@ -9692,7 +9750,7 @@ function jobTimingBlock(j){
   return `<div class="small">Time: <span class="job-timer" data-status="${esc(j.status||'')}" data-created="${esc(j.created_at||0)}" data-started="${esc(j.started_at||0)}" data-finished="${esc(j.finished_at||0)}">${esc(label)}</span></div>`;
 }
 function pct(n,d){ return d ? Math.max(0, Math.min(100, (Number(n||0)/Number(d||1))*100)).toFixed(1)+'%' : '0%'; }
-function etaText(sec){ return (sec === null || sec === undefined || !isFinite(Number(sec))) ? 'warming up...' : 'about ' + fmtDuration(sec) + ' remaining'; }
+function etaText(sec){ return (sec === null || sec === undefined || !isFinite(Number(sec))) ? 'estimating time remaining...' : 'about ' + fmtDuration(sec) + ' remaining'; }
 function jobProgressBlock(j){
   const p = j && j.result && j.result.progress ? j.result.progress : null;
   if(!p || p.kind !== 'tagged-script') return '';
@@ -10446,7 +10504,7 @@ api('/api/meta').then(setupEngines).then(loadAll).then(restoreFormState).then(re
   window.queueBatchLineTake=function queueBatchLineTakeV097(manifest,lineIndex,textId,engineId,profileId,xvecId,statusId,prefix=''){
     const text=readFieldValue(textId,'').trim(); if(!manifest||!lineIndex){ setInlineStatus(statusId,'<span class="bad">Missing manifest or line index.</span>'); return; } if(!text){ setInlineStatus(statusId,'<span class="bad">Line text is empty.</span>'); return; }
     const engine=readFieldValue(engineId,'chatterbox');
-    const body={manifest,line_index:Number(lineIndex),text,spoken_text:text,engine,profile:readFieldValue(profileId,''),x_vector_only:readFieldChecked(xvecId,true),auto_select:false};
+    const body={manifest,line_index:Number(lineIndex),text,spoken_text:text,engine,profile:readFieldValue(profileId,''),x_vector_only:readFieldChecked(xvecId,true),auto_select:false,cooldown_seconds:Number(readFieldValue('optCooldown','0')||0)};
     if(engine==='chatterbox'&&prefix){ body.performance_style=readFieldValue(prefix+'Style',''); body.engine_options=collectChatterboxTurboOptions(prefix); }
     logUiEvent('take manager: generate alternate take clicked',{manifest,lineIndex,engine,performance_style:body.performance_style||'',engine_options:body.engine_options||{}});
     setInlineStatus(statusId,'<span class="warn">Queueing alternate take...</span>');

@@ -1,3 +1,14 @@
+## v0.97.1 - Audio finalization and log refresh cleanup
+
+- Separates chunk concatenation from generated-audio finalization so completed WAVs are rewritten for browser compatibility only once.
+- Prevents duplicate MP3 preview generation after chunked single renders and Tagged Script alternate takes.
+- Uses authoritative MP3 outputs directly for browser playback instead of generating redundant `.mp3.preview.mp3` files.
+- Keeps automatic live job-log updates and adds immediate visible feedback to the manual **Refresh log** troubleshooting button.
+- Manual refresh now reports its timestamp and whether new lines arrived, no output changed, or the request failed.
+- Adds an **Options → Synthesis pacing** setting for pauses between chunks and between Tagged Script lines. Default is `0` seconds and is saved in `webui_state.json`.
+- `TTS_WEBUI_COOLDOWN_SECONDS` remains available as an emergency environment override.
+- Job ETA text now reads **estimating time remaining...** while no estimate is available.
+
 ## v0.97 - Chatterbox-Turbo controls and performance tags
 
 - Hotfix: restores a per-line `text = spoken_text` compatibility alias so legacy batch-renderer references no longer raise `NameError` after successful parsing.
