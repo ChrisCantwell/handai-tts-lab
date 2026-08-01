@@ -87,7 +87,7 @@ DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
 
-VERSION = "0.97.1"
+VERSION = "0.97.2"
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
@@ -3559,7 +3559,88 @@ class Job:
                 pass
         if self.manifest:
             data["manifest_url"] = f"/manifest/{Path(self.manifest).name}"
+        data["is_resumable"] = self.is_resumable()
         return data
+
+    def is_resumable(self) -> bool:
+        """A batch job can be resumed if it has children and a manifest path."""
+        return self.kind == "batch" and bool(self.children) and bool(self.manifest)
+
+    def resume_payload(self) -> dict[str, Any] | None:
+        """Rebuild a batch payload that starts from the first failed/missing line."""
+        if not self.is_resumable():
+            return None
+        resume_from = 1
+        for child in self.children:
+            if child.get("ok") and child.get("output"):
+                resume_from = max(resume_from, int(child.get("index") or 0) + 1)
+            else:
+                break
+        if resume_from <= 1 or resume_from > len(self.children) + 1:
+            return None
+        original = self.result.get("batch_payload") or {}
+        full_script = str(original.get("script") or "").strip()
+        role_map = dict(original.get("role_map") or {})
+
+        if full_script:
+            # Trim the original script to the lines we still need.
+            all_lines = full_script.splitlines()
+            parsed_all, _ = parse_tagged_script_dialogue(full_script)
+            parsed_indices = []
+            pidx = 0
+            for i, raw in enumerate(all_lines, start=1):
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                if ":" in stripped and not stripped.startswith("["):
+                    pidx += 1
+                    parsed_indices.append((pidx, i))
+            target_source_idx = None
+            for pidx, src_idx in parsed_indices:
+                if pidx == resume_from:
+                    target_source_idx = src_idx
+                    break
+            if target_source_idx is not None:
+                trimmed = "\n".join(all_lines[target_source_idx - 1:])
+            else:
+                trimmed = "\n".join(all_lines)
+        else:
+            lines = []
+            for child in self.children[resume_from - 1:]:
+                role = str(child.get("role") or "")
+                text = str(child.get("spoken_text") or child.get("text") or "")
+                if role and text:
+                    lines.append(f"{role}: {text}")
+            trimmed = "\n".join(lines)
+            for child in self.children:
+                role = str(child.get("role") or "").strip()
+                if not role or role in role_map:
+                    continue
+                role_map[role] = {
+                    "engine": child.get("engine"),
+                    "ref": child.get("ref"),
+                    "ref_text": child.get("ref_text"),
+                    "x_vector_only": child.get("x_vector_only"),
+                    "profile": child.get("profile"),
+                    "engine_options": child.get("engine_options"),
+                }
+
+        if not trimmed.strip():
+            return None
+        payload = {
+            "script": trimmed,
+            "role_map": role_map,
+            "default_engine": str(original.get("default_engine") or "chatterbox"),
+            "default_ref": str(original.get("default_ref") or str(DEFAULT_REF)),
+            "default_ref_text": str(original.get("default_ref_text") or ""),
+            "default_x_vector_only": bool(original.get("default_x_vector_only", True)),
+            "default_engine_options": original.get("default_engine_options") or {},
+            "assemble_mixdown": False,
+            "__resume_parent_id": self.id,
+            "__resume_from_line": resume_from,
+            "__existing_batch_dir": str(Path(self.manifest).parent),
+        }
+        return payload
 
 
 class JobManager:
@@ -3570,6 +3651,7 @@ class JobManager:
         self.q: queue.Queue[tuple[Job, dict[str, Any]]] = queue.Queue()
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
+        self._sanitize_running_jobs_at_startup()
 
     def _job_json_path(self, job_id: str) -> Path:
         return JOB_DIR / f"{safe_slug(job_id)}.json"
@@ -3765,6 +3847,54 @@ class JobManager:
     def get(self, job_id: str) -> Job | None:
         with self.lock:
             return self.jobs.get(job_id)
+
+    def _sanitize_running_jobs_at_startup(self) -> None:
+        """Mark any 'running' job whose process PID is dead as error/crashed."""
+        with self.lock:
+            for job in list(self.jobs.values()):
+                if job.status != "running" or not job.process_pid:
+                    continue
+                try:
+                    os.kill(int(job.process_pid), 0)
+                except ProcessLookupError:
+                    dead = True
+                except Exception:
+                    dead = True
+                else:
+                    dead = False
+                if dead:
+                    job.status = "error"
+                    job.error = f"Process {job.process_pid} is no longer running (system restart or crash). Resume the batch if it is resumable."
+                    job.finished_at = now()
+                    job.process_pid = None
+                    self._persist_job(job)
+
+    def resume_batch(self, job_id: str) -> dict[str, Any]:
+        """Resume a batch job from the first failed or missing line."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+        if not job:
+            return {"ok": False, "message": "Job not found."}
+        if job.status == "running":
+            if job.process_pid:
+                try:
+                    os.kill(int(job.process_pid), 0)
+                except Exception:
+                    pass
+                else:
+                    return {"ok": False, "message": "Job is still running; wait for it to finish or cancel it."}
+        payload = job.resume_payload()
+        if not payload:
+            return {"ok": False, "message": "This job is not resumable (no partial manifest or all lines rendered)."}
+        # Persist the partial manifest before resuming so it is visible to mixdown later.
+        manifest_path = Path(job.manifest)
+        try:
+            manifest_path.write_text(json.dumps(job.children, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except Exception as exc:
+            return {"ok": False, "message": f"Could not write partial manifest: {exc}"}
+        new_job = Job(id=uuid.uuid4().hex, kind="batch")
+        self.add(new_job, payload)
+        return {"ok": True, "message": f"Resuming batch from line {payload['__resume_from_line']}.", "job": new_job.public(), "parent_id": job_id}
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         with self.lock:
@@ -5848,41 +5978,62 @@ class JobManager:
         lines, tag_errors = parse_tagged_script_dialogue(script)
         if tag_errors:
             raise ValueError("Tagged Script performance-tag errors: " + " | ".join(tag_errors[:12]))
+        resume_from = max(1, int(payload.get("__resume_from_line") or 1))
+        existing_batch_dir_raw = str(payload.get("__existing_batch_dir") or "").strip()
+        existing_batch_dir = Path(existing_batch_dir_raw) if existing_batch_dir_raw else None
+        is_resume = resume_from > 1 and existing_batch_dir and existing_batch_dir.exists()
         if not lines:
             raise ValueError("No tagged lines found. Use ROLE: dialogue")
 
+        # For resume jobs the script is already trimmed; absolute line numbers start
+        # at resume_from.  display_total is used for progress/mixdown messaging.
         total_lines = len(lines)
         total_words = sum(int(item["words"]) for item in lines)
         total_units = sum(int(item["units"]) for item in lines)
+        display_total = total_lines + (resume_from - 1) if is_resume else total_lines
         batch_id = uuid.uuid4().hex[:8]
-        batch_dir = OUT_DIR / f"batch_{time.strftime('%Y%m%d_%H%M%S')}_{batch_id}"
-        batch_dir.mkdir(parents=True, exist_ok=True)
-        manifest_path = batch_dir / "manifest.json"
+        if is_resume:
+            batch_dir = existing_batch_dir
+            manifest_path = batch_dir / "manifest.json"
+            # Load existing manifest and pre-seed with previously rendered children.
+            existing_manifest: list[dict[str, Any]] = []
+            if manifest_path.exists():
+                try:
+                    existing_manifest = tagged_manifest_read(manifest_path)
+                except Exception:
+                    existing_manifest = []
+            base_index_offset = resume_from - 1
+        else:
+            batch_dir = OUT_DIR / f"batch_{time.strftime('%Y%m%d_%H%M%S')}_{batch_id}"
+            batch_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path = batch_dir / "manifest.json"
+            existing_manifest = []
+            base_index_offset = 0
 
         started_ts = now()
         manifest: list[dict[str, Any]] = []
 
         def progress_payload(completed: int, status_note: str, current: dict[str, Any] | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-            completed = max(0, min(completed, total_lines))
-            completed_words = sum(int(item["words"]) for item in lines[:completed])
-            completed_units = sum(int(item["units"]) for item in lines[:completed])
+            completed = max(0, min(completed, display_total))
+            completed_words = sum(int(item["words"]) for item in lines[:max(0, completed - base_index_offset)])
+            completed_units = sum(int(item["units"]) for item in lines[:max(0, completed - base_index_offset)])
             elapsed = max(0.0, now() - started_ts)
             remaining_units = max(0, total_units - completed_units)
             eta = None
             estimated_total = None
-            if completed >= 3 and completed_units > 0 and elapsed >= 5:
+            if completed >= 3 and completed_units > 0 and elapsed >= 5 and total_units > 0:
                 rate = completed_units / max(1.0, elapsed)
                 eta = remaining_units / rate if rate > 0 else None
                 estimated_total = elapsed + eta if eta is not None else None
             data: dict[str, Any] = {
                 "kind": "tagged-script",
                 "status_note": status_note,
-                "total_lines": total_lines,
+                "total_lines": display_total,
                 "completed_lines": completed,
-                "total_words": total_words,
-                "completed_words": completed_words,
-                "total_units": total_units,
-                "completed_units": completed_units,
+                "total_words": total_words + sum(int(x.get("word_count") or x.get("words") or 0) for x in existing_manifest),
+                "completed_words": completed_words + sum(int(x.get("word_count") or x.get("words") or 0) for x in existing_manifest),
+                "total_units": total_units + sum(int(x.get("weighted_units") or x.get("units") or 0) for x in existing_manifest),
+                "completed_units": completed_units + sum(int(x.get("weighted_units") or x.get("units") or 0) for x in existing_manifest),
                 "remaining_units": remaining_units,
                 "elapsed_seconds": elapsed,
                 "estimated_remaining_seconds": eta,
@@ -5901,12 +6052,20 @@ class JobManager:
                 data.update(extra)
             return data
 
+        # Preserve the original payload so a future resume can reconstruct settings.
+        payload_snapshot = dict(payload)
+        payload_snapshot.pop("__resume_parent_id", None)
+        payload_snapshot.pop("__existing_batch_dir", None)
         self._set(
             job,
             status="running",
             started_at=started_ts,
             manifest=str(manifest_path),
-            result={"kind": "tagged-script-batch", "progress": progress_payload(0, "starting")},
+            result={
+                "kind": "tagged-script-batch",
+                "progress": progress_payload(0, "starting"),
+                "batch_payload": payload_snapshot,
+            },
         )
         self._append_log(job, f"Tagged script batch: {total_lines} lines, {total_words} words, {total_units} weighted units.\n")
         if invisible_char_count:
@@ -5915,12 +6074,11 @@ class JobManager:
         for idx, item_meta in enumerate(lines, start=1):
             if self._is_cancel_requested(job):
                 self._mark_canceled(job)
+                manifest.extend(existing_manifest)
+                manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
                 return
             role = str(item_meta["role"])
             spoken_text = str(item_meta.get("spoken_text") or item_meta["text"])
-            # Compatibility alias: the mature batch renderer still has a few
-            # local references to `text`; v0.97 stores the authoritative value
-            # in `spoken_text`.
             text = spoken_text
             performance_style = normalize_performance_style(item_meta.get("performance_style"))
             cfg = role_map.get(role) or role_map.get(role.upper()) or role_map.get(role.lower()) or {}
@@ -5936,7 +6094,20 @@ class JobManager:
             if isinstance(cfg.get("engine_options"), dict):
                 raw_engine_options.update(cfg.get("engine_options") or {})
             engine_options = normalize_chatterbox_turbo_options(raw_engine_options) if engine == "chatterbox" else raw_engine_options
-            output = batch_dir / f"{idx:03d}_{safe_slug(role)}_{engine}.wav"
+            absolute_idx = base_index_offset + idx
+            output = batch_dir / f"{absolute_idx:03d}_{safe_slug(role)}_{engine}.wav"
+            # Never overwrite an existing take from the original batch.
+            if output.exists() and existing_manifest:
+                self._append_log(job, f"Skipping {absolute_idx:03d}: {output.name} already exists from original batch.\n")
+                prior = next((x for x in existing_manifest if x.get("index") == absolute_idx and x.get("output") == str(output)), None)
+                if prior:
+                    manifest.append(prior)
+                    if is_resume:
+                        merged = existing_manifest + manifest
+                        manifest_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                        self._sync_tagged_batch_jobs_from_manifest(manifest_path, merged)
+                    self._set(job, children=manifest.copy(), result={"kind": "tagged-script-batch", "progress": progress_payload(absolute_idx, "rendered", {"index": absolute_idx, "role": role, "engine": engine, "words": item_meta["words"], "text": spoken_text}), "manifest": str(manifest_path)})
+                    continue
             line_payload = {
                 "engine": engine,
                 "role": role,
@@ -5950,14 +6121,14 @@ class JobManager:
                 "engine_options": engine_options,
             }
             current = {
-                "index": idx,
+                "index": absolute_idx,
                 "role": role,
                 "engine": engine,
                 "words": item_meta["words"],
                 "text": spoken_text,
             }
-            self._set(job, result={"kind": "tagged-script-batch", "progress": progress_payload(idx - 1, "rendering", current)})
-            self._append_log(job, f"\n=== {idx:03d}/{total_lines:03d} {role} via {engine} ({item_meta['words']} words) ===\n")
+            self._set(job, result={"kind": "tagged-script-batch", "progress": progress_payload(absolute_idx - 1, "rendering", current)})
+            self._append_log(job, f"\n=== {absolute_idx:03d}/{total_lines + base_index_offset:03d} {role} via {engine} ({item_meta['words']} words) ===\n")
             chunks = split_synthesis_text(text)
             if engine == "chatterbox" and bool(line_payload.get("split_on_sentences", True)) and len(chunks) > 1:
                 rc = self._run_chunked(job, line_payload, output, chunks)
@@ -5973,7 +6144,7 @@ class JobManager:
                     self._append_log(job, f"Cooling down {cooldown:g}s before next line.\n")
                     time.sleep(cooldown)
             item = {
-                "index": idx,
+                "index": absolute_idx,
                 "role": role,
                 "engine": engine,
                 "profile": profile_slug,
@@ -5998,7 +6169,7 @@ class JobManager:
                 "selected_output": str(output) if ok else "",
                 "takes": [{
                     "take_id": "take-1",
-                    "index": idx,
+                    "index": absolute_idx,
                     "role": role,
                     "text": spoken_text,
                     "spoken_text": spoken_text,
@@ -6023,37 +6194,55 @@ class JobManager:
                 "take_count": 1,
             }
             manifest.append(item)
+            if is_resume:
+                # Update the on-disk manifest incrementally so a second crash can resume.
+                merged = existing_manifest + manifest
+                manifest_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                self._sync_tagged_batch_jobs_from_manifest(manifest_path, merged)
             self._set(
                 job,
                 children=manifest.copy(),
-                result={"kind": "tagged-script-batch", "progress": progress_payload(idx, "rendered", current), "manifest": str(manifest_path)},
+                result={"kind": "tagged-script-batch", "progress": progress_payload(absolute_idx, "rendered", current), "manifest": str(manifest_path)},
             )
             if self._is_cancel_requested(job) or rc in {-15, -9, 143, 137}:
-                self._mark_canceled(job, f"Canceled by user at line {idx} ({role}).")
+                self._mark_canceled(job, f"Canceled by user at line {absolute_idx} ({role}).")
+                manifest.extend(existing_manifest)
+                manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
                 break
             if rc != 0:
                 self._set(
                     job,
                     status="error",
-                    error=f"Batch stopped at line {idx} ({role}); {oom_message(rc)}",
-                    result={"kind": "tagged-script-batch", "progress": progress_payload(idx - 1, "error", current), "manifest": str(manifest_path)},
+                    error=f"Batch stopped at line {absolute_idx} ({role}); {oom_message(rc)}",
+                    result={"kind": "tagged-script-batch", "progress": progress_payload(absolute_idx - 1, "error", current), "manifest": str(manifest_path)},
                 )
+                manifest.extend(existing_manifest)
+                manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
                 break
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        all_ok = bool(manifest) and len(manifest) == total_lines and all(item["ok"] for item in manifest)
+        # Finalize manifest: merge with existing entries on resume so the file
+        # represents the complete batch, not just the tail we just rendered.
+        final_manifest = existing_manifest + manifest if is_resume else manifest
+        manifest_path.write_text(json.dumps(final_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if is_resume:
+            self._sync_tagged_batch_jobs_from_manifest(manifest_path, final_manifest)
+        all_ok = bool(final_manifest) and len(final_manifest) == display_total and all(item["ok"] for item in final_manifest)
         result: dict[str, Any] = {
             "kind": "tagged-script-batch",
             "created_at": iso_time(started_ts),
             "job_id": job.id,
             "manifest": str(manifest_path),
-            "line_count": len(manifest),
-            "total_lines": total_lines,
-            "total_words": total_words,
-            "total_units": total_units,
-            "children": manifest,
+            "line_count": len(final_manifest),
+            "total_lines": display_total,
+            "total_words": total_words + sum(int(x.get("word_count") or x.get("words") or 0) for x in existing_manifest),
+            "total_units": total_units + sum(int(x.get("weighted_units") or x.get("units") or 0) for x in existing_manifest),
+            "children": final_manifest,
             "mixdown_requested": bool(payload.get("assemble_mixdown", False)),
-            "progress": progress_payload(len(manifest), "assembling" if all_ok and bool(payload.get("assemble_mixdown", False)) else "complete"),
+            "progress": progress_payload(display_total, "assembling" if all_ok and bool(payload.get("assemble_mixdown", False)) else "complete"),
+            "batch_payload": payload_snapshot,
         }
+        if is_resume:
+            result["resume_parent_id"] = payload.get("__resume_parent_id")
+            result["resume_from_line"] = payload.get("__resume_from_line")
         if all_ok and bool(payload.get("assemble_mixdown", False)):
             mix_fmt = str(payload.get("mixdown_format") or "mp3").strip().lower()
             if mix_fmt not in {"mp3", "wav"}:
@@ -6062,7 +6251,7 @@ class JobManager:
                 line_gap = max(0.0, float(payload.get("line_gap_seconds") or 0.0))
             except Exception:
                 line_gap = 0.0
-            self._set(job, result={**result, "progress": progress_payload(len(manifest), "assembling", extra={"mixdown_format": mix_fmt, "line_gap_seconds": line_gap})})
+            self._set(job, result={**result, "progress": progress_payload(total_lines + base_index_offset, "assembling", extra={"mixdown_format": mix_fmt, "line_gap_seconds": line_gap})})
             self._append_log(job, f"\nAssembling tagged script mixdown: format={mix_fmt}, line gap={line_gap:g}s.\n")
             rendered = tagged_manifest_selected_audio_paths(manifest)
             mix_pieces: list[Path] = []
@@ -6098,12 +6287,12 @@ class JobManager:
                 }
                 final_output.with_suffix(final_output.suffix + ".json").write_text(json.dumps(mix_meta, indent=2), encoding="utf-8")
                 result["mixdown"] = mix_meta
-                result["progress"] = progress_payload(len(manifest), "complete", extra={"mixdown_output": str(final_output)})
+                result["progress"] = progress_payload(total_lines + base_index_offset, "complete", extra={"mixdown_output": str(final_output)})
                 self._set(job, output=str(final_output), result=result)
                 self._append_log(job, f"Tagged script mixdown ready: {final_output}\n")
             else:
                 result["mixdown_error"] = "Line files rendered, but FFmpeg could not assemble the final mixdown. Individual line outputs are preserved."
-                result["progress"] = progress_payload(len(manifest), "mixdown failed")
+                result["progress"] = progress_payload(total_lines + base_index_offset, "mixdown failed")
                 self._set(job, result=result, warning=result["mixdown_error"])
                 self._append_log(job, "Warning: tagged script mixdown failed. Individual line files are preserved.\n")
         else:
@@ -7558,6 +7747,8 @@ document.addEventListener('click', function(ev){
   if(takeMgrBtn){ ev.preventDefault(); logUiEvent('clicked send batch to Take Manager', {jobid:takeMgrBtn.dataset.jobid || ''}); sendBatchToTakeManager(takeMgrBtn.dataset.jobid || ''); return; }
   const cancelBtn = ev.target.closest ? ev.target.closest('.cancel-job-btn') : null;
   if(cancelBtn){ ev.preventDefault(); logUiEvent('clicked abort job', {jobid:cancelBtn.dataset.jobid || ''}, 'warn'); cancelJob(cancelBtn.dataset.jobid || ''); return; }
+  const resumeBtn = ev.target.closest ? ev.target.closest('.resume-job-btn') : null;
+  if(resumeBtn){ ev.preventDefault(); logUiEvent('clicked resume batch', {jobid:resumeBtn.dataset.jobid || ''}, 'warn'); resumeBatch(resumeBtn.dataset.jobid || ''); return; }
 });
 function openJobLog(id, title){
   activeLogId = id; activeLogTitle = title || id;
@@ -8612,6 +8803,15 @@ function cancelJob(id){
     })
     .catch(err=>{ if(status) status.innerHTML='<span class="bad">Could not abort job: '+esc(err)+'</span>'; else console.warn('Could not abort job', err); });
 }
+function resumeBatch(id){
+  if(!id) return;
+  api('/api/jobs/'+id+'/resume', {method:'POST', body:JSON.stringify({})})
+    .then(r=>{
+      alert((r.ok ? 'Resumed: ' : 'Could not resume: ') + (r.message || ''));
+      lastJobsSig=''; refreshJobs(); startPoll();
+    })
+    .catch(err=>{ alert('Could not resume batch: '+err); });
+}
 let jobsRenderLimit = Number(localStorage.getItem('ttsLabJobsRenderLimit') || 12);
 if(!Number.isFinite(jobsRenderLimit) || jobsRenderLimit < 1) jobsRenderLimit = 12;
 function setJobsRenderLimit(n){
@@ -8671,6 +8871,7 @@ function renderJobs(data){
     ${(j.status==='queued'||j.status==='running'||j.status==='canceling')?`<button class="mini danger cancel-job-btn" data-jobid="${esc(j.id)}">abort job</button> <span id="cancel-status-${esc(j.id)}" class="small inline-status"></span>`:''}
     ${j.status==='canceled'?`<div class="small warn">${esc(j.warning || 'Canceled by user.')}</div>`:''}
     ${j.kind==='batch'&&j.children&&j.children.length?`<button class="mini secondary send-take-manager-btn" data-jobid="${esc(j.id || '')}">Send to Take Manager</button>`:''}
+    ${j.kind==='batch'&&j.is_resumable?`<button class="mini secondary resume-job-btn" data-jobid="${esc(j.id || '')}">Resume batch</button>`:''}
     <button class="mini secondary view-log-btn pref-logs" data-jobid="${esc(j.id)}" data-title="${esc(title)}">view log</button></div>`;
   }).join('');
   if(!jobsHtml) jobsHtml = '<p class="small">No jobs yet.</p>';
@@ -10803,6 +11004,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(save_stt_transcript(str(body.get("path", "")), str(body.get("text", ""))))
             elif path == "/api/jobs/cancel":
                 self.send_json(JOBS.cancel(str(body.get("job_id", ""))))
+            elif path.startswith("/api/jobs/") and path.endswith("/resume"):
+                parts = path.split("/")
+                if len(parts) >= 5:
+                    job_id = parts[3]
+                    self.send_json(JOBS.resume_batch(job_id))
+                else:
+                    self.send_json({"ok": False, "message": "Missing job id."}, 400)
             elif path == "/api/audio-lab/process":
                 job = Job(id=uuid.uuid4().hex, kind="audio")
                 JOBS.add(job, body)
