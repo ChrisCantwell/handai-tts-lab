@@ -6403,7 +6403,8 @@ html.boot-layout-stack body main { display:flex; flex-direction:column; }
 html.boot-layout-stack body .left-panel { flex: 0 0 min(62vh, 680px); }
 html.boot-layout-stack body .right-panel { flex: 1 1 320px; }
 html.boot-jobs-as-tab.boot-layout-stack body .left-panel { flex: 1 1 auto; }
-.jobs-tab-button.hidden { display:none; }
+.jobs-tab-button { display:none; }
+body.jobs-as-tab .jobs-tab-button, html.boot-jobs-as-tab .jobs-tab-button { display:inline-block; }
 .layout-status { margin-top:6px; min-height:1.2em; }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; box-shadow: 0 8px 22px rgba(0,0,0,.18); overflow-y:auto; min-height:0; }
 .sticky-actions { position: sticky; bottom: -16px; background: linear-gradient(180deg, rgba(24,28,37,0.75), var(--panel) 35%); padding: 12px 0 2px; z-index: 5; }
@@ -6515,7 +6516,7 @@ hr { border:0; border-top:1px solid #303747; margin:12px 0; }
       <button id="tab-metadata" onclick="showTab('metadata')">Metadata</button>
       <button id="tab-resemble" onclick="showTab('resemble')">Resemble Enhance</button>
       <button id="tab-maintenance" onclick="showTab('maintenance')">Maintenance</button>
-      <button id="tab-jobs" class="jobs-tab-button hidden" onclick="showTab('jobs')">Jobs</button>
+      <button id="tab-jobs" class="jobs-tab-button" onclick="showTab('jobs')">Jobs</button>
     </div>
 
     <div id="pane-single">
@@ -8131,7 +8132,7 @@ function applyLayoutPrefs(){
   const label=$('opsWidthLabel'); if(label) label.textContent = opsWidth + 'px';
   document.body.classList.toggle('layout-stack', orientation === 'stack');
   document.body.classList.toggle('jobs-as-tab', jobsAsTab);
-  const jobsTab=$('tab-jobs'); if(jobsTab) jobsTab.classList.toggle('hidden', !jobsAsTab);
+  // Jobs tab visibility is controlled by body.jobs-as-tab / html.boot-jobs-as-tab CSS.
   moveJobsPanelContent(jobsAsTab);
   if(!jobsAsTab && currentTabName === 'jobs') showTab('single');
   const status=$('layoutStatus');
