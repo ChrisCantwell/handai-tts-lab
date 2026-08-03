@@ -94,6 +94,22 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", 
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
 TEXT_EXTS = {".txt", ".md", ".text", ".json"}
 
+
+def gpu_vram_mb() -> int:
+    """Detect total VRAM of the first CUDA device, in MB. Returns 0 if CUDA unavailable."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return int(torch.cuda.get_device_properties(0).total_memory / 1024 / 1024)
+    except Exception:
+        pass
+    return 0
+
+
+_GPU_VRAM_MB = gpu_vram_mb()
+_F5_VRAM_THRESHOLD_MB = 12 * 1024  # F5-TTS segfaulted on 6GB RTX 2060; stable on 24GB A5000
+_F5_WORKING = _GPU_VRAM_MB >= _F5_VRAM_THRESHOLD_MB
+
 ENGINE_META = {
     "chatterbox": {
         "label": "Chatterbox-Turbo",
@@ -117,8 +133,12 @@ ENGINE_META = {
     },
     "f5": {
         "label": "F5-TTS",
-        "status": "broken-in-log",
-        "note": "Experimental/back-burnered locally: current tests still segfault. Use Chatterbox, Qwen3, or CosyVoice first.",
+        "status": "working" if _F5_WORKING else "experimental",
+        "note": (
+            "Working on this GPU (detected ~" + str(_GPU_VRAM_MB // 1024) + "GB VRAM). Requires an exact reference transcript. "
+            if _F5_WORKING else
+            "Experimental: segfaulted on 6GB RTX 2060. Should work on GPUs with >=12GB VRAM (e.g., Runpod A5000). Use Chatterbox, Qwen3, or CosyVoice first."
+        ),
     },
 }
 
@@ -644,8 +664,8 @@ def engine_env_status_payload() -> dict[str, Any]:
             "exists": env_path.exists(),
             "python": str(py),
             "python_exists": py.exists(),
-            "green_path": engine in {"chatterbox", "qwen3", "qwen3-1.7b", "cosyvoice"},
-            "experimental": engine == "f5",
+            "green_path": engine in {"chatterbox", "qwen3", "qwen3-1.7b", "cosyvoice"} or (engine == "f5" and _F5_WORKING),
+            "experimental": engine == "f5" and not _F5_WORKING,
         }
     return envs
 
@@ -701,7 +721,7 @@ def stack_status_payload() -> dict[str, Any]:
         "ready": ready,
         "notes": [
             "This is a diagnostics-only Web UI check. It does not install engines or run repair actions.",
-            "Green path engines are Chatterbox, Qwen3, and CosyVoice. F5 is present/experimental when detected.",
+            "Green path engines are Chatterbox, Qwen3, CosyVoice, and F5-TTS when running on a GPU with >=12GB VRAM.",
             "If launcher status fails but the launcher exists, copy the diagnostics and inspect the stack-installer logs.",
         ],
     }
