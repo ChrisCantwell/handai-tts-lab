@@ -82,7 +82,7 @@ METADATA_UPLOAD_DIR = METADATA_DIR / "uploads"
 CONDA_ROOT = Path(os.environ.get("CONDA_ROOT", str(Path.home() / "miniconda3")))
 STACK_INSTALLER = Path(os.environ.get("TTS_STACK_INSTALLER", str(LAB / "stack-installer" / "install-tts-lab-stack.sh")))
 STACK_INSTALLER_ENV = os.environ.get("TTS_STACK_INSTALLER", "").strip()
-ENGINE_ENV_NAMES = {"chatterbox": "tts-chatterbox", "qwen3": "tts-qwen3", "qwen3-1.7b": "tts-qwen3", "cosyvoice": "tts-cosyvoice", "f5": "tts-f5"}
+ENGINE_ENV_NAMES = {"chatterbox": "tts-chatterbox", "qwen3": "tts-qwen3", "qwen3-1.7b": "tts-qwen3", "qwen3-0.6b-customvoice": "tts-qwen3", "qwen3-1.7b-customvoice": "tts-qwen3", "qwen3-1.7b-voicedesign": "tts-qwen3", "cosyvoice": "tts-cosyvoice", "f5": "tts-f5"}
 DEFAULT_REF = REF_DIR / "voice_ref.wav"
 HOST = os.environ.get("TTS_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TTS_WEBUI_PORT", "7870"))
@@ -125,6 +125,21 @@ ENGINE_META = {
         "label": "Qwen3-TTS 1.7B",
         "status": "working",
         "note": "Larger Qwen3-TTS model; slower but higher quality. Use x-vector-only when you do not have exact reference transcript.",
+    },
+    "qwen3-0.6b-customvoice": {
+        "label": "Qwen3-TTS 0.6B CustomVoice",
+        "status": "working",
+        "note": "CustomVoice variant; use x-vector-only when exact reference transcript is unavailable.",
+    },
+    "qwen3-1.7b-customvoice": {
+        "label": "Qwen3-TTS 1.7B CustomVoice",
+        "status": "working",
+        "note": "Larger CustomVoice variant; use x-vector-only when exact reference transcript is unavailable.",
+    },
+    "qwen3-1.7b-voicedesign": {
+        "label": "Qwen3-TTS 1.7B VoiceDesign",
+        "status": "working",
+        "note": "VoiceDesign variant for zero-shot voice creation; use x-vector-only mode.",
     },
     "cosyvoice": {
         "label": "CosyVoice 3",
@@ -664,7 +679,7 @@ def engine_env_status_payload() -> dict[str, Any]:
             "exists": env_path.exists(),
             "python": str(py),
             "python_exists": py.exists(),
-            "green_path": engine in {"chatterbox", "qwen3", "qwen3-1.7b", "cosyvoice"} or (engine == "f5" and _F5_WORKING),
+            "green_path": engine in {"chatterbox", "qwen3", "qwen3-1.7b", "qwen3-0.6b-customvoice", "qwen3-1.7b-customvoice", "qwen3-1.7b-voicedesign", "cosyvoice"} or (engine == "f5" and _F5_WORKING),
             "experimental": engine == "f5" and not _F5_WORKING,
         }
     return envs
@@ -8403,7 +8418,7 @@ function renderStackStatus(d){
   const helpers = d.helpers || {};
   const video = d.video_downloader || {};
   const logs = d.logs || {};
-  const engineRows = ['chatterbox','qwen3','cosyvoice','f5'].map(k=>{
+  const engineRows = ['chatterbox','qwen3','qwen3-1.7b','qwen3-0.6b-customvoice','qwen3-1.7b-customvoice','qwen3-1.7b-voicedesign','cosyvoice','f5'].map(k=>{
     const e = engines[k] || {};
     const label = k === 'qwen3' ? 'Qwen3' : (k === 'cosyvoice' ? 'CosyVoice' : (k === 'f5' ? 'F5 experimental' : 'Chatterbox'));
     const ok = !!(e.exists && e.python_exists);
@@ -9146,7 +9161,7 @@ function profileOptionsHtml(selected=''){
 
 function engineOptionsHtml(selected=''){
   const keys = Object.keys(engines || {});
-  const fallback = ['chatterbox','qwen3','cosyvoice','f5'];
+  const fallback = ['chatterbox','qwen3','qwen3-1.7b','cosyvoice','f5'];
   const list = keys.length ? keys : fallback;
   if(!selected) selected = readFieldValue('defaultEngine', 'chatterbox') || 'chatterbox';
   return list.map(k=>`<option value="${esc(k)}"${k===selected?' selected':''}>${esc(engineDisplayName(k))}</option>`).join('');

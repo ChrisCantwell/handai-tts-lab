@@ -634,13 +634,13 @@ cmd_test() {
     ref_text_arg="--ref-text $(tr -d '\n' < "$REF_TEXT")"
   fi
 
-  local engines=(chatterbox qwen3 qwen3-1.7b cosyvoice)
+  local engines=(chatterbox qwen3 qwen3-1.7b qwen3-0.6b-customvoice qwen3-1.7b-customvoice qwen3-1.7b-voicedesign cosyvoice)
   [[ -d "${CONDA_ROOT}/envs/tts-f5" ]] && engines+=(f5)
   if [[ -n "$only" ]]; then engines=("$only"); fi
 
   for engine in "${engines[@]}"; do
     echo "=== Testing $engine ==="
-    if [[ "$engine" == "qwen3" || "$engine" == "qwen3-1.7b" ]]; then
+    if [[ "$engine" == "qwen3" || "$engine" == "qwen3-1.7b" || "$engine" == "qwen3-0.6b-customvoice" || "$engine" == "qwen3-1.7b-customvoice" || "$engine" == "qwen3-1.7b-voicedesign" ]]; then
       cmd_synth "$engine" --text "$text" --ref "$ref_file" --out "${OUT}/test_${engine}.wav" --x-vector-only
     elif [[ "$engine" == "f5" ]]; then
       # shellcheck disable=SC2086
@@ -905,6 +905,9 @@ from qwen_tts import Qwen3TTSModel
 QWEN_MODELS = {
     "qwen3": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     "qwen3-1.7b": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "qwen3-0.6b-customvoice": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "qwen3-1.7b-customvoice": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "qwen3-1.7b-voicedesign": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 }
 
 
@@ -1146,6 +1149,12 @@ install_qwen3() {
       "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-0.6B-Base || true
     HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
       "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-1.7B-Base || true
+    HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+      "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice || true
+    HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+      "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice || true
+    HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+      "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign || true
   fi
   # Final safety: any -U install above may have bumped huggingface-hub back to 1.x
   pip_in_env tts-qwen3 install --no-deps "huggingface-hub<1.0"
