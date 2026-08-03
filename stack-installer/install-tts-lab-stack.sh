@@ -618,10 +618,21 @@ cmd_status() {
 cmd_test() {
   local only="${1:-}"
   local text="This is a quick voice cloning test on my local GPU."
-  echo "Reference: $REF"
+  echo "Reference container: $REF"
   echo "Test text: $text"
   mkdir -p "$OUT"
-  [[ -f "$REF" ]] || { echo "Reference audio not found: $REF" >&2; exit 1; }
+
+  local ref_file="$REF"
+  if [[ -d "$ref_file" ]]; then
+    ref_file=$(find "$ref_file" -maxdepth 2 -type f -name "*.wav" | head -1)
+  fi
+  [[ -f "$ref_file" ]] || { echo "Reference audio not found under: $REF" >&2; exit 1; }
+  echo "Resolved reference file: $ref_file"
+
+  local ref_text_arg=""
+  if [[ -f "$REF_TEXT" ]]; then
+    ref_text_arg="--ref-text $(tr -d '\n' < "$REF_TEXT")"
+  fi
 
   local engines=(chatterbox qwen3 qwen3-1.7b cosyvoice)
   [[ -d "${CONDA_ROOT}/envs/tts-f5" ]] && engines+=(f5)
@@ -630,9 +641,12 @@ cmd_test() {
   for engine in "${engines[@]}"; do
     echo "=== Testing $engine ==="
     if [[ "$engine" == "qwen3" || "$engine" == "qwen3-1.7b" ]]; then
-      cmd_synth "$engine" --text "$text" --out "${OUT}/test_${engine}.wav" --x-vector-only
+      cmd_synth "$engine" --text "$text" --ref "$ref_file" --out "${OUT}/test_${engine}.wav" --x-vector-only
+    elif [[ "$engine" == "f5" ]]; then
+      # shellcheck disable=SC2086
+      cmd_synth "$engine" --text "$text" --ref "$ref_file" $ref_text_arg --out "${OUT}/test_${engine}.wav"
     else
-      cmd_synth "$engine" --text "$text" --out "${OUT}/test_${engine}.wav"
+      cmd_synth "$engine" --text "$text" --ref "$ref_file" --out "${OUT}/test_${engine}.wav"
     fi
   done
   echo "Done. Outputs in ${OUT}/test_*.wav"
