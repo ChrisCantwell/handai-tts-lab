@@ -414,8 +414,8 @@ Usage: tts-lab.sh <command> [args]
 
 Commands:
   synth <engine> --text "..." [--ref PATH] [--ref-text "..."] [--out PATH] [--language English]
-      Engines: chatterbox | qwen3 | cosyvoice | f5
-      Qwen3 supports --x-vector-only.
+      Engines: chatterbox | qwen3 | qwen3-1.7b | cosyvoice | f5
+      qwen3 and qwen3-1.7b support --x-vector-only.
 
   synth-chatterbox-batch --manifest PATH
       Render many Chatterbox-Turbo utterances from a JSON manifest.
@@ -440,6 +440,7 @@ Commands:
 Examples:
   tts-lab.sh synth chatterbox --text "Hello from the executive office."
   tts-lab.sh synth qwen3 --text "Status update." --x-vector-only
+  tts-lab.sh synth qwen3-1.7b --text "Status update." --x-vector-only
   tts-lab.sh synth cosyvoice --text "Proceed with the archive step."
   tts-lab.sh video-dl 'https://example.invalid/video' /tmp/video-test
 EOF
@@ -451,7 +452,7 @@ activate_env() {
   source "$CONDA"
   case "$1" in
     chatterbox) conda activate tts-chatterbox ;;
-    qwen3)      conda activate tts-qwen3 ;;
+    qwen3|qwen3-1.7b) conda activate tts-qwen3 ;;
     cosyvoice)  conda activate tts-cosyvoice ;;
     f5)         conda activate tts-f5 ;;
     whisper)    conda activate tts-whisper ;;
@@ -508,8 +509,10 @@ cmd_synth() {
       [[ "$norm_loudness" == "0" ]] && args+=(--no-norm-loudness)
       python "$SCRIPTS/synth_chatterbox.py" "${args[@]}"
       ;;
-    qwen3)
-      args=(--text "$text" --ref "$ref" --out "$out" --language "$language")
+    qwen3|qwen3-1.7b)
+      local model_id="Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+      [[ "$engine" == "qwen3-1.7b" ]] && model_id="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+      args=(--text "$text" --ref "$ref" --out "$out" --language "$language" --model-id "$model_id")
       if [[ -n "$ref_text" ]]; then
         args+=(--ref-text "$ref_text")
       else
@@ -567,7 +570,7 @@ cmd_ui() {
     chatterbox)
       python -c "import chatterbox, os; from pathlib import Path; p=Path(chatterbox.__file__).parent.parent; os.chdir(p); exec(open('gradio_tts_turbo_app.py').read())"
       ;;
-    qwen3)
+    qwen3|qwen3-1.7b)
       qwen-tts-demo Qwen/Qwen3-TTS-12Hz-0.6B-Base --ip 127.0.0.1 --port 7861
       ;;
     f5)
@@ -603,7 +606,7 @@ cmd_status() {
   echo "OUT=$OUT"
   echo "VIDEO_DL_BIN=$VIDEO_DL_BIN"
   [[ -x "$VIDEO_DL_BIN" ]] && echo "video-dl: OK" || echo "video-dl: missing/not executable"
-  for e in chatterbox qwen3 cosyvoice f5 whisper whisperx crisperwhisper; do
+  for e in chatterbox qwen3 qwen3-1.7b cosyvoice f5 whisper whisperx crisperwhisper; do
     if [[ -d "${CONDA_ROOT}/envs/tts-${e}" ]]; then
       echo "env tts-${e}: present"
     else
@@ -620,13 +623,13 @@ cmd_test() {
   mkdir -p "$OUT"
   [[ -f "$REF" ]] || { echo "Reference audio not found: $REF" >&2; exit 1; }
 
-  local engines=(chatterbox qwen3 cosyvoice)
+  local engines=(chatterbox qwen3 qwen3-1.7b cosyvoice)
   [[ -d "${CONDA_ROOT}/envs/tts-f5" ]] && engines+=(f5)
   if [[ -n "$only" ]]; then engines=("$only"); fi
 
   for engine in "${engines[@]}"; do
     echo "=== Testing $engine ==="
-    if [[ "$engine" == "qwen3" ]]; then
+    if [[ "$engine" == "qwen3" || "$engine" == "qwen3-1.7b" ]]; then
       cmd_synth "$engine" --text "$text" --out "${OUT}/test_${engine}.wav" --x-vector-only
     else
       cmd_synth "$engine" --text "$text" --out "${OUT}/test_${engine}.wav"
@@ -877,7 +880,7 @@ PY
 
   cat > "${TTS_DATA_DIR}/scripts/synth_qwen3.py" <<'PY'
 #!/usr/bin/env python3
-"""Generate speech with Qwen3-TTS 0.6B Base voice clone."""
+"""Generate speech with Qwen3-TTS voice clone."""
 import argparse
 from pathlib import Path
 
@@ -885,22 +888,34 @@ import soundfile as sf
 import torch
 from qwen_tts import Qwen3TTSModel
 
+QWEN_MODELS = {
+    "qwen3": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "qwen3-1.7b": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+}
+
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Qwen3-TTS 0.6B voice clone")
+    p = argparse.ArgumentParser(description="Qwen3-TTS voice clone")
     p.add_argument("--text", required=True, help="Text to synthesize")
     p.add_argument("--ref", required=True, help="Reference audio WAV")
     p.add_argument("--ref-text", default="", help="Transcript of reference audio")
     p.add_argument("--out", required=True, help="Output WAV path")
     p.add_argument("--language", default="English")
     p.add_argument("--x-vector-only", action="store_true", help="Skip ref_text requirement")
+    p.add_argument(
+        "--model-id",
+        default="Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        help="HuggingFace model ID or alias (qwen3, qwen3-1.7b)",
+    )
     args = p.parse_args()
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    model_id = QWEN_MODELS.get(args.model_id, args.model_id)
+
     model = Qwen3TTSModel.from_pretrained(
-        "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        model_id,
         device_map="cuda:0",
         dtype=torch.bfloat16,
     )
@@ -1102,7 +1117,7 @@ PY
 
 install_qwen3() {
   [[ "$INSTALL_ENGINES" == "1" && "$INSTALL_QWEN3" == "1" ]] || return 0
-  log "Installing Qwen3-TTS 0.6B"
+  log "Installing Qwen3-TTS"
   create_env tts-qwen3 3.12
   install_pytorch_in_env tts-qwen3 "$PYTORCH_CUDA_INDEX"
   pip_in_env tts-qwen3 install -U qwen-tts soundfile
@@ -1115,6 +1130,8 @@ install_qwen3() {
       "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-Tokenizer-12Hz || true
     HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
       "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-0.6B-Base || true
+    HF_HOME="${TTS_MODEL_DIR}/huggingface" TORCH_HOME="${TTS_MODEL_DIR}/torch" \
+      "${CONDA_ROOT}/envs/tts-qwen3/bin/huggingface-cli" download Qwen/Qwen3-TTS-12Hz-1.7B-Base || true
   fi
   # Final safety: any -U install above may have bumped huggingface-hub back to 1.x
   pip_in_env tts-qwen3 install --no-deps "huggingface-hub<1.0"
